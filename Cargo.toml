@@ -1,0 +1,16 @@
+[package]
+name = "sga"
+version = "0.1.0"
+edition = "2021"
+description = "SGA Programming Language — компилятор и VM с ключевыми словами на Standard Galactic Alphabet"
+license = "MIT"
+
+[lib]
+name = "sga"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sga"
+path = "src/main.rs"
+
+[dependencies]

@@ -1,0 +1,20 @@
+// Ownership/Borrowing: параметры immutable по умолчанию, MUT разрешает мутацию
+fn describe(numbers) {
+    // numbers — immutable-заимствование: читать можно, мутировать нельзя
+    return len(numbers);
+}
+
+fn append_zero(mut numbers) {
+    // numbers — mutable-заимствование: требует VAR-аргумент на месте вызова
+    push(numbers, 0);
+}
+
+var data = [1, 2, 3];
+print("длина:", describe(data));
+
+append_zero(data);
+print("после append_zero:", data);
+
+let frozen = [9, 9, 9];
+print("frozen всё ещё можно читать:", describe(frozen));
+// append_zero(frozen); — это была бы ОШИБКА КОМПИЛЯЦИИ: frozen объявлена через LET

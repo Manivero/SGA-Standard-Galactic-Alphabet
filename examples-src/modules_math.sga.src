@@ -1,0 +1,8 @@
+// Вспомогательный модуль: импортируется из modules.sga.src
+fn square(x) {
+    return x * x;
+}
+
+fn cube(x) {
+    return x * x * x;
+}

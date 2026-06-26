@@ -1,0 +1,18 @@
+// Массивы (array) — базовые операции
+ numbers = [1, 2, 3, 4, 5];
+("длина массива =", len(numbers));
+push(numbers, 6);
+("после push =", numbers);
+numbers[0] = 100;
+("после изменения [0] =", numbers[0]);
+
+ sum_array(arr) {
+     total = 0;
+     i = 0;
+     i < len(arr) {
+        total = total + arr[i];
+        i = i + 1;
+    }
+     total;
+}
+("сумма массива =", sum_array(numbers));

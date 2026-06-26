@@ -1,0 +1,18 @@
+// Замыкания: фабрика функций, IIFE и вызов через переменную
+fn make_multiplier(factor) {
+    return fn(x) { return x * factor; };
+}
+
+let double = make_multiplier(2);
+let triple = make_multiplier(3);
+print("double(5) =", double(5));
+print("triple(5) =", triple(5));
+
+// Немедленный вызов анонимной функции (IIFE)
+print("IIFE:", fn(a, b) { return a + b; }(10, 32));
+
+// Замыкание, захватывающее переменную по значению
+var total = 100;
+let snapshot = fn() { return total; };
+total = 999;
+print("snapshot всё ещё видит старое значение:", snapshot());

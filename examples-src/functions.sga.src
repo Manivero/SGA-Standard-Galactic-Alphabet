@@ -1,0 +1,15 @@
+// Функции, рекурсия
+fn square(x) {
+    return x * x;
+}
+
+fn factorial(n) {
+    if n <= 1 {
+        return 1;
+    } else {
+        return n * factorial(n - 1);
+    }
+}
+
+print("square(7) =", square(7));
+print("factorial(6) =", factorial(6));

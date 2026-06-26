@@ -1,0 +1,20 @@
+// Циклы: for-in и while, break/continue
+var sum = 0;
+for i in 0..10 {
+    if i == 5 {
+        continue;
+    }
+    if i == 8 {
+        break;
+    }
+    sum = sum + i;
+}
+print("sum =", sum);
+
+var n = 5;
+var fact = 1;
+while n > 0 {
+    fact = fact * n;
+    n = n - 1;
+}
+print("fact =", fact);

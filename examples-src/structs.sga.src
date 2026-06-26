@@ -1,0 +1,38 @@
+// Структуры (struct): номинальные типы-записи с методами по конвенции
+// именования TypeName_method(self, ...). Перенесено при слиянии веток
+// (см. MIGRATION_REPORT.md) — структуры являются reference-типом, как и
+// массивы, поэтому участвуют в Ownership/Borrowing на тех же правах.
+
+struct Point {
+    x, y
+}
+
+// MUT self — обязателен, если метод присваивает self.<поле>. Без него
+// присваивание внутри тела метода было бы ошибкой компиляции — той же
+// проверки, что и для обычных immutable-параметров функций.
+fn Point_move(mut self, dx, dy) {
+    self.x = self.x + dx;
+    self.y = self.y + dy;
+}
+
+fn Point_length(self) {
+    return sqrt(to_float(self.x * self.x + self.y * self.y));
+}
+
+var p = Point { x: 3, y: 4 };
+print("точка:", p);
+print("длина вектора:", p.length());
+
+p.move(1, 1);
+print("после move(1, 1):", p);
+
+// frozen объявлена через LET — присваивание полю запрещено компилятором,
+// как и индексное присваивание для immutable-массива.
+let frozen = Point { x: 0, y: 0 };
+print("frozen всё ещё можно читать:", frozen.x);
+// frozen.x = 1; — это была бы ОШИБКА КОМПИЛЯЦИИ: frozen объявлена через LET
+
+// keys()/type_of() из расширенной стандартной библиотеки (перенесена из
+// второй родительской ветки, см. MIGRATION_REPORT.md).
+print("поля p:", keys(p));
+print("тип p:", type_of(p));

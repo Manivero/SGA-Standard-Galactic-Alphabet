@@ -1,0 +1,40 @@
+{
+  "name": "sga-language",
+  "displayName": "SGA Programming Language",
+  "description": "Syntax highlighting и сниппеты для языка SGA (.sga) — ключевые слова на Standard Galactic Alphabet. Автодополнение/hover/go-to-definition/diagnostics НЕ реализованы в этой версии (требуют отдельного language server, см. ROADMAP в основном репозитории).",
+  "version": "0.1.0",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "sga",
+        "aliases": ["SGA", "sga"],
+        "extensions": [".sga"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "sga",
+        "scopeName": "source.sga",
+        "path": "./syntaxes/sga.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "sga",
+        "path": "./snippets/sga.code-snippets"
+      }
+    ],
+    "configurationDefaults": {
+      "[sga]": {
+        "editor.fontFamily": "'Fairfax HD', Consolas, monospace",
+        "editor.fontLigatures": false
+      }
+    }
+  }
+}

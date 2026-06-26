@@ -1,0 +1,5 @@
+// Модули: IMPORT резолвится относительно директории этого файла
+import "modules_math.sga";
+
+print("square(5) =", square(5));
+print("cube(3) =", cube(3));

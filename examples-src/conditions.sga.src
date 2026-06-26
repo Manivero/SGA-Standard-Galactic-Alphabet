@@ -1,0 +1,15 @@
+// Условия и логические операторы
+let age = 20;
+if age >= 18 and age < 65 {
+    print("взрослый трудоспособного возраста");
+} else if age < 18 {
+    print("несовершеннолетний");
+} else {
+    print("пенсионный возраст");
+}
+
+let is_admin = false;
+let is_owner = true;
+if is_admin or is_owner {
+    print("доступ разрешён");
+}

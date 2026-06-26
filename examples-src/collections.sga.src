@@ -1,0 +1,18 @@
+// Массивы (array) — базовые операции
+var numbers = [1, 2, 3, 4, 5];
+print("длина массива =", len(numbers));
+push(numbers, 6);
+print("после push =", numbers);
+numbers[0] = 100;
+print("после изменения [0] =", numbers[0]);
+
+fn sum_array(arr) {
+    var total = 0;
+    var i = 0;
+    while i < len(arr) {
+        total = total + arr[i];
+        i = i + 1;
+    }
+    return total;
+}
+print("сумма массива =", sum_array(numbers));

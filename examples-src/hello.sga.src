@@ -1,0 +1,3 @@
+// Hello World на SGA
+let message = "Hello, SGA Programming Language!";
+print(message);

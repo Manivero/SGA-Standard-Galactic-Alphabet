@@ -1,0 +1,6 @@
+/target
+/tools/translit/target
+Cargo.lock.bak
+*.swp
+.DS_Store
+demo/

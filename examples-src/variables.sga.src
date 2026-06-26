@@ -1,0 +1,8 @@
+// Переменные: immutable (let/const) vs mutable (var)
+let pi = 3;
+const max_players = 10;
+var score = 0;
+score = score + 5;
+print("pi =", pi);
+print("max_players =", max_players);
+print("score =", score);

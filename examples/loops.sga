@@ -1,0 +1,20 @@
+// Циклы: for-in и while, break/continue
+ sum = 0;
+ i  0..10 {
+     i == 5 {
+        ;
+    }
+     i == 8 {
+        ;
+    }
+    sum = sum + i;
+}
+("sum =", sum);
+
+ n = 5;
+ fact = 1;
+ n > 0 {
+    fact = fact * n;
+    n = n - 1;
+}
+("fact =", fact);

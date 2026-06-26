@@ -1,0 +1,3 @@
+// Hello World на SGA
+ message = "Hello, SGA Programming Language!";
+(message);
