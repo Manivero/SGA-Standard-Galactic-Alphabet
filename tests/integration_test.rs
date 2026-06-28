@@ -141,6 +141,49 @@ fn test_parser_produces_expected_statement_count() {
     assert_eq!(program.len(), 2);
 }
 
+/// SECURITY FIX (audit): рекурсивный спуск без лимита глубины давал
+/// неперехватываемый `fatal runtime error: stack overflow` (`abort()`
+/// процесса, не Rust panic — `catch_unwind` не спасает) на глубоко
+/// вложенном выражении. Подтверждено эмпирически ДО исправления:
+/// крейт реально вызывал stack overflow между ~1000 и ~5000 уровней
+/// вложенных `(` (~2-10 КБ исходного текста — тривиально малый входной
+/// файл). После исправления (`Parser::guarded_recursion`,
+/// `MAX_PARSE_DEPTH = 256`) это управляемая `ParseError`, а не crash
+/// процесса.
+#[test]
+fn test_deeply_nested_parens_returns_parse_error_not_stack_overflow() {
+    let depth = 100_000; // на 2-3 порядка больше, чем порог реального stack overflow без защиты
+    let mut expr = String::from("1");
+    for _ in 0..depth {
+        expr = format!("({})", expr);
+    }
+    let src = format!("{} x = {};", kw("LET"), expr);
+    let tokens = lexer::Lexer::new(&src).tokenize().unwrap();
+    match parser::Parser::new(tokens).parse_program() {
+        Err(e) => assert!(
+            e.to_string().contains("глубин"),
+            "ошибка должна явно объяснять превышение глубины вложенности, получено: {}",
+            e
+        ),
+        Ok(_) => panic!("ожидалась ParseError (превышена максимальная глубина вложенности), получен Ok — лимит глубины не сработал"),
+    }
+}
+
+/// Negative-тест к предыдущему: лимит глубины не должен давать false
+/// positive на легитимных, умеренно вложенных выражениях — 50 уровней
+/// `(...)` — это глубже любого реального кода, но всё ещё далеко от
+/// `MAX_PARSE_DEPTH = 256`.
+#[test]
+fn test_moderately_nested_parens_still_parses_successfully() {
+    let depth = 50;
+    let mut expr = String::from("1");
+    for _ in 0..depth {
+        expr = format!("({})", expr);
+    }
+    let src = format!("{} x = {}; {}(x);", kw("LET"), expr, kw("PRINT"));
+    assert_eq!(run(&src).unwrap(), Value::Nil);
+}
+
 #[test]
 fn test_codegen_produces_nonempty_chunk() {
     let src = format!("{}(1);", kw("PRINT"));
@@ -579,7 +622,43 @@ fn test_vm_rejects_corrupted_function_chunk_not_just_main() {
     }
 }
 
-// ===== Замыкания (closures) =====
+/// SECURITY FIX (audit): `Chunk`/`OpCode` — публичные типы, поэтому
+/// внешний потребитель крейта может вручную сконструировать чанк с
+/// несбалансированными `PushScope`/`PopScope` (`PopScope` без
+/// соответствующего `PushScope`). До исправления `OpCode::DefineVar`
+/// делал `scopes.last_mut().unwrap()`, что давало неуправляемую Rust
+/// panic, как только `scopes` опускался до пустого вектора — ровно тот
+/// класс багов, для защиты от которого существует verify_chunk/
+/// verify_program (см. два теста выше), но статическая проверка баланса
+/// PushScope/PopScope ненадёжна при наличии Jump/JumpIfFalse, поэтому
+/// verify_chunk эту конкретную инвариант не проверяет — защита должна
+/// быть в самой `run_chunk`, в точке использования. Подтверждено
+/// эмпирически (PoC, паника `called `Option::unwrap()` on a `None`
+/// value` at `src/vm/mod.rs:161`) до исправления; после — управляемая
+/// `RuntimeError`, тест проверяет именно это, а не просто `is_err()`.
+#[test]
+fn test_vm_defines_var_after_scope_underflow_returns_runtime_error_not_panic() {
+    let chunk = Chunk {
+        code: vec![
+            OpCode::PushConst(0),
+            OpCode::PopScope, // нет соответствующего PushScope — опускает scopes ниже базового
+            OpCode::DefineVar("x".to_string(), true),
+            OpCode::Return(false),
+        ],
+        constants: vec![Value::Int(1)],
+    };
+    let program = CompiledProgram { main: chunk, functions: HashMap::new() };
+    // Верификатор не проверяет баланс PushScope/PopScope (см. docstring
+    // выше), поэтому Vm::new должен пройти успешно...
+    let (mut vm, main) = Vm::new(program).expect("verify_program не должен отклонять этот чанк — баланс scope не проверяется статически");
+    // ...а паника должна быть превращена в RuntimeError на этапе run().
+    match vm.run(&main) {
+        Err(e) => assert!(e.to_string().contains("DefineVar"), "сообщение об ошибке должно объяснять причину (DefineVar без активного scope), получено: {}", e),
+        Ok(v) => panic!("ожидалась RuntimeError (DefineVar без активного scope), получен Ok({:?})", v),
+    }
+}
+
+
 
 #[test]
 fn test_closure_basic_call_through_variable() {

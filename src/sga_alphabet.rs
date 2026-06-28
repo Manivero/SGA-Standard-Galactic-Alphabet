@@ -34,7 +34,7 @@ pub fn letter_to_sga(c: char) -> Option<char> {
 /// Обратное преобразование: SGA-кодпоинт -> латинская буква.
 pub fn sga_to_letter(c: char) -> Option<char> {
     let cp = c as u32;
-    if cp >= SGA_BASE && cp < SGA_BASE + 26 {
+    if (SGA_BASE..SGA_BASE + 26).contains(&cp) {
         Some((b'A' + (cp - SGA_BASE) as u8) as char)
     } else {
         None

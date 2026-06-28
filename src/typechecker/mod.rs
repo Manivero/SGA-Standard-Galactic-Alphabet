@@ -56,6 +56,12 @@ pub struct Typechecker {
     current_return_ty: Option<TypeAnnotation>,
 }
 
+impl Default for Typechecker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Typechecker {
     pub fn new() -> Self {
         let mut functions = HashMap::new();

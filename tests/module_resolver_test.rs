@@ -170,6 +170,149 @@ fn test_missing_import_file_gives_explicit_error_not_panic() {
     }
 }
 
+// --- SECURITY: confinement тесты (см. docs/SECURITY.md, "IMPORT
+// confinement") -----------------------------------------------------
+//
+// До фикса `IMPORT "/etc/passwd";` или `IMPORT "../../secret.sga";`
+// читали произвольный файл с прав процесса вместо отказа — эмпирически
+// подтверждено PoC при аудите (абсолютный путь и `../../` оба успешно
+// инлайнили файл за пределами каталога входной программы). Тесты ниже
+// закрывают оба вектора регрессионным тестом.
+
+#[test]
+fn test_absolute_path_import_is_rejected() {
+    // Абсолютный путь отклоняется ДО обращения к loader'у (а значит, и
+    // в in-memory тесте, без реальной ФС) — см. комментарий в
+    // `module_resolver::resolve_program`: `Path::join` с абсолютным
+    // аргументом полностью заменяет базовый путь, поэтому проверка
+    // обязана быть безусловной, а не зависеть от `current_dir`.
+    let absolute = if cfg!(windows) { "C:\\secret.sga" } else { "/etc/secret.sga" };
+    let entry_src = format!("{i} \"{p}\";\n", i = kw("IMPORT"), p = absolute);
+    let loader = InMemoryLoader::new(&[("entry.sga", &entry_src)]);
+
+    let program = parse(&entry_src).unwrap();
+    let result = resolve_imports(program, Path::new("entry.sga"), &loader, &parse);
+
+    match result {
+        Err(ImportError(msg)) => assert!(
+            msg.contains("абсолютным") || msg.to_lowercase().contains("absolute"),
+            "сообщение об ошибке должно объяснять, что путь абсолютный: {}",
+            msg
+        ),
+        Ok(_) => panic!("ожидался отказ для абсолютного пути в IMPORT, получен Ok"),
+    }
+}
+
+/// Создаёт одноразовую директорию во `std::env::temp_dir()` с уникальным
+/// именем (PID + имя теста), без новых зависимостей (`tempfile` и
+/// аналоги) — соответствует выбору проекта не тащить лишние крейты там,
+/// где хватает `std`. Вызывающий тест отвечает за удаление в конце
+/// (через `let _guard = ...` с `Drop`, см. ниже).
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(test_name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("sga_test_{}_{}", test_name, std::process::id()));
+        std::fs::create_dir_all(&dir).expect("не удалось создать временную директорию для теста");
+        TempDir(dir)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn test_path_traversal_escaping_entry_root_is_rejected_on_real_fs() {
+    // Реальная ФС обязательна для этого теста: лексическая проверка
+    // (fallback для in-memory loader'а) тоже сработала бы, но именно
+    // здесь нужно подтвердить основной путь — `std::fs::canonicalize`,
+    // который резолвит фактические symlink/`..` на диске (тот же путь,
+    // которым реально пользуется production `FsLoader`).
+    use sga::module_resolver::FsLoader;
+
+    let tmp = TempDir::new("traversal_escape");
+    let project_dir = tmp.0.join("project");
+    let outside_dir = tmp.0.join("outside");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    std::fs::create_dir_all(&outside_dir).unwrap();
+
+    let secret_path = outside_dir.join("secret.sga");
+    let secret_src = format!("{let_} TOKEN = \"sk_live_should_not_leak\";\n", let_ = kw("LET"));
+    std::fs::write(secret_path, secret_src).unwrap();
+
+    let entry_path = project_dir.join("main.sga");
+    let entry_src = format!("{i} \"../outside/secret.sga\";\n", i = kw("IMPORT"));
+    std::fs::write(&entry_path, &entry_src).unwrap();
+
+    let program = parse(&entry_src).unwrap();
+    let result = resolve_imports(program, &entry_path, &FsLoader, &parse);
+
+    match result {
+        Err(ImportError(msg)) => assert!(
+            msg.contains("пределы") || msg.to_lowercase().contains("traversal") || msg.contains(".."),
+            "сообщение должно объяснять, что путь выходит за пределы каталога входного файла: {}",
+            msg
+        ),
+        Ok(_) => panic!("ожидался отказ для IMPORT, выходящего за пределы каталога входного файла (path traversal), получен Ok"),
+    }
+}
+
+#[test]
+fn test_path_traversal_within_entry_root_still_works_on_real_fs() {
+    // Негативный тест на false positive: точка входа — `project/main.sga`,
+    // он импортирует `sub/inner.sga`, а ТОТ, в свою очередь (уже на
+    // следующем уровне рекурсии, относительно СВОЕЙ директории
+    // `project/sub`), импортирует `../shared.sga`. Итоговый путь —
+    // `project/shared.sga` — остаётся внутри корня (`project/`,
+    // директория исходного входного файла `main.sga`), поэтому должен
+    // продолжать резолвиться как раньше: фикс не должен ломать
+    // легитимные вложенные модули, только реальный побег за пределы
+    // каталога ИСХОДНОГО входного файла программы.
+    use sga::module_resolver::FsLoader;
+
+    let tmp = TempDir::new("traversal_legit");
+    let project_dir = tmp.0.join("project");
+    let sub_dir = project_dir.join("sub");
+    std::fs::create_dir_all(&sub_dir).unwrap();
+
+    let shared_path = project_dir.join("shared.sga");
+    let shared_src = format!(
+        "{fn} shared_helper() {{ {ret} 100; }}\n",
+        fn = kw("FN"),
+        ret = kw("RETURN")
+    );
+    std::fs::write(shared_path, shared_src).unwrap();
+
+    let inner_path = sub_dir.join("inner.sga");
+    let inner_src = format!(
+        "{i} \"../shared.sga\";\n{fn} get_value() {{ {ret} shared_helper() + 1; }}\n",
+        i = kw("IMPORT"),
+        fn = kw("FN"),
+        ret = kw("RETURN"),
+    );
+    std::fs::write(inner_path, inner_src).unwrap();
+
+    let entry_path = project_dir.join("main.sga");
+    let entry_src = format!(
+        "{i} \"sub/inner.sga\";\n{pr}(get_value());\n",
+        i = kw("IMPORT"),
+        pr = kw("PRINT"),
+    );
+    std::fs::write(&entry_path, &entry_src).unwrap();
+
+    let program = parse(&entry_src).unwrap();
+    let result = resolve_imports(program, &entry_path, &FsLoader, &parse);
+
+    assert!(
+        result.is_ok(),
+        "легитимный '..' внутри каталога исходного входного файла программы не должен отклоняться: {:?}",
+        result.err()
+    );
+}
+
 #[test]
 fn test_transitive_import_chain_is_resolved() {
     // entry -> mid -> leaf, без циклов и без дублей. Все три уровня
@@ -241,7 +384,7 @@ fn test_imported_top_level_expr_stmt_is_preserved() {
 
     assert_eq!(resolved.len(), 1);
     match &resolved[0] {
-        Stmt::Print(args) => assert!(matches!(args.get(0), Some(Expr::Int(1)))),
+        Stmt::Print(args) => assert!(matches!(args.first(), Some(Expr::Int(1)))),
         other => panic!("ожидался Stmt::Print из импортированного файла, получено {:?}", other),
     }
 }

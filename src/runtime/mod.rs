@@ -298,14 +298,14 @@ pub fn is_builtin(name: &str) -> bool {
 pub fn call_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> {
     match name {
         // ── коллекции ────────────────────────────────────────────────
-        "len" => match args.get(0) {
+        "len" => match args.first() {
             Some(Value::Str(s)) => Ok(Value::Int(s.chars().count() as i64)),
             Some(Value::Array(a)) => Ok(Value::Int(a.borrow().len() as i64)),
             Some(Value::Struct { fields, .. }) => Ok(Value::Int(fields.borrow().len() as i64)),
             Some(v) => Err(format!("len() не поддерживает тип {}", v.type_display_name())),
             None => Err("len() ожидает 1 аргумент, передано 0".to_string()),
         },
-        "push" => match args.get(0) {
+        "push" => match args.first() {
             Some(Value::Array(a)) => {
                 a.borrow_mut().push(args.get(1).cloned().unwrap_or(Value::Nil));
                 Ok(Value::Nil)
@@ -314,7 +314,7 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> {
             None => Err("push() ожидает минимум 1 аргумент, передано 0".to_string()),
         },
         // Возвращает массив имён полей struct или индексов массива (как int).
-        "keys" => match args.get(0) {
+        "keys" => match args.first() {
             Some(Value::Struct { fields, .. }) => {
                 let mut ks: Vec<Value> = fields.borrow().keys().map(|k| Value::Str(k.clone())).collect();
                 ks.sort_by(|a, b| match (a, b) {
@@ -335,7 +335,7 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> {
         // диапазон [0, end).
         "range" => {
             const MAX_RANGE: i64 = 10_000_000;
-            match (args.get(0), args.get(1)) {
+            match (args.first(), args.get(1)) {
                 (Some(Value::Int(end)), None) => {
                     let n = *end;
                     if n < 0 { return Err(format!("range() получил отрицательный конец: {}", n)); }
@@ -353,11 +353,11 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> {
         }
 
         // ── преобразование типов ─────────────────────────────────────
-        "to_string" => match args.get(0) {
+        "to_string" => match args.first() {
             Some(v) => Ok(Value::Str(v.to_string())),
             None => Err("to_string() ожидает 1 аргумент, передано 0".to_string()),
         },
-        "to_int" => match args.get(0) {
+        "to_int" => match args.first() {
             Some(Value::Int(i)) => Ok(Value::Int(*i)),
             Some(Value::Float(f)) => Ok(Value::Int(*f as i64)),
             Some(Value::Str(s)) => s.trim().parse::<i64>().map(Value::Int).map_err(|_| format!("невозможно преобразовать '{}' в int", s)),
@@ -365,7 +365,7 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> {
             Some(v) => Err(format!("to_int() не поддерживает тип {}", v.type_display_name())),
             None => Err("to_int() ожидает 1 аргумент, передано 0".to_string()),
         },
-        "to_float" => match args.get(0) {
+        "to_float" => match args.first() {
             Some(Value::Int(i)) => Ok(Value::Float(*i as f64)),
             Some(Value::Float(f)) => Ok(Value::Float(*f)),
             Some(Value::Str(s)) => s.trim().parse::<f64>().map(Value::Float).map_err(|_| format!("невозможно преобразовать '{}' в float", s)),
@@ -374,37 +374,37 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> {
         },
         // Возвращает строку с именем типа значения (для struct — реальное
         // имя типа, например "Point", см. type_display_name()).
-        "type_of" => match args.get(0) {
+        "type_of" => match args.first() {
             Some(v) => Ok(Value::Str(v.type_display_name())),
             None => Err("type_of() ожидает 1 аргумент, передано 0".to_string()),
         },
 
         // ── математика ───────────────────────────────────────────────
-        "sqrt" => match args.get(0) {
+        "sqrt" => match args.first() {
             Some(Value::Float(f)) => Ok(Value::Float(f.sqrt())),
             Some(Value::Int(i)) => Ok(Value::Float((*i as f64).sqrt())),
             Some(v) => Err(format!("sqrt() ожидает число, получено {}", v.type_display_name())),
             None => Err("sqrt() ожидает 1 аргумент, передано 0".to_string()),
         },
-        "floor" => match args.get(0) {
+        "floor" => match args.first() {
             Some(Value::Float(f)) => Ok(Value::Int(f.floor() as i64)),
             Some(Value::Int(i)) => Ok(Value::Int(*i)),
             Some(v) => Err(format!("floor() ожидает число, получено {}", v.type_display_name())),
             None => Err("floor() ожидает 1 аргумент, передано 0".to_string()),
         },
-        "ceil" => match args.get(0) {
+        "ceil" => match args.first() {
             Some(Value::Float(f)) => Ok(Value::Int(f.ceil() as i64)),
             Some(Value::Int(i)) => Ok(Value::Int(*i)),
             Some(v) => Err(format!("ceil() ожидает число, получено {}", v.type_display_name())),
             None => Err("ceil() ожидает 1 аргумент, передано 0".to_string()),
         },
-        "abs" => match args.get(0) {
+        "abs" => match args.first() {
             Some(Value::Int(i)) => Ok(Value::Int(i.abs())),
             Some(Value::Float(f)) => Ok(Value::Float(f.abs())),
             Some(v) => Err(format!("abs() ожидает число, получено {}", v.type_display_name())),
             None => Err("abs() ожидает 1 аргумент, передано 0".to_string()),
         },
-        "min" => match (args.get(0), args.get(1)) {
+        "min" => match (args.first(), args.get(1)) {
             (Some(Value::Int(a)), Some(Value::Int(b))) => Ok(Value::Int(*a.min(b))),
             (Some(Value::Float(a)), Some(Value::Float(b))) => Ok(Value::Float(a.min(*b))),
             (Some(Value::Int(a)), Some(Value::Float(b))) => Ok(Value::Float((*a as f64).min(*b))),
@@ -412,7 +412,7 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> {
             (Some(a), Some(b)) => Err(format!("min() ожидает два числа, получено {} и {}", a.type_display_name(), b.type_display_name())),
             _ => Err("min(a, b) ожидает 2 аргумента".to_string()),
         },
-        "max" => match (args.get(0), args.get(1)) {
+        "max" => match (args.first(), args.get(1)) {
             (Some(Value::Int(a)), Some(Value::Int(b))) => Ok(Value::Int(*a.max(b))),
             (Some(Value::Float(a)), Some(Value::Float(b))) => Ok(Value::Float(a.max(*b))),
             (Some(Value::Int(a)), Some(Value::Float(b))) => Ok(Value::Float((*a as f64).max(*b))),
@@ -420,7 +420,7 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> {
             (Some(a), Some(b)) => Err(format!("max() ожидает два числа, получено {} и {}", a.type_display_name(), b.type_display_name())),
             _ => Err("max(a, b) ожидает 2 аргумента".to_string()),
         },
-        "pow" => match (args.get(0), args.get(1)) {
+        "pow" => match (args.first(), args.get(1)) {
             (Some(Value::Int(base)), Some(Value::Int(exp))) => {
                 if *exp < 0 {
                     return Err("pow() с целым отрицательным экспонентом не поддерживается; используйте to_float() для обоих аргументов".to_string());
@@ -449,7 +449,7 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> {
         },
 
         // ── строки ──────────────────────────────────────────────────
-        "str_split" => match (args.get(0), args.get(1)) {
+        "str_split" => match (args.first(), args.get(1)) {
             (Some(Value::Str(s)), Some(Value::Str(sep))) => {
                 let parts: Vec<Value> = s.split(sep.as_str()).map(|p| Value::Str(p.to_string())).collect();
                 Ok(Value::Array(Rc::new(RefCell::new(parts))))
@@ -457,36 +457,36 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> {
             (Some(a), Some(b)) => Err(format!("str_split(str, sep) ожидает два string, получено {} и {}", a.type_display_name(), b.type_display_name())),
             _ => Err("str_split(str, sep) ожидает 2 аргумента".to_string()),
         },
-        "str_contains" => match (args.get(0), args.get(1)) {
+        "str_contains" => match (args.first(), args.get(1)) {
             (Some(Value::Str(s)), Some(Value::Str(sub))) => Ok(Value::Bool(s.contains(sub.as_str()))),
             (Some(a), Some(b)) => Err(format!("str_contains(str, sub) ожидает два string, получено {} и {}", a.type_display_name(), b.type_display_name())),
             _ => Err("str_contains(str, sub) ожидает 2 аргумента".to_string()),
         },
-        "str_trim" => match args.get(0) {
+        "str_trim" => match args.first() {
             Some(Value::Str(s)) => Ok(Value::Str(s.trim().to_string())),
             Some(v) => Err(format!("str_trim() ожидает string, получено {}", v.type_display_name())),
             None => Err("str_trim() ожидает 1 аргумент, передано 0".to_string()),
         },
-        "str_starts_with" => match (args.get(0), args.get(1)) {
+        "str_starts_with" => match (args.first(), args.get(1)) {
             (Some(Value::Str(s)), Some(Value::Str(pre))) => Ok(Value::Bool(s.starts_with(pre.as_str()))),
             (Some(a), Some(b)) => Err(format!("str_starts_with(str, prefix) ожидает два string, получено {} и {}", a.type_display_name(), b.type_display_name())),
             _ => Err("str_starts_with(str, prefix) ожидает 2 аргумента".to_string()),
         },
-        "str_ends_with" => match (args.get(0), args.get(1)) {
+        "str_ends_with" => match (args.first(), args.get(1)) {
             (Some(Value::Str(s)), Some(Value::Str(suf))) => Ok(Value::Bool(s.ends_with(suf.as_str()))),
             (Some(a), Some(b)) => Err(format!("str_ends_with(str, suffix) ожидает два string, получено {} и {}", a.type_display_name(), b.type_display_name())),
             _ => Err("str_ends_with(str, suffix) ожидает 2 аргумента".to_string()),
         },
-        "str_replace" => match (args.get(0), args.get(1), args.get(2)) {
+        "str_replace" => match (args.first(), args.get(1), args.get(2)) {
             (Some(Value::Str(s)), Some(Value::Str(from)), Some(Value::Str(to))) => Ok(Value::Str(s.replace(from.as_str(), to.as_str()))),
             _ => Err("str_replace(str, from, to) ожидает 3 string-аргумента".to_string()),
         },
-        "str_upper" => match args.get(0) {
+        "str_upper" => match args.first() {
             Some(Value::Str(s)) => Ok(Value::Str(s.to_uppercase())),
             Some(v) => Err(format!("str_upper() ожидает string, получено {}", v.type_display_name())),
             None => Err("str_upper() ожидает 1 аргумент, передано 0".to_string()),
         },
-        "str_lower" => match args.get(0) {
+        "str_lower" => match args.first() {
             Some(Value::Str(s)) => Ok(Value::Str(s.to_lowercase())),
             Some(v) => Err(format!("str_lower() ожидает string, получено {}", v.type_display_name())),
             None => Err("str_lower() ожидает 1 аргумент, передано 0".to_string()),

@@ -18,8 +18,11 @@
 | **Использование неинициализированных/неопределённых имён** | Semantic analyzer отклоняет до исполнения | `test_undefined_variable_is_rejected` |
 | **Type safety (динамическая)** | Бинарные операции проверяют совместимость типов в runtime (`arith()`/`compare()` в `src/vm/mod.rs`), несовместимые типы -> `RuntimeError`, не "тихая" порча данных | покрыто косвенно через `arith`/`compare` match-конструкции, которые не имеют catch-all "приведения" |
 | **Type safety (статическая, градуальная)** | Аннотации типов (`: int`, `-> string`, ...) проверяются отдельным проходом `src/typechecker/mod.rs` ДО выполнения; без аннотации поведение остаётся полностью динамическим (обратная совместимость) | `test_typed_function_param_and_return_mismatch_is_rejected`, `test_typed_var_decl_with_mismatched_value_is_type_error`, `test_untyped_var_can_still_change_type_freely` |
-| **Защита от stack overflow рекурсии** | `Vm::max_call_depth = 200`, превышение -> управляемая ошибка | `test_recursion_depth_limit_triggers_before_stack_overflow`, `test_recursion_depth_limit_is_safe_under_default_sized_stack` |
+| **Защита от stack overflow рекурсии (вызовы функций)** | `Vm::max_call_depth = 200`, превышение -> управляемая ошибка | `test_recursion_depth_limit_triggers_before_stack_overflow`, `test_recursion_depth_limit_is_safe_under_default_sized_stack` |
+| **Защита от stack overflow в рекурсивном спуске парсера** | До фикса: `((((...1...))))` с несколькими тысячами вложенных `(` (буквально пара КБ исходного текста — тривиально малый входной файл) давало неперехватываемый `fatal runtime error: stack overflow` и `abort()` процесса — НЕ Rust panic, `catch_unwind` не помогает. Подтверждено эмпирически: переполнение происходит между ~1000 и ~5000 уровней вложенности на стандартном стеке потока. `Parser::guarded_recursion` (общий счётчик глубины для `parse_expr`/`parse_stmt`, `MAX_PARSE_DEPTH = 256`, симметрично с `max_call_depth`) превращает это в управляемую `ParseError` | `test_deeply_nested_parens_returns_parse_error_not_stack_overflow`, `test_moderately_nested_parens_still_parses_successfully` (negative-тест на false positive) |
 | **Bytecode verifier** | `Chunk`/`OpCode`/`CompiledProgram` публичны, поэтому потребитель крейта может сконструировать байткод напрямую, в обход компилятора; `Vm::new` верифицирует все ссылки на пул констант и все цели переходов (включая тела вложенных замыканий) ДО исполнения и отклоняет повреждённый байткод как `RuntimeError`, а не падает в Rust panic | `test_vm_rejects_chunk_with_out_of_bounds_const_index_instead_of_panicking`, `test_vm_rejects_chunk_with_jump_target_past_end`, `test_vm_rejects_corrupted_function_chunk_not_just_main` |
+| **Защита от scope-stack underflow в `DefineVar`** | `verify_chunk` не проверяет статически баланс `PushScope`/`PopScope` (ненадёжно при наличии `Jump`/`JumpIfFalse` — порядок исполнения динамический). До фикса вручную сконструированный `Chunk` с лишним `PopScope` (без соответствующего `PushScope`) опускал `scopes` до пустого вектора, и следующий `DefineVar` падал на `scopes.last_mut().unwrap()` — неуправляемая Rust panic. Заменено на `.ok_or_else(...)?`, в точности тот же паттерн, что уже используется для каждого `stack.pop()` в этой функции | `test_vm_defines_var_after_scope_underflow_returns_runtime_error_not_panic` |
+| **IMPORT confinement (path traversal / absolute path)** | `IMPORT` — единственная операция файлового I/O во всём пайплайне (резолвится в `module_resolver::resolve_imports`). До фикса `Path::join` с абсолютным аргументом (документированное поведение std: абсолютный путь полностью заменяет базу) и относительные `../../`-цепочки позволяли `IMPORT "/etc/passwd";` или `IMPORT "../../secret.sga";` читать и инлайнить произвольный файл с правами процесса — за пределами каталога входного файла программы. Подтверждено эмпирически PoC (планированный секрет в файле вне проекта успешно "утёк" через `print()`). Исправлено: абсолютные пути отклоняются безусловно (до `.join`); резолвленный путь обязан остаться внутри каталога входного файла программы — проверяется через `std::fs::canonicalize` (резолвит symlink) с лексическим fallback'ом для случаев, когда путь ещё не существует на диске (in-memory loader в тестах). Легитимные `..`, которые НЕ выходят за эту границу (вложенные модули внутри одного проекта), продолжают резолвиться как раньше | `test_absolute_path_import_is_rejected`, `test_path_traversal_escaping_entry_root_is_rejected_on_real_fs`, `test_path_traversal_within_entry_root_still_works_on_real_fs` |
 
 ## Явно НЕ реализовано в v0.1 (см. ROADMAP)
 
@@ -28,10 +31,28 @@
   Любая переменная может стать `Nil` в runtime без статической проверки.
 - **Safe concurrency**: нет потоков/async — соответственно, и нет
   гонок данных, но и нет самой конкурентности.
-- **Sandbox execution / permission system**: нет модели прав доступа к
-  файловой системе/сети, потому что у языка пока нет файловой
-  системы/сети (`std/fs`, `std/net` не реализованы). Заявлять "sandbox"
-  для несуществующего I/O было бы пустой декларацией.
+- **Sandbox execution / permission system для самих SGA-программ**: нет
+  модели прав доступа к файловой системе/сети ВНУТРИ языка, потому что
+  у SGA-программ пока нет собственного файлового/сетевого I/O
+  (`std/fs`, `std/net` не реализованы для пользовательского кода —
+  заявлять "sandbox" для несуществующего I/O было бы пустой
+  декларацией). Это НЕ относится к `IMPORT`: это I/O самого
+  компилятора/резолвера, а не языка, и для него confinement-граница
+  теперь есть и проверена тестами (см. строку "IMPORT confinement"
+  выше) — раньше этот документ ошибочно не делал это разграничение
+  явным, что и затушёвывало реальную уязвимость до аудита.
+- **Защита от бесконечных циклов / instruction budget в VM**: у VM есть
+  лимит на ГЛУБИНУ вызовов (`max_call_depth = 200`, см. выше), но нет
+  лимита на ОБЩЕЕ количество исполненных инструкций — `WHILE ИСТИНА {}`
+  выполняется неограниченно долго, потребляя 100% CPU одного потока без
+  тайм-аута. Не является уязвимостью при локальном однопользовательском
+  запуске (тот же процесс, что и сам пользователь, мог бы написать
+  `while true {}` и на любом другом языке), но становится DoS-вектором
+  в любом сценарии, где SGA-программы из недоверенного источника
+  исполняются в общем процессе/сервисе (онлайн-площадка, CI). Открытый
+  пункт — реализация требует решений по умолчанию по бюджету, обратной
+  совместимости API `Vm::new`/`Vm::run` и поведению при превышении
+  лимита (см. docs/ROADMAP.md).
 - **Статическая типобезопасность**: типы проверяются только в runtime.
 
 ## Известные ограничения, важные для безопасности

@@ -24,16 +24,58 @@ impl std::fmt::Display for ParseError {
     }
 }
 
+/// Максимальная глубина рекурсии рекурсивного спуска (выражения и
+/// вложенные блоки/операторы — см. `parse_expr`/`parse_stmt`).
+///
+/// БЕЗ ЭТОГО ЛИМИТА: `((((((...1...))))))` с несколькими тысячами
+/// вложенных `(` (буквально пара КБ исходного текста) даёт
+/// неперехватываемый `fatal runtime error: stack overflow` и `abort()`
+/// процесса — НЕ Rust panic, поэтому `catch_unwind` не помогает, а
+/// `Result`/`?` в `PResult` тоже не успевает сработать: стек уже
+/// переполнен до того, как первый `Err` смог бы всплыть. Эмпирически
+/// подтверждено: на стандартном стеке потока переполнение происходит
+/// между ~1000 и ~5000 уровней вложенности (см. docs/SECURITY.md).
+/// 256 выбрано симметрично с `Vm::max_call_depth = 200` (см.
+/// `vm/mod.rs`) и даёт огромный запас (на 1-2 порядка меньше порога
+/// реального переполнения) для легитимных программ — ни один реальный
+/// код, включая сгенерированный, не вкладывает выражения/блоки на
+/// 256 уровней.
+const MAX_PARSE_DEPTH: usize = 256;
+
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// Текущая глубина рекурсии `parse_expr`/`parse_stmt` (общий
+    /// счётчик для обоих — стек растёт от обоих видов рекурсии вместе,
+    /// поэтому лимитировать их по отдельности было бы недостаточно).
+    depth: usize,
 }
 
 type PResult<T> = Result<T, ParseError>;
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Parser { tokens, pos: 0 }
+        Parser { tokens, pos: 0, depth: 0 }
+    }
+
+    /// Входная точка в рекурсию с проверкой глубины. Увеличивает
+    /// `self.depth`, выполняет `f`, затем гарантированно уменьшает
+    /// обратно (в том числе на пути ошибки). Без RAII-guard, потому что
+    /// держать `&mut self.depth` живым одновременно с `&mut self`,
+    /// нужным внутри `f`, не проходит borrow checker — вместо этого
+    /// декремент выполняется явно после вызова `f`, последовательно.
+    fn guarded_recursion<T>(&mut self, what: &str, f: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<T> {
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            self.depth -= 1;
+            return Err(self.err(&format!(
+                "превышена максимальная глубина вложенности {} ({}) — защита от stack overflow",
+                what, MAX_PARSE_DEPTH
+            )));
+        }
+        let result = f(self);
+        self.depth -= 1;
+        result
     }
 
     fn peek(&self) -> &Token {
@@ -119,13 +161,17 @@ impl Parser {
         Ok(stmts)
     }
 
+    fn parse_stmt(&mut self, top_level: bool) -> PResult<Stmt> {
+        self.guarded_recursion("блоков/операторов", |p| p.parse_stmt_inner(top_level))
+    }
+
     /// `top_level=true` только для statement'ов непосредственно в теле
     /// программы (`parse_program`). Внутри любого блока (`if`/`while`/
     /// `for`/`fn`-тело) — `top_level=false`. Используется, чтобы явно
     /// запретить вложенные `FN`/`IMPORT` синтаксически, вместо того
     /// чтобы давать им молча пройти semantic-анализ (см.
     /// docs/COMPILER_SPEC.md — функции и импорты только верхнего уровня).
-    fn parse_stmt(&mut self, top_level: bool) -> PResult<Stmt> {
+    fn parse_stmt_inner(&mut self, top_level: bool) -> PResult<Stmt> {
         match self.peek_kind().clone() {
             TokenKind::Let => {
                 self.advance();
@@ -388,7 +434,7 @@ impl Parser {
     // --- выражения, по приоритетам ---
 
     fn parse_expr(&mut self) -> PResult<Expr> {
-        self.parse_assignment()
+        self.guarded_recursion("выражения", |p| p.parse_assignment())
     }
 
     fn parse_assignment(&mut self) -> PResult<Expr> {

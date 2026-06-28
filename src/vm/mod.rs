@@ -158,7 +158,25 @@ impl Vm {
                 }
                 OpCode::DefineVar(name, mutable) => {
                     let v = stack.pop().ok_or_else(|| rt_err("пустой стек при DefineVar"))?;
-                    scopes.last_mut().unwrap().vars.insert(name.clone(), (v, *mutable));
+                    // FIX (security audit): было `scopes.last_mut().unwrap()`.
+                    // `Chunk`/`OpCode` — публичные типы (см. docstring
+                    // `verify_chunk` выше), и `PopScope` без соответствующего
+                    // `PushScope` (рассогласованный байткод — несбалансированные
+                    // PushScope/PopScope) опускает `scopes` до пустого вектора;
+                    // следующий `DefineVar` на `unwrap()` паниковал —
+                    // неконтролируемая Rust panic вместо `RuntimeError`, ровно
+                    // тот класс багов, для которого существует `verify_chunk`/
+                    // `verify_program`, но статическая проверка баланса
+                    // PushScope/PopScope ненадёжна при наличии Jump/JumpIfFalse
+                    // (порядок исполнения динамический), поэтому защита
+                    // выставлена здесь, в точке фактического использования —
+                    // тот же паттерн, что уже применяется выше для каждого
+                    // `stack.pop()` в этой функции.
+                    scopes
+                        .last_mut()
+                        .ok_or_else(|| rt_err("повреждённый байткод: DefineVar без активного scope (PopScope без соответствующего PushScope)"))?
+                        .vars
+                        .insert(name.clone(), (v, *mutable));
                 }
                 OpCode::Pop => {
                     stack.pop();

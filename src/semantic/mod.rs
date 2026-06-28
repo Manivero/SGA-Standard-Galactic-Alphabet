@@ -60,6 +60,12 @@ pub struct Analyzer {
     fn_depth: u32,
 }
 
+impl Default for Analyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Analyzer {
     pub fn new() -> Self {
         Analyzer { scopes: vec![Scope { vars: HashMap::new() }], functions: HashMap::new(), structs: HashMap::new(), loop_depth: 0, fn_depth: 0 }
@@ -103,7 +109,7 @@ impl Analyzer {
     /// вызова функции, `f()[0] = v`), возвращает `None`: в этом случае
     /// мы не можем статически определить владельца и не блокируем
     /// операцию (известное ограничение v0.1, см. docs/ROADMAP.md).
-    fn mutation_root<'e>(expr: &'e Expr) -> Option<&'e str> {
+    fn mutation_root(expr: &Expr) -> Option<&str> {
         match expr {
             Expr::Ident(name) => Some(name.as_str()),
             Expr::Index(target, _) => Self::mutation_root(target),

@@ -96,9 +96,18 @@ pub fn resolve_imports<L: ModuleLoader>(
     let mut visited = HashSet::new();
     let mut in_progress = Vec::new(); // стек текущей цепочки импортов — для сообщения о цикле
     let entry_dir = entry_path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+    // SECURITY (см. docs/SECURITY.md, "IMPORT confinement"): `entry_dir`
+    // — это и есть граница песочницы для ВСЕГО графа импортов, включая
+    // транзитивные. Она вычисляется один раз здесь и передаётся вниз по
+    // рекурсии неизменной (`root`), в отличие от `current_dir`, который
+    // меняется на каждом уровне вложенности для резолвинга
+    // относительных путей. Если бы каждый уровень вычислял свою
+    // собственную границу из своего `current_dir`, `..` мог бы "сбежать"
+    // выше предыдущей границы на каждом новом уровне импорта.
+    let root = lexically_normalize(&entry_dir);
     visited.insert(normalize_key(entry_path));
     in_progress.push(normalize_key(entry_path));
-    let resolved = resolve_program(program, &entry_dir, loader, parse_fn, &mut visited, &mut in_progress)?;
+    let resolved = resolve_program(program, &entry_dir, &root, loader, parse_fn, &mut visited, &mut in_progress)?;
     in_progress.pop();
     Ok(resolved)
 }
@@ -114,9 +123,62 @@ fn normalize_key(path: &Path) -> String {
     std::fs::canonicalize(path).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| path.to_string_lossy().into_owned())
 }
 
+/// Чисто лексическая нормализация пути: резолвит `.` и `..` через
+/// компоненты пути, БЕЗ обращения к файловой системе (в отличие от
+/// `std::fs::canonicalize`, которому нужно, чтобы путь физически
+/// существовал, и который не работает для in-memory `ModuleLoader` в
+/// тестах). Если `..` пытается "подняться" выше уже нормализованной
+/// части пути (нет предыдущего `Normal`-компонента, который можно
+/// снять), он сохраняется буквально, а не отбрасывается молча — это
+/// важно для проверки confinement ниже: путь типа `../../secret.sga`,
+/// у которого после нормализации остаются нескомпенсированные `..`,
+/// никогда не будет иметь префиксом нормализованный `root` (у которого
+/// таких `..` нет), и `starts_with` корректно провалит проверку, а не
+/// тихо "проглотит" попытку выхода.
+fn lexically_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::ParentDir => match out.components().last() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                _ => out.push(".."),
+            },
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Проверяет, что `candidate` (уже объединённый с `current_dir`, но
+/// ещё не прочитанный с диска) остаётся внутри `root` — каталога
+/// входного файла программы. Это единственная граница доверия для
+/// `IMPORT`: всё, что внутри неё, резолвится свободно (в том числе
+/// через `..`, если он не выводит за пределы `root` — например,
+/// `project/a/b.sga`, импортирующий `../c.sga`, остаётся внутри
+/// `project/`), а всё, что снаружи — отклоняется до попытки чтения
+/// файла.
+///
+/// На реальной ФС (`FsLoader`) предпочитается `std::fs::canonicalize`
+/// (резолвит symlink'и — лексическая проверка сама по себе не защищает
+/// от symlink, указывающего наружу `root`); если канонизация
+/// недоступна (путь ещё не существует на диске — в частности, ВСЕГДА
+/// верно для in-memory `ModuleLoader` в тестах), используется
+/// лексический fallback.
+fn is_within_root(candidate: &Path, root: &Path) -> bool {
+    match (std::fs::canonicalize(candidate), std::fs::canonicalize(root)) {
+        (Ok(c), Ok(r)) => c.starts_with(r),
+        _ => lexically_normalize(candidate).starts_with(lexically_normalize(root)),
+    }
+}
+
 fn resolve_program<L: ModuleLoader>(
     program: Program,
     current_dir: &Path,
+    root: &Path,
     loader: &L,
     parse_fn: &dyn Fn(&str) -> Result<Program, String>,
     visited: &mut HashSet<String>,
@@ -126,7 +188,33 @@ fn resolve_program<L: ModuleLoader>(
     for stmt in program {
         match stmt {
             Stmt::Import(rel_path) => {
+                // SECURITY: абсолютные пути в IMPORT запрещены безусловно.
+                // `Path::join` в Rust, если аргумент абсолютный, ПОЛНОСТЬЮ
+                // заменяет базовый путь (это документированное поведение
+                // std, не баг) — без этой проверки `IMPORT "/etc/passwd";`
+                // игнорировал бы `current_dir` целиком и читал бы
+                // произвольный файл с прав процесса. Проверяется ДО
+                // `.join`, чтобы не зависеть от этого нюанса `Path::join`.
+                if Path::new(&rel_path).is_absolute() {
+                    return Err(ImportError(format!(
+                        "IMPORT с абсолютным путём запрещён: '{}'. Пути импорта обязаны быть относительными и не выходить за пределы каталога входного файла программы",
+                        rel_path
+                    )));
+                }
+
                 let full_path = current_dir.join(&rel_path);
+
+                // SECURITY: то же самое для `..`-побега за пределы
+                // каталога входного файла (path traversal) — см.
+                // `is_within_root` и docs/SECURITY.md.
+                if !is_within_root(&full_path, root) {
+                    return Err(ImportError(format!(
+                        "IMPORT \"{}\" выходит за пределы каталога входного файла программы ('{}'); обход через '..' запрещён",
+                        rel_path,
+                        root.display()
+                    )));
+                }
+
                 let key = normalize_key(&full_path);
 
                 if in_progress.contains(&key) {
@@ -151,7 +239,7 @@ fn resolve_program<L: ModuleLoader>(
                 })?;
                 let imported_dir = full_path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
                 let resolved_imported =
-                    resolve_program(imported_program, &imported_dir, loader, parse_fn, visited, in_progress)?;
+                    resolve_program(imported_program, &imported_dir, root, loader, parse_fn, visited, in_progress)?;
 
                 in_progress.pop();
                 out.extend(resolved_imported);
