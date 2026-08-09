@@ -140,7 +140,7 @@ fn lexically_normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in path.components() {
         match comp {
-            Component::ParentDir => match out.components().last() {
+            Component::ParentDir => match out.components().next_back() {
                 Some(Component::Normal(_)) => {
                     out.pop();
                 }

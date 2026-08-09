@@ -141,38 +141,68 @@ fn test_parser_produces_expected_statement_count() {
     assert_eq!(program.len(), 2);
 }
 
-/// SECURITY FIX (audit): рекурсивный спуск без лимита глубины давал
-/// неперехватываемый `fatal runtime error: stack overflow` (`abort()`
-/// процесса, не Rust panic — `catch_unwind` не спасает) на глубоко
-/// вложенном выражении. Подтверждено эмпирически ДО исправления:
-/// крейт реально вызывал stack overflow между ~1000 и ~5000 уровней
-/// вложенных `(` (~2-10 КБ исходного текста — тривиально малый входной
-/// файл). После исправления (`Parser::guarded_recursion`,
-/// `MAX_PARSE_DEPTH = 256`) это управляемая `ParseError`, а не crash
-/// процесса.
+/// SECURITY FIX (T001, см. IMPLEMENTATION_LOG.md): рекурсивный спуск без
+/// достаточной защиты давал неперехватываемый `fatal runtime error: stack
+/// overflow` (`abort()` процесса, не Rust panic — `catch_unwind` не
+/// спасает) на глубоко вложенном выражении. ПЕРВАЯ версия этой защиты
+/// (`MAX_PARSE_DEPTH = 256`, без явного `stack_size` у этого теста) САМА
+/// была уязвима к тому же классу бага, который она должна была
+/// предотвращать: `self.depth` считает по одному инкременту на вызов
+/// `parse_expr`, а один такой вызов — это ~10 вложенных нативных
+/// Rust-кадров (вся цепочка precedence-climbing, см. doc-комментарий
+/// `MAX_PARSE_DEPTH` в `src/parser/mod.rs`), поэтому 256 "уровней"
+/// защиты реально исчерпывали 2‑МиБ стек ЗАДОЛГО до срабатывания
+/// проверки. 2 МиБ — это дефолтный размер стека НЕ главного потока в
+/// Rust, если явно не задан `stack_size`/`RUST_MIN_STACK` — именно такой
+/// поток даёт тестовый харнесс `cargo test` каждому `#[test]`, что и
+/// вызывало реальный краш при обычном запуске (эмпирические пороги
+/// переполнения при разных размерах стека — см. `MAX_PARSE_DEPTH`).
+/// Исправлено: (а) `MAX_PARSE_DEPTH` уменьшен до эмпирически проверенного
+/// безопасного значения `80`; (б) этот тест теперь, как и аналогичные
+/// тесты `Vm::max_call_depth` ниже, явно запускается в потоке с
+/// фиксированным `stack_size` (2 МиБ — именно тот размер, на котором
+/// воспроизводился реальный краш), а не полагается на непроверяемый
+/// дефолт тестового харнесса.
 #[test]
 fn test_deeply_nested_parens_returns_parse_error_not_stack_overflow() {
-    let depth = 100_000; // на 2-3 порядка больше, чем порог реального stack overflow без защиты
+    let depth = 100_000; // на 3 порядка больше эмпирического порога переполнения без защиты
     let mut expr = String::from("1");
     for _ in 0..depth {
         expr = format!("({})", expr);
     }
     let src = format!("{} x = {};", kw("LET"), expr);
-    let tokens = lexer::Lexer::new(&src).tokenize().unwrap();
-    match parser::Parser::new(tokens).parse_program() {
-        Err(e) => assert!(
-            e.to_string().contains("глубин"),
+    let handle = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || {
+            let tokens = lexer::Lexer::new(&src).tokenize().unwrap();
+            match parser::Parser::new(tokens).parse_program() {
+                Ok(_) => Ok(()),
+                Err(e) => Err(e.to_string()),
+            }
+        })
+        .expect("не удалось создать поток для теста");
+    match handle.join() {
+        Ok(Err(msg)) => assert!(
+            msg.contains("глубин"),
             "ошибка должна явно объяснять превышение глубины вложенности, получено: {}",
-            e
+            msg
         ),
-        Ok(_) => panic!("ожидалась ParseError (превышена максимальная глубина вложенности), получен Ok — лимит глубины не сработал"),
+        Ok(Ok(())) => panic!(
+            "ожидалась ParseError (превышена максимальная глубина вложенности), получен Ok — лимит глубины не сработал"
+        ),
+        Err(_) => panic!(
+            "ПРОЦЕСС РУХНУЛ (реальный stack overflow) в потоке с 2 МиБ стека — MAX_PARSE_DEPTH \
+             слишком велик относительно реального расхода стека на кадр parse_expr (регрессия T001)"
+        ),
     }
 }
 
 /// Negative-тест к предыдущему: лимит глубины не должен давать false
 /// positive на легитимных, умеренно вложенных выражениях — 50 уровней
-/// `(...)` — это глубже любого реального кода, но всё ещё далеко от
-/// `MAX_PARSE_DEPTH = 256`.
+/// `(...)` (пик глубины ~51 с учётом охватывающего `LET`) — это глубже
+/// любого реального кода, но всё ещё с запасом ~29 уровней от
+/// `MAX_PARSE_DEPTH = 80` (см. обоснование выбора этого значения в
+/// doc-комментарии `MAX_PARSE_DEPTH`, `src/parser/mod.rs`).
 #[test]
 fn test_moderately_nested_parens_still_parses_successfully() {
     let depth = 50;
