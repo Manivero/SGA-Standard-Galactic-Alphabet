@@ -26,7 +26,9 @@ fn main() -> ExitCode {
         }
         "build" => {
             eprintln!("'sga build' (нативная компиляция через LLVM) пока не реализована.");
-            eprintln!("Текущий бэкенд v0.1 — собственная байткод-VM. Используйте 'sga run <файл.sga>'.");
+            eprintln!(
+                "Текущий бэкенд v0.1 — собственная байткод-VM. Используйте 'sga run <файл.sga>'."
+            );
             eprintln!("См. docs/ROADMAP.md, раздел 'Бэкенды'.");
             ExitCode::FAILURE
         }
@@ -43,7 +45,10 @@ fn main() -> ExitCode {
             cmd_fmt(&args[2])
         }
         "lint" | "install" | "uninstall" | "doctor" | "update" | "package" => {
-            eprintln!("команда '{}' входит в roadmap CLI, но не реализована в v0.1. См. docs/ROADMAP.md.", args[1]);
+            eprintln!(
+                "команда '{}' входит в roadmap CLI, но не реализована в v0.1. См. docs/ROADMAP.md.",
+                args[1]
+            );
             ExitCode::FAILURE
         }
         "version" | "--version" | "-v" => {
@@ -63,7 +68,9 @@ fn print_usage() {
     eprintln!();
     eprintln!("команды:");
     eprintln!("  run <файл.sga>    скомпилировать и выполнить файл на встроенной VM");
-    eprintln!("                    (поддерживает IMPORT \"путь.sga\"; — см. docs/COMPILER_SPEC.md)");
+    eprintln!(
+        "                    (поддерживает IMPORT \"путь.sga\"; — см. docs/COMPILER_SPEC.md)"
+    );
     eprintln!("  init [путь]       создать новый проект (sga.toml + src/main.sga)");
     eprintln!("  fmt <файл.sga>    вывести AST-нормализованный псевдокод файла (диагностика;");
     eprintln!("                    НЕ резолвит IMPORT — показывает AST файла как есть)");
@@ -137,5 +144,8 @@ fn cmd_init(dir: &str) -> ExitCode {
 fn encode_hello_world() -> String {
     let let_kw = sga_alphabet::encode_word("LET");
     let print_kw = sga_alphabet::encode_word("PRINT");
-    format!("{} message = \"Hello, SGA!\";\n{}(message);\n", let_kw, print_kw)
+    format!(
+        "{} message = \"Hello, SGA!\";\n{}(message);\n",
+        let_kw, print_kw
+    )
 }

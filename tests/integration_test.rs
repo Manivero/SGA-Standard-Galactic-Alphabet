@@ -17,9 +17,9 @@ use sga::runtime::Value;
 use sga::sga_alphabet::encode_word;
 use sga::vm::Vm;
 use sga::{codegen, lexer, parser, semantic, SgaError};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::cell::RefCell;
 
 fn kw(word: &str) -> String {
     encode_word(word)
@@ -42,7 +42,10 @@ fn test_immutable_assignment_is_rejected() {
     let src = format!("{} x = 5; x = 10;", kw("LET"));
     match run(&src) {
         Err(SgaError::Semantic(_)) => {}
-        other => panic!("ожидалась ошибка семантики (immutable), получено {:?}", other),
+        other => panic!(
+            "ожидалась ошибка семантики (immutable), получено {:?}",
+            other
+        ),
     }
 }
 
@@ -57,13 +60,20 @@ fn test_undefined_variable_is_rejected() {
     let src = format!("{}(y);", kw("PRINT"));
     match run(&src) {
         Err(SgaError::Semantic(_)) => {}
-        other => panic!("ожидалась ошибка семантики (undefined), получено {:?}", other),
+        other => panic!(
+            "ожидалась ошибка семантики (undefined), получено {:?}",
+            other
+        ),
     }
 }
 
 #[test]
 fn test_integer_overflow_is_runtime_error_not_panic() {
-    let src = format!("{} x = 9223372036854775807; {}(x + 1);", kw("LET"), kw("PRINT"));
+    let src = format!(
+        "{} x = 9223372036854775807; {}(x + 1);",
+        kw("LET"),
+        kw("PRINT")
+    );
     match run(&src) {
         Err(SgaError::Runtime(msg)) => assert!(msg.contains("переполнение")),
         other => panic!("ожидалась ошибка переполнения, получено {:?}", other),
@@ -72,7 +82,12 @@ fn test_integer_overflow_is_runtime_error_not_panic() {
 
 #[test]
 fn test_division_by_zero_is_runtime_error() {
-    let src = format!("{} a = 1; {} b = 0; {}(a / b);", kw("LET"), kw("LET"), kw("PRINT"));
+    let src = format!(
+        "{} a = 1; {} b = 0; {}(a / b);",
+        kw("LET"),
+        kw("LET"),
+        kw("PRINT")
+    );
     match run(&src) {
         Err(SgaError::Runtime(_)) => {}
         other => panic!("ожидалась ошибка деления на ноль, получено {:?}", other),
@@ -93,7 +108,10 @@ fn test_break_outside_loop_is_compile_error() {
     let src = kw("BREAK") + ";";
     match run(&src) {
         Err(SgaError::Semantic(_)) => {}
-        other => panic!("ожидалась ошибка семантики (break вне цикла), получено {:?}", other),
+        other => panic!(
+            "ожидалась ошибка семантики (break вне цикла), получено {:?}",
+            other
+        ),
     }
 }
 
@@ -249,7 +267,10 @@ fn test_immutable_array_index_assignment_is_rejected() {
     let src = format!("{} a = [1, 2, 3]; a[0] = 99;", kw("LET"));
     match run(&src) {
         Err(SgaError::Semantic(msg)) => assert!(msg.contains("immutable")),
-        other => panic!("ожидалась ошибка семантики (immutable через индекс), получено {:?}", other),
+        other => panic!(
+            "ожидалась ошибка семантики (immutable через индекс), получено {:?}",
+            other
+        ),
     }
 }
 
@@ -259,7 +280,10 @@ fn test_immutable_array_push_is_rejected() {
     let src = format!("{} a = [1, 2, 3]; push(a, 4);", kw("LET"));
     match run(&src) {
         Err(SgaError::Semantic(msg)) => assert!(msg.contains("immutable")),
-        other => panic!("ожидалась ошибка семантики (immutable через push), получено {:?}", other),
+        other => panic!(
+            "ожидалась ошибка семантики (immutable через push), получено {:?}",
+            other
+        ),
     }
 }
 
@@ -270,7 +294,11 @@ fn test_immutable_array_push_is_rejected() {
 /// программа теперь завершается успешно (Ok), а не падает.
 #[test]
 fn test_self_referential_array_does_not_crash_on_print() {
-    let src = format!("{var} a = [1, 2, 3]; a[0] = a; {pr}(a);", var = kw("VAR"), pr = kw("PRINT"));
+    let src = format!(
+        "{var} a = [1, 2, 3]; a[0] = a; {pr}(a);",
+        var = kw("VAR"),
+        pr = kw("PRINT")
+    );
     assert!(run(&src).is_ok());
 }
 
@@ -299,7 +327,10 @@ fn test_immutability_bypass_through_function_parameter_is_now_fixed() {
     );
     match run(&src) {
         Err(SgaError::Semantic(msg)) => assert!(msg.contains("immutable")),
-        other => panic!("ожидалась ошибка семантики (immutable-параметр без MUT), получено {:?}", other),
+        other => panic!(
+            "ожидалась ошибка семантики (immutable-параметр без MUT), получено {:?}",
+            other
+        ),
     }
 }
 
@@ -330,7 +361,10 @@ fn test_passing_immutable_variable_to_mut_parameter_is_rejected() {
     );
     match run(&src) {
         Err(SgaError::Semantic(msg)) => assert!(msg.contains("MUT")),
-        other => panic!("ожидалась ошибка семантики (передача LET в MUT-параметр), получено {:?}", other),
+        other => panic!(
+            "ожидалась ошибка семантики (передача LET в MUT-параметр), получено {:?}",
+            other
+        ),
     }
 }
 
@@ -427,7 +461,10 @@ fn test_typed_var_reassignment_with_wrong_type_is_rejected() {
     let src = format!("{} x: int = 5; x = \"теперь строка\";", kw("VAR"));
     match run(&src) {
         Err(SgaError::Type(_)) => {}
-        other => panic!("ожидалась ошибка типов при переприсваивании, получено {:?}", other),
+        other => panic!(
+            "ожидалась ошибка типов при переприсваивании, получено {:?}",
+            other
+        ),
     }
 }
 
@@ -436,7 +473,11 @@ fn test_typed_var_reassignment_with_wrong_type_is_rejected() {
 /// существующий untyped-код.
 #[test]
 fn test_untyped_var_can_still_change_type_freely() {
-    let src = format!("{var} x = 5; x = \"теперь строка\"; {pr}(x);", var = kw("VAR"), pr = kw("PRINT"));
+    let src = format!(
+        "{var} x = 5; x = \"теперь строка\"; {pr}(x);",
+        var = kw("VAR"),
+        pr = kw("PRINT")
+    );
     assert!(run(&src).is_ok());
 }
 
@@ -459,17 +500,28 @@ fn test_builtin_len_return_type_signature_is_checked() {
     let bad = format!("{} n: string = len([1, 2, 3]);", kw("LET"));
     match run(&bad) {
         Err(SgaError::Type(_)) => {}
-        other => panic!("ожидалась ошибка типов (len -> int, не string), получено {:?}", other),
+        other => panic!(
+            "ожидалась ошибка типов (len -> int, не string), получено {:?}",
+            other
+        ),
     }
 }
 
 #[test]
 fn test_array_index_must_be_int_when_statically_known() {
-    let src =
-        format!("{} idx: bool = {}; {} a = [1, 2, 3]; {}(a[idx]);", kw("LET"), kw("TRUE"), kw("VAR"), kw("PRINT"));
+    let src = format!(
+        "{} idx: bool = {}; {} a = [1, 2, 3]; {}(a[idx]);",
+        kw("LET"),
+        kw("TRUE"),
+        kw("VAR"),
+        kw("PRINT")
+    );
     match run(&src) {
         Err(SgaError::Type(_)) => {}
-        other => panic!("ожидалась ошибка типов (индекс должен быть int), получено {:?}", other),
+        other => panic!(
+            "ожидалась ошибка типов (индекс должен быть int), получено {:?}",
+            other
+        ),
     }
 }
 
@@ -488,7 +540,10 @@ fn test_nested_fn_declaration_is_rejected_by_parser() {
     );
     match run(&src) {
         Err(SgaError::Parse(_)) => {}
-        other => panic!("ожидалась ошибка парсера (вложенный FN), получено {:?}", other),
+        other => panic!(
+            "ожидалась ошибка парсера (вложенный FN), получено {:?}",
+            other
+        ),
     }
 }
 
@@ -501,22 +556,37 @@ fn test_builtin_call_with_wrong_arity_is_semantic_error() {
     let src = format!("{}(len());", kw("PRINT"));
     match run(&src) {
         Err(SgaError::Semantic(_)) => {}
-        other => panic!("ожидалась ошибка семантики (len без аргументов), получено {:?}", other),
+        other => panic!(
+            "ожидалась ошибка семантики (len без аргументов), получено {:?}",
+            other
+        ),
     }
 }
 
 #[test]
 fn test_push_with_variable_arity_one_or_two_args_is_accepted() {
-    let src = format!("{var} a = [1]; {push}(a); {push}(a, 2); {pr}(a);", var = kw("VAR"), push = "push", pr = kw("PRINT"));
+    let src = format!(
+        "{var} a = [1]; {push}(a); {push}(a, 2); {pr}(a);",
+        var = kw("VAR"),
+        push = "push",
+        pr = kw("PRINT")
+    );
     assert!(run(&src).is_ok());
 }
 
 #[test]
 fn test_push_with_three_args_is_semantic_error() {
-    let src = format!("{var} a = [1]; {push}(a, 2, 3);", var = kw("VAR"), push = "push");
+    let src = format!(
+        "{var} a = [1]; {push}(a, 2, 3);",
+        var = kw("VAR"),
+        push = "push"
+    );
     match run(&src) {
         Err(SgaError::Semantic(_)) => {}
-        other => panic!("ожидалась ошибка семантики (push с 3 аргументами), получено {:?}", other),
+        other => panic!(
+            "ожидалась ошибка семантики (push с 3 аргументами), получено {:?}",
+            other
+        ),
     }
 }
 
@@ -528,7 +598,7 @@ fn test_push_with_three_args_is_semantic_error() {
 /// `RuntimeError`, а не зависает и не паникует в обычных условиях.
 ///
 /// ВАЖНАЯ ОГОВОРКА: этот тест запускается с заведомо щедрым стеком
-/// потока (16 МиБ), поэтому он подтверждает корректность СРАБАТЫВАНИЯ
+/// потока (8 МиБ), поэтому он подтверждает корректность СРАБАТЫВАНИЯ
 /// лимита, но НЕ откалиброван под минимальный безопасный размер стека.
 ///
 /// FUSION-ПРИМЕЧАНИЕ: исходная версия этого теста перемещала
@@ -590,7 +660,7 @@ fn test_recursion_depth_limit_triggers_before_stack_overflow() {
         }
         Ok(Ok(())) => panic!("ожидалась RuntimeError о превышении глубины рекурсии, получено Ok"),
         Err(_) => panic!(
-            "поток аварийно завершился даже при щедром стеке 16 МиБ (вероятно, реальный stack \
+            "поток аварийно завершился даже при щедром стеке 64 МиБ (вероятно, реальный stack \
              overflow ДО срабатывания max_call_depth) — это серьёзная регрессия"
         ),
     }
@@ -609,7 +679,10 @@ fn test_vm_rejects_chunk_with_out_of_bounds_const_index_instead_of_panicking() {
         code: vec![OpCode::PushConst(0), OpCode::Return(true)],
         constants: vec![],
     };
-    let program = CompiledProgram { main: chunk, functions: HashMap::new() };
+    let program = CompiledProgram {
+        main: chunk,
+        functions: HashMap::new(),
+    };
     match Vm::new(program) {
         Err(_) => {}
         Ok(_) => panic!("ожидалась ошибка верификации байткода (PushConst вне границ пула констант), получен Ok"),
@@ -619,11 +692,19 @@ fn test_vm_rejects_chunk_with_out_of_bounds_const_index_instead_of_panicking() {
 /// Аналогичный тест для `Jump`/`JumpIfFalse` с целью за пределами чанка.
 #[test]
 fn test_vm_rejects_chunk_with_jump_target_past_end() {
-    let chunk = Chunk { code: vec![OpCode::Jump(99), OpCode::Return(false)], constants: vec![] };
-    let program = CompiledProgram { main: chunk, functions: HashMap::new() };
+    let chunk = Chunk {
+        code: vec![OpCode::Jump(99), OpCode::Return(false)],
+        constants: vec![],
+    };
+    let program = CompiledProgram {
+        main: chunk,
+        functions: HashMap::new(),
+    };
     match Vm::new(program) {
         Err(_) => {}
-        Ok(_) => panic!("ожидалась ошибка верификации байткода (Jump за пределы чанка), получен Ok"),
+        Ok(_) => {
+            panic!("ожидалась ошибка верификации байткода (Jump за пределы чанка), получен Ok")
+        }
     }
 }
 
@@ -631,8 +712,14 @@ fn test_vm_rejects_chunk_with_jump_target_past_end() {
 /// случай: `Jump`/`JumpIfFalse` с целью, РОВНО равной длине чанка.
 #[test]
 fn test_vm_accepts_chunk_with_jump_target_exactly_at_end() {
-    let chunk = Chunk { code: vec![OpCode::Jump(1), OpCode::Return(false)], constants: vec![] };
-    let program = CompiledProgram { main: chunk, functions: HashMap::new() };
+    let chunk = Chunk {
+        code: vec![OpCode::Jump(1), OpCode::Return(false)],
+        constants: vec![],
+    };
+    let program = CompiledProgram {
+        main: chunk,
+        functions: HashMap::new(),
+    };
     assert!(Vm::new(program).is_ok());
 }
 
@@ -640,12 +727,28 @@ fn test_vm_accepts_chunk_with_jump_target_exactly_at_end() {
 /// определённой функции.
 #[test]
 fn test_vm_rejects_corrupted_function_chunk_not_just_main() {
-    let bad_fn_chunk = Chunk { code: vec![OpCode::PushConst(5), OpCode::Return(true)], constants: vec![] };
+    let bad_fn_chunk = Chunk {
+        code: vec![OpCode::PushConst(5), OpCode::Return(true)],
+        constants: vec![],
+    };
     let mut functions = HashMap::new();
     // FUSION: `param_mut` восстановлен в `FunctionDef` (Ownership/
     // Borrowing) — конструктор теста обновлён под новое поле.
-    functions.insert("broken".to_string(), FunctionDef { params: vec![], param_mut: vec![], chunk: bad_fn_chunk });
-    let program = CompiledProgram { main: Chunk { code: vec![OpCode::Return(false)], constants: vec![] }, functions };
+    functions.insert(
+        "broken".to_string(),
+        FunctionDef {
+            params: vec![],
+            param_mut: vec![],
+            chunk: bad_fn_chunk,
+        },
+    );
+    let program = CompiledProgram {
+        main: Chunk {
+            code: vec![OpCode::Return(false)],
+            constants: vec![],
+        },
+        functions,
+    };
     match Vm::new(program) {
         Err(_) => {}
         Ok(_) => panic!("ожидалась ошибка верификации байткода функции 'broken', получен Ok"),
@@ -677,18 +780,21 @@ fn test_vm_defines_var_after_scope_underflow_returns_runtime_error_not_panic() {
         ],
         constants: vec![Value::Int(1)],
     };
-    let program = CompiledProgram { main: chunk, functions: HashMap::new() };
+    let program = CompiledProgram {
+        main: chunk,
+        functions: HashMap::new(),
+    };
     // Верификатор не проверяет баланс PushScope/PopScope (см. docstring
     // выше), поэтому Vm::new должен пройти успешно...
-    let (mut vm, main) = Vm::new(program).expect("verify_program не должен отклонять этот чанк — баланс scope не проверяется статически");
+    let (mut vm, main) = Vm::new(program).expect(
+        "verify_program не должен отклонять этот чанк — баланс scope не проверяется статически",
+    );
     // ...а паника должна быть превращена в RuntimeError на этапе run().
     match vm.run(&main) {
         Err(e) => assert!(e.to_string().contains("DefineVar"), "сообщение об ошибке должно объяснять причину (DefineVar без активного scope), получено: {}", e),
         Ok(v) => panic!("ожидалась RuntimeError (DefineVar без активного scope), получен Ok({:?})", v),
     }
 }
-
-
 
 #[test]
 fn test_closure_basic_call_through_variable() {
@@ -777,7 +883,10 @@ fn test_calling_non_closure_value_is_runtime_error() {
     let src = format!("{let_} x = 5; x();", let_ = kw("LET"));
     match run(&src) {
         Err(SgaError::Runtime(_)) => {}
-        other => panic!("ожидалась RuntimeError при вызове не-замыкания, получено {:?}", other),
+        other => panic!(
+            "ожидалась RuntimeError при вызове не-замыкания, получено {:?}",
+            other
+        ),
     }
 }
 
@@ -791,7 +900,10 @@ fn test_closure_called_with_wrong_arity_is_runtime_error() {
     );
     match run(&src) {
         Err(SgaError::Runtime(_)) => {}
-        other => panic!("ожидалась RuntimeError при неверной арности вызова замыкания, получено {:?}", other),
+        other => panic!(
+            "ожидалась RuntimeError при неверной арности вызова замыкания, получено {:?}",
+            other
+        ),
     }
 }
 
@@ -804,7 +916,10 @@ fn test_assigning_to_captured_immutable_variable_inside_closure_is_semantic_erro
     );
     match run(&src) {
         Err(SgaError::Semantic(_)) => {}
-        other => panic!("ожидалась SemError при присваивании захваченной immutable-переменной, получено {:?}", other),
+        other => panic!(
+            "ожидалась SemError при присваивании захваченной immutable-переменной, получено {:?}",
+            other
+        ),
     }
 }
 
@@ -868,13 +983,24 @@ fn test_vm_enforces_param_immutability_even_if_semantic_is_bypassed() {
     let mut functions = HashMap::new();
     functions.insert(
         "frozen_fn".to_string(),
-        FunctionDef { params: vec!["arr".to_string()], param_mut: vec![false], chunk: fn_chunk },
+        FunctionDef {
+            params: vec!["arr".to_string()],
+            param_mut: vec![false],
+            chunk: fn_chunk,
+        },
     );
     let main_chunk = Chunk {
-        code: vec![OpCode::PushConst(0), OpCode::Call("frozen_fn".to_string(), 1), OpCode::Return(false)],
+        code: vec![
+            OpCode::PushConst(0),
+            OpCode::Call("frozen_fn".to_string(), 1),
+            OpCode::Return(false),
+        ],
         constants: vec![Value::Int(5)],
     };
-    let program = CompiledProgram { main: main_chunk, functions };
+    let program = CompiledProgram {
+        main: main_chunk,
+        functions,
+    };
     let (mut machine, main) = Vm::new(program).expect("байткод должен пройти верификатор");
     match machine.run(&main) {
         Err(_) => {}
@@ -1001,7 +1127,10 @@ fn test_struct_unknown_type_is_semantic_error() {
     let src = "p = Ghost { x: 1 };".to_string();
     match run(&src) {
         Err(SgaError::Semantic(_)) => {}
-        other => panic!("ожидалась SemError для неизвестного типа struct, получено {:?}", other),
+        other => panic!(
+            "ожидалась SemError для неизвестного типа struct, получено {:?}",
+            other
+        ),
     }
 }
 
@@ -1013,7 +1142,10 @@ fn test_struct_unknown_field_in_literal_is_semantic_error() {
     );
     match run(&src) {
         Err(SgaError::Semantic(_)) => {}
-        other => panic!("ожидалась SemError для неизвестного поля в литерале struct, получено {:?}", other),
+        other => panic!(
+            "ожидалась SemError для неизвестного поля в литерале struct, получено {:?}",
+            other
+        ),
     }
 }
 
@@ -1047,7 +1179,10 @@ fn test_struct_field_access_does_not_break_for_range() {
 
 #[test]
 fn test_stdlib_type_of() {
-    let src = format!("{struct_} P {{ x }} type_of(P {{ x: 1 }});", struct_ = kw("STRUCT"));
+    let src = format!(
+        "{struct_} P {{ x }} type_of(P {{ x: 1 }});",
+        struct_ = kw("STRUCT")
+    );
     assert_eq!(run(&src).unwrap(), Value::Str("P".to_string()));
     assert_eq!(run("type_of(5);").unwrap(), Value::Str("int".to_string()));
 }
@@ -1058,14 +1193,41 @@ fn test_stdlib_keys_on_struct_and_array() {
         "{struct_} P {{ a, b }} keys(P {{ a: 1, b: 2 }});",
         struct_ = kw("STRUCT"),
     );
-    assert_eq!(run(&src).unwrap(), Value::Array(Rc::new(RefCell::new(vec![Value::Str("a".into()), Value::Str("b".into())]))));
-    assert_eq!(run("keys([10, 20, 30]);").unwrap(), Value::Array(Rc::new(RefCell::new(vec![Value::Int(0), Value::Int(1), Value::Int(2)]))));
+    assert_eq!(
+        run(&src).unwrap(),
+        Value::Array(Rc::new(RefCell::new(vec![
+            Value::Str("a".into()),
+            Value::Str("b".into())
+        ])))
+    );
+    assert_eq!(
+        run("keys([10, 20, 30]);").unwrap(),
+        Value::Array(Rc::new(RefCell::new(vec![
+            Value::Int(0),
+            Value::Int(1),
+            Value::Int(2)
+        ])))
+    );
 }
 
 #[test]
 fn test_stdlib_range() {
-    assert_eq!(run("range(3);").unwrap(), Value::Array(Rc::new(RefCell::new(vec![Value::Int(0), Value::Int(1), Value::Int(2)]))));
-    assert_eq!(run("range(2, 5);").unwrap(), Value::Array(Rc::new(RefCell::new(vec![Value::Int(2), Value::Int(3), Value::Int(4)]))));
+    assert_eq!(
+        run("range(3);").unwrap(),
+        Value::Array(Rc::new(RefCell::new(vec![
+            Value::Int(0),
+            Value::Int(1),
+            Value::Int(2)
+        ])))
+    );
+    assert_eq!(
+        run("range(2, 5);").unwrap(),
+        Value::Array(Rc::new(RefCell::new(vec![
+            Value::Int(2),
+            Value::Int(3),
+            Value::Int(4)
+        ])))
+    );
 }
 
 #[test]
@@ -1083,27 +1245,55 @@ fn test_stdlib_pow_checked() {
     assert_eq!(run("pow(2, 10);").unwrap(), Value::Int(1024));
     match run("pow(2, -1);") {
         Err(SgaError::Runtime(_)) => {}
-        other => panic!("ожидалась RuntimeError для pow с отрицательным int-экспонентом, получено {:?}", other),
+        other => panic!(
+            "ожидалась RuntimeError для pow с отрицательным int-экспонентом, получено {:?}",
+            other
+        ),
     }
 }
 
 #[test]
 fn test_stdlib_str_functions() {
-    assert_eq!(run("str_upper(\"abc\");").unwrap(), Value::Str("ABC".into()));
-    assert_eq!(run("str_lower(\"ABC\");").unwrap(), Value::Str("abc".into()));
-    assert_eq!(run("str_trim(\"  hi  \");").unwrap(), Value::Str("hi".into()));
-    assert_eq!(run("str_starts_with(\"hello\", \"he\");").unwrap(), Value::Bool(true));
-    assert_eq!(run("str_ends_with(\"hello\", \"lo\");").unwrap(), Value::Bool(true));
-    assert_eq!(run("str_replace(\"foo bar\", \"bar\", \"baz\");").unwrap(), Value::Str("foo baz".into()));
+    assert_eq!(
+        run("str_upper(\"abc\");").unwrap(),
+        Value::Str("ABC".into())
+    );
+    assert_eq!(
+        run("str_lower(\"ABC\");").unwrap(),
+        Value::Str("abc".into())
+    );
+    assert_eq!(
+        run("str_trim(\"  hi  \");").unwrap(),
+        Value::Str("hi".into())
+    );
+    assert_eq!(
+        run("str_starts_with(\"hello\", \"he\");").unwrap(),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        run("str_ends_with(\"hello\", \"lo\");").unwrap(),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        run("str_replace(\"foo bar\", \"bar\", \"baz\");").unwrap(),
+        Value::Str("foo baz".into())
+    );
 }
 
 #[test]
 fn test_stdlib_str_split_and_contains() {
     assert_eq!(
         run("str_split(\"a,b,c\", \",\");").unwrap(),
-        Value::Array(Rc::new(RefCell::new(vec![Value::Str("a".into()), Value::Str("b".into()), Value::Str("c".into())])))
+        Value::Array(Rc::new(RefCell::new(vec![
+            Value::Str("a".into()),
+            Value::Str("b".into()),
+            Value::Str("c".into())
+        ])))
     );
-    assert_eq!(run("str_contains(\"hello world\", \"wor\");").unwrap(), Value::Bool(true));
+    assert_eq!(
+        run("str_contains(\"hello world\", \"wor\");").unwrap(),
+        Value::Bool(true)
+    );
 }
 
 #[test]
@@ -1113,10 +1303,16 @@ fn test_stdlib_builtin_arity_is_checked_for_new_functions() {
     // ветки A — см. semantic::builtin_arity.
     match run("sqrt();") {
         Err(SgaError::Semantic(_)) => {}
-        other => panic!("ожидалась SemError для sqrt() без аргументов, получено {:?}", other),
+        other => panic!(
+            "ожидалась SemError для sqrt() без аргументов, получено {:?}",
+            other
+        ),
     }
     match run("str_replace(\"a\", \"b\");") {
         Err(SgaError::Semantic(_)) => {}
-        other => panic!("ожидалась SemError для str_replace() с 2 аргументами вместо 3, получено {:?}", other),
+        other => panic!(
+            "ожидалась SemError для str_replace() с 2 аргументами вместо 3, получено {:?}",
+            other
+        ),
     }
 }

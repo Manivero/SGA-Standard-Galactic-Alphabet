@@ -34,7 +34,9 @@ impl std::fmt::Display for TypeError {
 type TResult<T> = Result<T, TypeError>;
 
 fn err(msg: impl Into<String>) -> TypeError {
-    TypeError { message: msg.into() }
+    TypeError {
+        message: msg.into(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -69,16 +71,54 @@ impl Typechecker {
         // typechecker трактовал бы их как Any/Any, что тоже безопасно,
         // но менее полезно: например, `let s: string = len([1,2,3]);`
         // не поймал бы реальную ошибку без этой таблицы.
-        functions.insert("len".into(), FnSig { params: vec![TypeAnnotation::Any], ret: TypeAnnotation::Int });
-        functions.insert("push".into(), FnSig { params: vec![TypeAnnotation::Any, TypeAnnotation::Any], ret: TypeAnnotation::Nil });
-        functions.insert("to_string".into(), FnSig { params: vec![TypeAnnotation::Any], ret: TypeAnnotation::String });
-        functions.insert("to_int".into(), FnSig { params: vec![TypeAnnotation::Any], ret: TypeAnnotation::Int });
-        functions.insert("to_float".into(), FnSig { params: vec![TypeAnnotation::Any], ret: TypeAnnotation::Float });
-        Typechecker { scopes: vec![Scope { vars: HashMap::new() }], functions, current_return_ty: None }
+        functions.insert(
+            "len".into(),
+            FnSig {
+                params: vec![TypeAnnotation::Any],
+                ret: TypeAnnotation::Int,
+            },
+        );
+        functions.insert(
+            "push".into(),
+            FnSig {
+                params: vec![TypeAnnotation::Any, TypeAnnotation::Any],
+                ret: TypeAnnotation::Nil,
+            },
+        );
+        functions.insert(
+            "to_string".into(),
+            FnSig {
+                params: vec![TypeAnnotation::Any],
+                ret: TypeAnnotation::String,
+            },
+        );
+        functions.insert(
+            "to_int".into(),
+            FnSig {
+                params: vec![TypeAnnotation::Any],
+                ret: TypeAnnotation::Int,
+            },
+        );
+        functions.insert(
+            "to_float".into(),
+            FnSig {
+                params: vec![TypeAnnotation::Any],
+                ret: TypeAnnotation::Float,
+            },
+        );
+        Typechecker {
+            scopes: vec![Scope {
+                vars: HashMap::new(),
+            }],
+            functions,
+            current_return_ty: None,
+        }
     }
 
     fn push_scope(&mut self) {
-        self.scopes.push(Scope { vars: HashMap::new() });
+        self.scopes.push(Scope {
+            vars: HashMap::new(),
+        });
     }
 
     fn pop_scope(&mut self) {
@@ -86,7 +126,11 @@ impl Typechecker {
     }
 
     fn declare(&mut self, name: &str, ty: TypeAnnotation) {
-        self.scopes.last_mut().unwrap().vars.insert(name.to_string(), ty);
+        self.scopes
+            .last_mut()
+            .unwrap()
+            .vars
+            .insert(name.to_string(), ty);
     }
 
     fn lookup(&self, name: &str) -> TypeAnnotation {
@@ -104,9 +148,18 @@ impl Typechecker {
         // Первый проход: собрать сигнатуры функций верхнего уровня —
         // как и semantic-analyzer, чтобы поддержать опережающие вызовы.
         for stmt in program {
-            if let Stmt::FnDecl { name, params, return_ty, .. } = stmt {
+            if let Stmt::FnDecl {
+                name,
+                params,
+                return_ty,
+                ..
+            } = stmt
+            {
                 let sig = FnSig {
-                    params: params.iter().map(|p| p.ty.clone().unwrap_or(TypeAnnotation::Any)).collect(),
+                    params: params
+                        .iter()
+                        .map(|p| p.ty.clone().unwrap_or(TypeAnnotation::Any))
+                        .collect(),
                     ret: return_ty.clone().unwrap_or(TypeAnnotation::Any),
                 };
                 self.functions.insert(name.clone(), sig);
@@ -266,10 +319,16 @@ impl Typechecker {
                 let tt = self.infer(target)?;
                 let it = self.infer(idx)?;
                 if tt != Any && tt != Array && tt != String {
-                    return Err(err(format!("индексация '[...]' не определена для типа {}", show(&tt))));
+                    return Err(err(format!(
+                        "индексация '[...]' не определена для типа {}",
+                        show(&tt)
+                    )));
                 }
                 if it != Any && it != Int {
-                    return Err(err(format!("индекс массива должен быть int, получено {}", show(&it))));
+                    return Err(err(format!(
+                        "индекс массива должен быть int, получено {}",
+                        show(&it)
+                    )));
                 }
                 Any
             }
@@ -279,7 +338,12 @@ impl Typechecker {
                     UnOp::Not => Bool,
                     UnOp::Neg => match t {
                         Any | Int | Float => t,
-                        other => return Err(err(format!("унарный '-' не определён для {}", show(&other)))),
+                        other => {
+                            return Err(err(format!(
+                                "унарный '-' не определён для {}",
+                                show(&other)
+                            )))
+                        }
                     },
                 }
             }
@@ -289,10 +353,12 @@ impl Typechecker {
                 infer_binary(op, &lt, &rt)?
             }
             Expr::Call(name, args) => {
-                let arg_tys: Vec<TypeAnnotation> = args.iter().map(|a| self.infer(a)).collect::<TResult<_>>()?;
+                let arg_tys: Vec<TypeAnnotation> =
+                    args.iter().map(|a| self.infer(a)).collect::<TResult<_>>()?;
                 let sig = self.functions.get(name).cloned();
                 if let Some(sig) = sig {
-                    for (i, (declared, actual)) in sig.params.iter().zip(arg_tys.iter()).enumerate() {
+                    for (i, (declared, actual)) in sig.params.iter().zip(arg_tys.iter()).enumerate()
+                    {
                         if !compatible(declared, actual) {
                             return Err(err(format!(
                                 "функция '{}': аргумент {} должен быть {}, передан {}",
@@ -355,10 +421,16 @@ impl Typechecker {
                 let tt = self.infer(target)?;
                 let it = self.infer(idx)?;
                 if tt != Any && tt != Array {
-                    return Err(err(format!("индексное присваивание не определено для типа {}", show(&tt))));
+                    return Err(err(format!(
+                        "индексное присваивание не определено для типа {}",
+                        show(&tt)
+                    )));
                 }
                 if it != Any && it != Int {
-                    return Err(err(format!("индекс массива должен быть int, получено {}", show(&it))));
+                    return Err(err(format!(
+                        "индекс массива должен быть int, получено {}",
+                        show(&it)
+                    )));
                 }
                 self.infer(value)?
             }
@@ -426,9 +498,14 @@ impl Typechecker {
 fn infer_binary(op: &BinOp, lt: &TypeAnnotation, rt: &TypeAnnotation) -> TResult<TypeAnnotation> {
     use TypeAnnotation::*;
     match op {
-        BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq | BinOp::And | BinOp::Or => {
-            Ok(Bool)
-        }
+        BinOp::Eq
+        | BinOp::NotEq
+        | BinOp::Lt
+        | BinOp::Gt
+        | BinOp::LtEq
+        | BinOp::GtEq
+        | BinOp::And
+        | BinOp::Or => Ok(Bool),
         BinOp::Add => {
             if *lt == Any || *rt == Any {
                 return Ok(Any);
@@ -437,7 +514,11 @@ fn infer_binary(op: &BinOp, lt: &TypeAnnotation, rt: &TypeAnnotation) -> TResult
                 (Int, Int) => Ok(Int),
                 (Float, Float) | (Int, Float) | (Float, Int) => Ok(Float),
                 (String, String) => Ok(String),
-                _ => Err(err(format!("оператор '+' не определён для {} и {}", show(lt), show(rt)))),
+                _ => Err(err(format!(
+                    "оператор '+' не определён для {} и {}",
+                    show(lt),
+                    show(rt)
+                ))),
             }
         }
         BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
@@ -447,7 +528,11 @@ fn infer_binary(op: &BinOp, lt: &TypeAnnotation, rt: &TypeAnnotation) -> TResult
             match (lt, rt) {
                 (Int, Int) => Ok(Int),
                 (Float, Float) | (Int, Float) | (Float, Int) => Ok(Float),
-                _ => Err(err(format!("арифметический оператор не определён для {} и {}", show(lt), show(rt)))),
+                _ => Err(err(format!(
+                    "арифметический оператор не определён для {} и {}",
+                    show(lt),
+                    show(rt)
+                ))),
             }
         }
     }

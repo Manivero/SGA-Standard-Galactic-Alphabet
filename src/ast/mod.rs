@@ -136,7 +136,10 @@ pub enum Expr {
     /// docs/ROADMAP.md): ownership-модель для замыканий, захватывающих
     /// произвольное окружение, требует отдельного анализа времён жизни,
     /// не реализованного в этой версии. См. docs/LANGUAGE_SPEC.md, §5.2.
-    Lambda { params: Vec<String>, body: Vec<Stmt> },
+    Lambda {
+        params: Vec<String>,
+        body: Vec<Stmt>,
+    },
     /// `TypeName { field1: expr, field2: expr }` — создание экземпляра
     /// struct. `type_name` — имя struct, объявленного через
     /// `Stmt::StructDecl`. Вычисляется в `Value::Struct(...)` рантайме.
@@ -146,7 +149,10 @@ pub enum Expr {
     /// парсера/кодогена — мёртвая фича. Реализация B (полный конвейер)
     /// перенесена как есть, без статической типизации (нет
     /// `TypeAnnotation::Struct` — см. ROADMAP.md).
-    StructLit { type_name: String, fields: Vec<(String, Expr)> },
+    StructLit {
+        type_name: String,
+        fields: Vec<(String, Expr)>,
+    },
     /// `expr.field` — доступ к полю struct по имени.
     FieldAccess(Box<Expr>, String),
     /// `expr.field = value` — присваивание полю struct по имени.
@@ -170,13 +176,35 @@ pub enum Expr {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     /// let/var/const name [: type] = expr  (is_mutable, is_const)
-    VarDecl { name: String, value: Expr, mutable: bool, ty: Option<TypeAnnotation> },
+    VarDecl {
+        name: String,
+        value: Expr,
+        mutable: bool,
+        ty: Option<TypeAnnotation>,
+    },
     ExprStmt(Expr),
     Print(Vec<Expr>),
-    If { cond: Expr, then_branch: Vec<Stmt>, else_branch: Option<Vec<Stmt>> },
-    While { cond: Expr, body: Vec<Stmt> },
-    ForIn { var: String, start: Expr, end: Expr, body: Vec<Stmt> },
-    FnDecl { name: String, params: Vec<Param>, body: Vec<Stmt>, return_ty: Option<TypeAnnotation> },
+    If {
+        cond: Expr,
+        then_branch: Vec<Stmt>,
+        else_branch: Option<Vec<Stmt>>,
+    },
+    While {
+        cond: Expr,
+        body: Vec<Stmt>,
+    },
+    ForIn {
+        var: String,
+        start: Expr,
+        end: Expr,
+        body: Vec<Stmt>,
+    },
+    FnDecl {
+        name: String,
+        params: Vec<Param>,
+        body: Vec<Stmt>,
+        return_ty: Option<TypeAnnotation>,
+    },
     Return(Option<Expr>),
     Break,
     Continue,
@@ -196,7 +224,10 @@ pub enum Stmt {
     /// `Any`). Методы — отдельные `FnDecl` с конвенцией именования
     /// `TypeName_method(self, ...)`, без синтаксиса `impl` (см.
     /// `ast::Expr::MethodCall`). Перенесено из родительской ветки B.
-    StructDecl { name: String, fields: Vec<String> },
+    StructDecl {
+        name: String,
+        fields: Vec<String>,
+    },
 }
 
 pub type Program = Vec<Stmt>;

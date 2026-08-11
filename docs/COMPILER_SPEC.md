@@ -198,8 +198,8 @@ trait (`FsLoader`) — для тестов используется in-memory р
 
 ## Тесты
 
-`tests/integration_test.rs` (56 тестов) + `tests/module_resolver_test.rs`
-(9 тестов) через публичный API `sga::run_source()`/`run_source_file()`,
+`tests/integration_test.rs` (77 тестов) + `tests/module_resolver_test.rs`
+(12 тестов) через публичный API `sga::run_source()`/`run_source_file()`,
 проверяющих как успешные программы (арифметика, рекурсия, циклы, массивы,
 типизированный и смешанный typed/untyped код, `MUT`-параметры, замыкания,
 IIFE, цепочки вызовов, импорты, диамант-импорты), так и обязательные

@@ -74,7 +74,8 @@ pub struct FsLoader;
 
 impl ModuleLoader for FsLoader {
     fn read(&self, path: &Path) -> IResult<String> {
-        std::fs::read_to_string(path).map_err(|e| ImportError(format!("не удалось прочитать '{}': {}", path.display(), e)))
+        std::fs::read_to_string(path)
+            .map_err(|e| ImportError(format!("не удалось прочитать '{}': {}", path.display(), e)))
     }
 }
 
@@ -95,7 +96,10 @@ pub fn resolve_imports<L: ModuleLoader>(
 ) -> IResult<Program> {
     let mut visited = HashSet::new();
     let mut in_progress = Vec::new(); // стек текущей цепочки импортов — для сообщения о цикле
-    let entry_dir = entry_path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+    let entry_dir = entry_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
     // SECURITY (см. docs/SECURITY.md, "IMPORT confinement"): `entry_dir`
     // — это и есть граница песочницы для ВСЕГО графа импортов, включая
     // транзитивные. Она вычисляется один раз здесь и передаётся вниз по
@@ -107,7 +111,15 @@ pub fn resolve_imports<L: ModuleLoader>(
     let root = lexically_normalize(&entry_dir);
     visited.insert(normalize_key(entry_path));
     in_progress.push(normalize_key(entry_path));
-    let resolved = resolve_program(program, &entry_dir, &root, loader, parse_fn, &mut visited, &mut in_progress)?;
+    let resolved = resolve_program(
+        program,
+        &entry_dir,
+        &root,
+        loader,
+        parse_fn,
+        &mut visited,
+        &mut in_progress,
+    )?;
     in_progress.pop();
     Ok(resolved)
 }
@@ -120,7 +132,9 @@ fn normalize_key(path: &Path) -> String {
     // пути "как написан" — это осознанное упрощение: in-memory-тесты
     // обязаны использовать согласованные ключи путей, а не полагаться
     // на canonicalize.
-    std::fs::canonicalize(path).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| path.to_string_lossy().into_owned())
+    std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string_lossy().into_owned())
 }
 
 /// Чисто лексическая нормализация пути: резолвит `.` и `..` через
@@ -169,7 +183,10 @@ fn lexically_normalize(path: &Path) -> PathBuf {
 /// верно для in-memory `ModuleLoader` в тестах), используется
 /// лексический fallback.
 fn is_within_root(candidate: &Path, root: &Path) -> bool {
-    match (std::fs::canonicalize(candidate), std::fs::canonicalize(root)) {
+    match (
+        std::fs::canonicalize(candidate),
+        std::fs::canonicalize(root),
+    ) {
         (Ok(c), Ok(r)) => c.starts_with(r),
         _ => lexically_normalize(candidate).starts_with(lexically_normalize(root)),
     }
@@ -235,11 +252,25 @@ fn resolve_program<L: ModuleLoader>(
 
                 let source = loader.read(&full_path)?;
                 let imported_program = parse_fn(&source).map_err(|e| {
-                    ImportError(format!("ошибка разбора импортируемого файла '{}': {}", full_path.display(), e))
+                    ImportError(format!(
+                        "ошибка разбора импортируемого файла '{}': {}",
+                        full_path.display(),
+                        e
+                    ))
                 })?;
-                let imported_dir = full_path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
-                let resolved_imported =
-                    resolve_program(imported_program, &imported_dir, root, loader, parse_fn, visited, in_progress)?;
+                let imported_dir = full_path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| PathBuf::from("."));
+                let resolved_imported = resolve_program(
+                    imported_program,
+                    &imported_dir,
+                    root,
+                    loader,
+                    parse_fn,
+                    visited,
+                    in_progress,
+                )?;
 
                 in_progress.pop();
                 out.extend(resolved_imported);

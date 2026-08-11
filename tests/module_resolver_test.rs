@@ -53,8 +53,13 @@ struct InMemoryLoader {
 
 impl InMemoryLoader {
     fn new(files: &[(&str, &str)]) -> Self {
-        let map = files.iter().map(|(p, s)| (PathBuf::from(p), s.to_string())).collect();
-        InMemoryLoader { files: Mutex::new(map) }
+        let map = files
+            .iter()
+            .map(|(p, s)| (PathBuf::from(p), s.to_string()))
+            .collect();
+        InMemoryLoader {
+            files: Mutex::new(map),
+        }
     }
 }
 
@@ -65,13 +70,20 @@ impl ModuleLoader for InMemoryLoader {
             .unwrap()
             .get(path)
             .cloned()
-            .ok_or_else(|| ImportError(format!("файл не найден в in-memory loader'е: {}", path.display())))
+            .ok_or_else(|| {
+                ImportError(format!(
+                    "файл не найден в in-memory loader'е: {}",
+                    path.display()
+                ))
+            })
     }
 }
 
 fn parse(source: &str) -> Result<Program, String> {
     let tokens = Lexer::new(source).tokenize().map_err(|e| e.to_string())?;
-    Parser::new(tokens).parse_program().map_err(|e| e.to_string())
+    Parser::new(tokens)
+        .parse_program()
+        .map_err(|e| e.to_string())
 }
 
 /// Считает количество top-level `Stmt::FnDecl` с данным именем в
@@ -86,7 +98,11 @@ fn count_fn_decls(program: &Program, name: &str) -> usize {
 
 #[test]
 fn test_simple_import_inlines_function_from_other_file() {
-    let entry_src = format!("{import} \"lib.sga\";\n{pr}(helper());\n", import = kw("IMPORT"), pr = kw("PRINT"));
+    let entry_src = format!(
+        "{import} \"lib.sga\";\n{pr}(helper());\n",
+        import = kw("IMPORT"),
+        pr = kw("PRINT")
+    );
     let lib_src = format!("{fn} helper() {{ {ret} 42; }}\n", fn = kw("FN"), ret = kw("RETURN"));
     let loader = InMemoryLoader::new(&[("entry.sga", &entry_src), ("lib.sga", &lib_src)]);
 
@@ -137,7 +153,9 @@ fn test_cyclic_import_is_rejected_with_explicit_error() {
 
     match result {
         Err(_) => {}
-        Ok(_) => panic!("ожидалась ошибка циклического импорта (a.sga -> b.sga -> a.sga), получен Ok"),
+        Ok(_) => {
+            panic!("ожидалась ошибка циклического импорта (a.sga -> b.sga -> a.sga), получен Ok")
+        }
     }
 }
 
@@ -165,7 +183,9 @@ fn test_missing_import_file_gives_explicit_error_not_panic() {
     let result = resolve_imports(program, Path::new("entry.sga"), &loader, &parse);
 
     match result {
-        Err(ImportError(msg)) => assert!(msg.contains("does_not_exist.sga") || msg.contains("не найден")),
+        Err(ImportError(msg)) => {
+            assert!(msg.contains("does_not_exist.sga") || msg.contains("не найден"))
+        }
         Ok(_) => panic!("ожидалась ошибка отсутствующего файла импорта, получен Ok"),
     }
 }
@@ -186,7 +206,11 @@ fn test_absolute_path_import_is_rejected() {
     // `module_resolver::resolve_program`: `Path::join` с абсолютным
     // аргументом полностью заменяет базовый путь, поэтому проверка
     // обязана быть безусловной, а не зависеть от `current_dir`.
-    let absolute = if cfg!(windows) { "C:\\secret.sga" } else { "/etc/secret.sga" };
+    let absolute = if cfg!(windows) {
+        "C:\\secret.sga"
+    } else {
+        "/etc/secret.sga"
+    };
     let entry_src = format!("{i} \"{p}\";\n", i = kw("IMPORT"), p = absolute);
     let loader = InMemoryLoader::new(&[("entry.sga", &entry_src)]);
 
@@ -212,7 +236,8 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new(test_name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("sga_test_{}_{}", test_name, std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("sga_test_{}_{}", test_name, std::process::id()));
         std::fs::create_dir_all(&dir).expect("не удалось создать временную директорию для теста");
         TempDir(dir)
     }
@@ -240,7 +265,10 @@ fn test_path_traversal_escaping_entry_root_is_rejected_on_real_fs() {
     std::fs::create_dir_all(&outside_dir).unwrap();
 
     let secret_path = outside_dir.join("secret.sga");
-    let secret_src = format!("{let_} TOKEN = \"sk_live_should_not_leak\";\n", let_ = kw("LET"));
+    let secret_src = format!(
+        "{let_} TOKEN = \"sk_live_should_not_leak\";\n",
+        let_ = kw("LET")
+    );
     std::fs::write(secret_path, secret_src).unwrap();
 
     let entry_path = project_dir.join("main.sga");
@@ -370,7 +398,10 @@ fn test_nested_import_inside_block_is_rejected_by_parser() {
         fn = kw("FN"),
         i = kw("IMPORT"),
     );
-    assert!(parse(&src).is_err(), "ожидалась ошибка парсера: IMPORT внутри функции недопустим");
+    assert!(
+        parse(&src).is_err(),
+        "ожидалась ошибка парсера: IMPORT внутри функции недопустим"
+    );
 }
 
 #[test]
@@ -385,6 +416,9 @@ fn test_imported_top_level_expr_stmt_is_preserved() {
     assert_eq!(resolved.len(), 1);
     match &resolved[0] {
         Stmt::Print(args) => assert!(matches!(args.first(), Some(Expr::Int(1)))),
-        other => panic!("ожидался Stmt::Print из импортированного файла, получено {:?}", other),
+        other => panic!(
+            "ожидался Stmt::Print из импортированного файла, получено {:?}",
+            other
+        ),
     }
 }

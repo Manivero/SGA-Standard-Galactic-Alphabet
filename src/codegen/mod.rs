@@ -55,8 +55,11 @@ pub fn compile(program: &Program) -> CompiledProgram {
     let known_functions = Rc::new(known_functions);
 
     let mut functions = HashMap::new();
-    let mut main_compiler =
-        Compiler { chunk: Chunk::default(), loop_stack: Vec::new(), known_functions: known_functions.clone() };
+    let mut main_compiler = Compiler {
+        chunk: Chunk::default(),
+        loop_stack: Vec::new(),
+        known_functions: known_functions.clone(),
+    };
 
     // FUSION-ПРИМЕЧАНИЕ: значение ПОСЛЕДНЕГО top-level statement'а,
     // компилируемого в main-чанк (то есть последнего НЕ-FnDecl statement'а
@@ -79,12 +82,20 @@ pub fn compile(program: &Program) -> CompiledProgram {
     // последнего top-level выражения — результат скрипта" — естественную
     // для языка, где функции/блоки порой используются как REPL-подобные
     // скрипты. Подробности — см. MIGRATION_REPORT.md.
-    let last_main_stmt_idx = program.iter().rposition(|s| !matches!(s, Stmt::FnDecl { .. }));
+    let last_main_stmt_idx = program
+        .iter()
+        .rposition(|s| !matches!(s, Stmt::FnDecl { .. }));
 
     for (i, stmt) in program.iter().enumerate() {
-        if let Stmt::FnDecl { name, params, body, .. } = stmt {
-            let mut fc =
-                Compiler { chunk: Chunk::default(), loop_stack: Vec::new(), known_functions: known_functions.clone() };
+        if let Stmt::FnDecl {
+            name, params, body, ..
+        } = stmt
+        {
+            let mut fc = Compiler {
+                chunk: Chunk::default(),
+                loop_stack: Vec::new(),
+                known_functions: known_functions.clone(),
+            };
             for s in body {
                 fc.compile_stmt(s);
             }
@@ -99,7 +110,14 @@ pub fn compile(program: &Program) -> CompiledProgram {
             // (см. docs/SECURITY.md).
             let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
             let param_mut: Vec<bool> = params.iter().map(|p| p.mutable).collect();
-            functions.insert(name.clone(), FunctionDef { params: param_names, param_mut, chunk: fc.chunk });
+            functions.insert(
+                name.clone(),
+                FunctionDef {
+                    params: param_names,
+                    param_mut,
+                    chunk: fc.chunk,
+                },
+            );
         } else if Some(i) == last_main_stmt_idx {
             main_compiler.compile_tail_stmt(stmt);
         } else {
@@ -115,7 +133,10 @@ pub fn compile(program: &Program) -> CompiledProgram {
     // код становится недостижимым (безвредный мёртвый байткод в самом
     // конце чанка — не влияет на верификатор, см. `vm::verify_chunk`).
     main_compiler.chunk.code.push(OpCode::Return(false));
-    CompiledProgram { main: main_compiler.chunk, functions }
+    CompiledProgram {
+        main: main_compiler.chunk,
+        functions,
+    }
 }
 
 impl Compiler {
@@ -160,7 +181,12 @@ impl Compiler {
 
     fn compile_stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::VarDecl { name, value, mutable, .. } => {
+            Stmt::VarDecl {
+                name,
+                value,
+                mutable,
+                ..
+            } => {
                 self.compile_expr(value);
                 self.emit(OpCode::DefineVar(name.clone(), *mutable));
             }
@@ -175,7 +201,11 @@ impl Compiler {
                 }
                 self.emit(OpCode::Print(n));
             }
-            Stmt::If { cond, then_branch, else_branch } => {
+            Stmt::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
                 self.compile_expr(cond);
                 let jif = self.emit(OpCode::JumpIfFalse(0));
                 self.emit(OpCode::PushScope);
@@ -203,7 +233,10 @@ impl Compiler {
                 let loop_start = self.here();
                 self.compile_expr(cond);
                 let jif = self.emit(OpCode::JumpIfFalse(0));
-                self.loop_stack.push(LoopCtx { break_patches: Vec::new(), continue_patches: Vec::new() });
+                self.loop_stack.push(LoopCtx {
+                    break_patches: Vec::new(),
+                    continue_patches: Vec::new(),
+                });
                 self.emit(OpCode::PushScope);
                 for s in body {
                     self.compile_stmt(s);
@@ -220,7 +253,12 @@ impl Compiler {
                     self.patch_jump(p, loop_start);
                 }
             }
-            Stmt::ForIn { var, start, end, body } => {
+            Stmt::ForIn {
+                var,
+                start,
+                end,
+                body,
+            } => {
                 self.compile_expr(start);
                 self.emit(OpCode::DefineVar(var.clone(), true));
                 let cond_start = self.here();
@@ -229,7 +267,10 @@ impl Compiler {
                 self.emit(OpCode::Lt);
                 let jif = self.emit(OpCode::JumpIfFalse(0));
                 self.emit(OpCode::PushScope);
-                self.loop_stack.push(LoopCtx { break_patches: Vec::new(), continue_patches: Vec::new() });
+                self.loop_stack.push(LoopCtx {
+                    break_patches: Vec::new(),
+                    continue_patches: Vec::new(),
+                });
                 for s in body {
                     self.compile_stmt(s);
                 }
@@ -432,7 +473,10 @@ impl Compiler {
                     lambda_compiler.compile_stmt(s);
                 }
                 lambda_compiler.chunk.code.push(OpCode::Return(false));
-                self.emit(OpCode::MakeClosure { params: params.clone(), body: Rc::new(lambda_compiler.chunk) });
+                self.emit(OpCode::MakeClosure {
+                    params: params.clone(),
+                    body: Rc::new(lambda_compiler.chunk),
+                });
             }
             Expr::Assign(name, value) => {
                 self.compile_expr(value);
@@ -457,7 +501,10 @@ impl Compiler {
                 for (_, expr) in fields {
                     self.compile_expr(expr);
                 }
-                self.emit(OpCode::MakeStruct { type_name: type_name.clone(), fields: field_names });
+                self.emit(OpCode::MakeStruct {
+                    type_name: type_name.clone(),
+                    fields: field_names,
+                });
             }
             Expr::FieldAccess(obj, field) => {
                 self.compile_expr(obj);
@@ -477,7 +524,10 @@ impl Compiler {
                 for a in args {
                     self.compile_expr(a);
                 }
-                self.emit(OpCode::CallMethod { method: method_name.clone(), argc: args.len() });
+                self.emit(OpCode::CallMethod {
+                    method: method_name.clone(),
+                    argc: args.len(),
+                });
             }
         }
     }

@@ -53,13 +53,13 @@ pub enum TokenKind {
     Star,
     Slash,
     Percent,
-    Assign,   // =
-    Eq,       // ==
-    NotEq,    // !=
-    Lt,       // <
-    Gt,       // >
-    LtEq,     // <=
-    GtEq,     // >=
+    Assign, // =
+    Eq,     // ==
+    NotEq,  // !=
+    Lt,     // <
+    Gt,     // >
+    LtEq,   // <=
+    GtEq,   // >=
     LParen,
     RParen,
     LBrace,

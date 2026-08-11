@@ -16,14 +16,16 @@
 - ✅ Переменные: let/var/const
 - ✅ Функции верхнего уровня + рекурсия
 - ✅ if/else/while/for-in/break/continue
-- ✅ Встроенные функции: len, push, to_string, to_int, to_float
+- ✅ Встроенные функции: 23 функции — `len`, `push`, `keys`, `range`,
+  `to_string`/`to_int`/`to_float`, `type_of`, `sqrt`/`floor`/`ceil`/`abs`/
+  `min`/`max`/`pow`, 7 строковых `str_*` (см. `docs/VM_SPEC.md`)
 - ✅ CLI: `sga run`, `sga init`, `sga fmt` (печать AST), `sga version`
 - ✅ `sga.toml` (схема манифеста, генерируется `sga init`, без резолвера зависимостей)
 - ✅ Инструмент `tools/translit` для записи кода в ASCII-мнемониках
 - ✅ 10 примеров (`examples/`), все реально выполняются — включая
   новые `closures.sga`, `ownership.sga`, `modules.sga`+`modules_math.sga`,
   демонстрирующие совместную работу фич, объединённых при слиянии
-- ✅ 83 интеграционных/модульных тестов (включая регрессионные на
+- ✅ 89 интеграционных/модульных тестов (включая регрессионные на
   реально найденные дыры — см. ниже и docs/SECURITY.md, и на конфликт
   грамматики между field-access и `FOR..IN`, найденный при слиянии со
   structs-веткой)

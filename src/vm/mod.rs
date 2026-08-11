@@ -88,8 +88,12 @@ fn verify_chunk(chunk: &Chunk) -> RResult<()> {
                 // внутри тела лямбды прошёл бы верификацию незамеченным
                 // и дал бы panic при первом вызове этого конкретного
                 // замыкания, а не сразу при Vm::new.
-                verify_chunk(body)
-                    .map_err(|e| rt_err(format!("в теле замыкания (MakeClosure на позиции {}): {}", i, e.0)))?;
+                verify_chunk(body).map_err(|e| {
+                    rt_err(format!(
+                        "в теле замыкания (MakeClosure на позиции {}): {}",
+                        i, e.0
+                    ))
+                })?;
             }
             _ => {}
         }
@@ -133,11 +137,20 @@ impl Vm {
     /// подробного обоснования.
     pub fn new(program: CompiledProgram) -> RResult<(Self, Chunk)> {
         verify_program(&program.main, &program.functions)?;
-        Ok((Vm { functions: program.functions, call_depth: 0, max_call_depth: 200 }, program.main))
+        Ok((
+            Vm {
+                functions: program.functions,
+                call_depth: 0,
+                max_call_depth: 200,
+            },
+            program.main,
+        ))
     }
 
     pub fn run(&mut self, chunk: &Chunk) -> RResult<Value> {
-        let mut scopes = vec![Scope { vars: HashMap::new() }];
+        let mut scopes = vec![Scope {
+            vars: HashMap::new(),
+        }];
         self.run_chunk(chunk, &mut scopes)
     }
 
@@ -148,16 +161,22 @@ impl Vm {
             match &chunk.code[ip] {
                 OpCode::PushConst(idx) => stack.push(chunk.constants[*idx].clone()),
                 OpCode::LoadVar(name) => {
-                    let v = self.lookup(scopes, name).ok_or_else(|| rt_err(format!("неопределённая переменная '{}'", name)))?;
+                    let v = self
+                        .lookup(scopes, name)
+                        .ok_or_else(|| rt_err(format!("неопределённая переменная '{}'", name)))?;
                     stack.push(v);
                 }
                 OpCode::StoreVar(name) => {
-                    let v = stack.pop().ok_or_else(|| rt_err("пустой стек при StoreVar"))?;
+                    let v = stack
+                        .pop()
+                        .ok_or_else(|| rt_err("пустой стек при StoreVar"))?;
                     self.assign(scopes, name, v.clone())?;
                     stack.push(v);
                 }
                 OpCode::DefineVar(name, mutable) => {
-                    let v = stack.pop().ok_or_else(|| rt_err("пустой стек при DefineVar"))?;
+                    let v = stack
+                        .pop()
+                        .ok_or_else(|| rt_err("пустой стек при DefineVar"))?;
                     // FIX (security audit): было `scopes.last_mut().unwrap()`.
                     // `Chunk`/`OpCode` — публичные типы (см. docstring
                     // `verify_chunk` выше), и `PopScope` без соответствующего
@@ -181,18 +200,33 @@ impl Vm {
                 OpCode::Pop => {
                     stack.pop();
                 }
-                OpCode::PushScope => scopes.push(Scope { vars: HashMap::new() }),
+                OpCode::PushScope => scopes.push(Scope {
+                    vars: HashMap::new(),
+                }),
                 OpCode::PopScope => {
                     scopes.pop();
                 }
                 OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Div | OpCode::Mod => {
-                    let b = stack.pop().ok_or_else(|| rt_err("пустой стек в арифметике"))?;
-                    let a = stack.pop().ok_or_else(|| rt_err("пустой стек в арифметике"))?;
+                    let b = stack
+                        .pop()
+                        .ok_or_else(|| rt_err("пустой стек в арифметике"))?;
+                    let a = stack
+                        .pop()
+                        .ok_or_else(|| rt_err("пустой стек в арифметике"))?;
                     stack.push(arith(&chunk.code[ip], a, b)?);
                 }
-                OpCode::Eq | OpCode::NotEq | OpCode::Lt | OpCode::Gt | OpCode::LtEq | OpCode::GtEq => {
-                    let b = stack.pop().ok_or_else(|| rt_err("пустой стек в сравнении"))?;
-                    let a = stack.pop().ok_or_else(|| rt_err("пустой стек в сравнении"))?;
+                OpCode::Eq
+                | OpCode::NotEq
+                | OpCode::Lt
+                | OpCode::Gt
+                | OpCode::LtEq
+                | OpCode::GtEq => {
+                    let b = stack
+                        .pop()
+                        .ok_or_else(|| rt_err("пустой стек в сравнении"))?;
+                    let a = stack
+                        .pop()
+                        .ok_or_else(|| rt_err("пустой стек в сравнении"))?;
                     stack.push(compare(&chunk.code[ip], a, b)?);
                 }
                 OpCode::And => {
@@ -208,9 +242,17 @@ impl Vm {
                 OpCode::Neg => {
                     let a = stack.pop().ok_or_else(|| rt_err("пустой стек в NEG"))?;
                     stack.push(match a {
-                        Value::Int(i) => Value::Int(i.checked_neg().ok_or_else(|| rt_err("переполнение int при унарном минусе"))?),
+                        Value::Int(i) => Value::Int(
+                            i.checked_neg()
+                                .ok_or_else(|| rt_err("переполнение int при унарном минусе"))?,
+                        ),
                         Value::Float(f) => Value::Float(-f),
-                        other => return Err(rt_err(format!("унарный '-' не поддерживается для {}", other.type_name()))),
+                        other => {
+                            return Err(rt_err(format!(
+                                "унарный '-' не поддерживается для {}",
+                                other.type_name()
+                            )))
+                        }
                     });
                 }
                 OpCode::Not => {
@@ -218,7 +260,9 @@ impl Vm {
                     stack.push(Value::Bool(!a.is_truthy()));
                 }
                 OpCode::JumpIfFalse(target) => {
-                    let v = stack.pop().ok_or_else(|| rt_err("пустой стек в JumpIfFalse"))?;
+                    let v = stack
+                        .pop()
+                        .ok_or_else(|| rt_err("пустой стек в JumpIfFalse"))?;
                     if !v.is_truthy() {
                         ip = *target;
                         continue;
@@ -231,7 +275,11 @@ impl Vm {
                 OpCode::Call(name, argc) => {
                     let mut args = Vec::with_capacity(*argc);
                     for _ in 0..*argc {
-                        args.push(stack.pop().ok_or_else(|| rt_err("пустой стек при вызове функции"))?);
+                        args.push(
+                            stack
+                                .pop()
+                                .ok_or_else(|| rt_err("пустой стек при вызове функции"))?,
+                        );
                     }
                     args.reverse();
                     let result = self.call(name, args)?;
@@ -240,10 +288,16 @@ impl Vm {
                 OpCode::CallValue(argc) => {
                     let mut args = Vec::with_capacity(*argc);
                     for _ in 0..*argc {
-                        args.push(stack.pop().ok_or_else(|| rt_err("пустой стек при динамическом вызове"))?);
+                        args.push(
+                            stack
+                                .pop()
+                                .ok_or_else(|| rt_err("пустой стек при динамическом вызове"))?,
+                        );
                     }
                     args.reverse();
-                    let callee = stack.pop().ok_or_else(|| rt_err("пустой стек: нет callee для CallValue"))?;
+                    let callee = stack
+                        .pop()
+                        .ok_or_else(|| rt_err("пустой стек: нет callee для CallValue"))?;
                     let result = self.call_value(callee, args)?;
                     stack.push(result);
                 }
@@ -265,10 +319,16 @@ impl Vm {
                 OpCode::CallMethod { method, argc } => {
                     let mut args = Vec::with_capacity(*argc);
                     for _ in 0..*argc {
-                        args.push(stack.pop().ok_or_else(|| rt_err("пустой стек в CallMethod (аргументы)"))?);
+                        args.push(
+                            stack
+                                .pop()
+                                .ok_or_else(|| rt_err("пустой стек в CallMethod (аргументы)"))?,
+                        );
                     }
                     args.reverse();
-                    let obj = stack.pop().ok_or_else(|| rt_err("пустой стек в CallMethod (объект)"))?;
+                    let obj = stack
+                        .pop()
+                        .ok_or_else(|| rt_err("пустой стек в CallMethod (объект)"))?;
                     let type_name = obj.type_display_name();
                     let func_name = format!("{}_{}", type_name, method);
                     let mut all_args = vec![obj];
@@ -292,7 +352,11 @@ impl Vm {
                             captured.insert(name.clone(), (value.clone(), *mutable));
                         }
                     }
-                    let closure = ClosureValue { params: params.clone(), chunk: body.clone(), captured };
+                    let closure = ClosureValue {
+                        params: params.clone(),
+                        chunk: body.clone(),
+                        captured,
+                    };
                     stack.push(Value::Closure(Rc::new(closure)));
                 }
                 OpCode::Print(argc) => {
@@ -301,26 +365,44 @@ impl Vm {
                         parts.push(stack.pop().ok_or_else(|| rt_err("пустой стек при PRINT"))?);
                     }
                     parts.reverse();
-                    let line = parts.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ");
+                    let line = parts
+                        .iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ");
                     println!("{}", line);
                 }
                 OpCode::MakeArray(n) => {
                     let mut items = Vec::with_capacity(*n);
                     for _ in 0..*n {
-                        items.push(stack.pop().ok_or_else(|| rt_err("пустой стек при создании массива"))?);
+                        items.push(
+                            stack
+                                .pop()
+                                .ok_or_else(|| rt_err("пустой стек при создании массива"))?,
+                        );
                     }
                     items.reverse();
                     stack.push(Value::Array(Rc::new(RefCell::new(items))));
                 }
                 OpCode::Index => {
-                    let idx = stack.pop().ok_or_else(|| rt_err("пустой стек при индексации"))?;
-                    let target = stack.pop().ok_or_else(|| rt_err("пустой стек при индексации"))?;
+                    let idx = stack
+                        .pop()
+                        .ok_or_else(|| rt_err("пустой стек при индексации"))?;
+                    let target = stack
+                        .pop()
+                        .ok_or_else(|| rt_err("пустой стек при индексации"))?;
                     stack.push(index_get(&target, &idx)?);
                 }
                 OpCode::IndexAssign => {
-                    let value = stack.pop().ok_or_else(|| rt_err("пустой стек при IndexAssign"))?;
-                    let idx = stack.pop().ok_or_else(|| rt_err("пустой стек при IndexAssign"))?;
-                    let target = stack.pop().ok_or_else(|| rt_err("пустой стек при IndexAssign"))?;
+                    let value = stack
+                        .pop()
+                        .ok_or_else(|| rt_err("пустой стек при IndexAssign"))?;
+                    let idx = stack
+                        .pop()
+                        .ok_or_else(|| rt_err("пустой стек при IndexAssign"))?;
+                    let target = stack
+                        .pop()
+                        .ok_or_else(|| rt_err("пустой стек при IndexAssign"))?;
                     index_set(&target, &idx, value.clone())?;
                     stack.push(value);
                 }
@@ -334,7 +416,11 @@ impl Vm {
                     let mut field_map = HashMap::new();
                     let mut values = Vec::with_capacity(fields.len());
                     for _ in 0..fields.len() {
-                        values.push(stack.pop().ok_or_else(|| rt_err("пустой стек при MakeStruct"))?);
+                        values.push(
+                            stack
+                                .pop()
+                                .ok_or_else(|| rt_err("пустой стек при MakeStruct"))?,
+                        );
                     }
                     values.reverse();
                     for (name, value) in fields.iter().zip(values.into_iter()) {
@@ -346,34 +432,50 @@ impl Vm {
                     });
                 }
                 OpCode::GetField(field) => {
-                    let obj = stack.pop().ok_or_else(|| rt_err("пустой стек при GetField"))?;
+                    let obj = stack
+                        .pop()
+                        .ok_or_else(|| rt_err("пустой стек при GetField"))?;
                     match obj {
                         Value::Struct { fields, .. } => {
                             let val = fields.borrow().get(field).cloned().unwrap_or(Value::Nil);
                             stack.push(val);
                         }
-                        other => return Err(rt_err(format!(
-                            "доступ к полю '{}' не поддерживается для типа {}",
-                            field, other.type_display_name()
-                        ))),
+                        other => {
+                            return Err(rt_err(format!(
+                                "доступ к полю '{}' не поддерживается для типа {}",
+                                field,
+                                other.type_display_name()
+                            )))
+                        }
                     }
                 }
                 OpCode::SetField(field) => {
-                    let value = stack.pop().ok_or_else(|| rt_err("пустой стек при SetField (value)"))?;
-                    let obj = stack.pop().ok_or_else(|| rt_err("пустой стек при SetField (obj)"))?;
+                    let value = stack
+                        .pop()
+                        .ok_or_else(|| rt_err("пустой стек при SetField (value)"))?;
+                    let obj = stack
+                        .pop()
+                        .ok_or_else(|| rt_err("пустой стек при SetField (obj)"))?;
                     match &obj {
                         Value::Struct { fields, .. } => {
                             fields.borrow_mut().insert(field.clone(), value.clone());
                             stack.push(value);
                         }
-                        other => return Err(rt_err(format!(
-                            "присваивание поля '{}' не поддерживается для типа {}",
-                            field, other.type_display_name()
-                        ))),
+                        other => {
+                            return Err(rt_err(format!(
+                                "присваивание поля '{}' не поддерживается для типа {}",
+                                field,
+                                other.type_display_name()
+                            )))
+                        }
                     }
                 }
                 OpCode::Return(has_value) => {
-                    return Ok(if *has_value { stack.pop().unwrap_or(Value::Nil) } else { Value::Nil });
+                    return Ok(if *has_value {
+                        stack.pop().unwrap_or(Value::Nil)
+                    } else {
+                        Value::Nil
+                    });
                 }
             }
             ip += 1;
@@ -394,7 +496,10 @@ impl Vm {
         for scope in scopes.iter_mut().rev() {
             if let Some((v, mutable)) = scope.vars.get_mut(name) {
                 if !*mutable {
-                    return Err(rt_err(format!("невозможно изменить immutable-переменную '{}'", name)));
+                    return Err(rt_err(format!(
+                        "невозможно изменить immutable-переменную '{}'",
+                        name
+                    )));
                 }
                 *v = value;
                 return Ok(());
@@ -423,7 +528,9 @@ impl Vm {
         self.call_depth += 1;
         if self.call_depth > self.max_call_depth {
             self.call_depth -= 1;
-            return Err(rt_err("превышена максимальная глубина рекурсии (защита от stack overflow)"));
+            return Err(rt_err(
+                "превышена максимальная глубина рекурсии (защита от stack overflow)",
+            ));
         }
         let def = self
             .functions
@@ -432,10 +539,20 @@ impl Vm {
             .ok_or_else(|| rt_err(format!("неопределённая функция '{}'", name)))?;
         if def.params.len() != args.len() {
             self.call_depth -= 1;
-            return Err(rt_err(format!("функция '{}' ожидает {} аргумент(ов), передано {}", name, def.params.len(), args.len())));
+            return Err(rt_err(format!(
+                "функция '{}' ожидает {} аргумент(ов), передано {}",
+                name,
+                def.params.len(),
+                args.len()
+            )));
         }
         let mut base = HashMap::new();
-        for ((p, a), m) in def.params.iter().zip(args.into_iter()).zip(def.param_mut.iter()) {
+        for ((p, a), m) in def
+            .params
+            .iter()
+            .zip(args.into_iter())
+            .zip(def.param_mut.iter())
+        {
             base.insert(p.clone(), (a, *m));
         }
         let mut frame_scopes = vec![Scope { vars: base }];
@@ -477,9 +594,17 @@ impl Vm {
         self.call_depth += 1;
         if self.call_depth > self.max_call_depth {
             self.call_depth -= 1;
-            return Err(rt_err("превышена максимальная глубина рекурсии (защита от stack overflow)"));
+            return Err(rt_err(
+                "превышена максимальная глубина рекурсии (защита от stack overflow)",
+            ));
         }
-        let captured_scope = Scope { vars: closure.captured.iter().map(|(k, (v, m))| (k.clone(), (v.clone(), *m))).collect() };
+        let captured_scope = Scope {
+            vars: closure
+                .captured
+                .iter()
+                .map(|(k, (v, m))| (k.clone(), (v.clone(), *m)))
+                .collect(),
+        };
         let mut param_vars = HashMap::new();
         for (p, a) in closure.params.iter().zip(args.into_iter()) {
             param_vars.insert(p.clone(), (a, true));
@@ -495,14 +620,21 @@ fn arith(op: &OpCode, a: Value, b: Value) -> RResult<Value> {
     use Value::*;
     match (a, b) {
         (Int(x), Int(y)) => Ok(Int(match op {
-            OpCode::Add => x.checked_add(y).ok_or_else(|| rt_err("переполнение int при сложении"))?,
-            OpCode::Sub => x.checked_sub(y).ok_or_else(|| rt_err("переполнение int при вычитании"))?,
-            OpCode::Mul => x.checked_mul(y).ok_or_else(|| rt_err("переполнение int при умножении"))?,
+            OpCode::Add => x
+                .checked_add(y)
+                .ok_or_else(|| rt_err("переполнение int при сложении"))?,
+            OpCode::Sub => x
+                .checked_sub(y)
+                .ok_or_else(|| rt_err("переполнение int при вычитании"))?,
+            OpCode::Mul => x
+                .checked_mul(y)
+                .ok_or_else(|| rt_err("переполнение int при умножении"))?,
             OpCode::Div => {
                 if y == 0 {
                     return Err(rt_err("деление на ноль"));
                 }
-                x.checked_div(y).ok_or_else(|| rt_err("переполнение int при делении"))?
+                x.checked_div(y)
+                    .ok_or_else(|| rt_err("переполнение int при делении"))?
             }
             OpCode::Mod => {
                 if y == 0 {
@@ -524,9 +656,15 @@ fn arith(op: &OpCode, a: Value, b: Value) -> RResult<Value> {
         (Float(x), Int(y)) => arith(op, Float(x), Float(y as f64)),
         (Str(x), Str(y)) => match op {
             OpCode::Add => Ok(Str(x + &y)),
-            _ => Err(rt_err("для строк допустима только операция '+' (конкатенация)")),
+            _ => Err(rt_err(
+                "для строк допустима только операция '+' (конкатенация)",
+            )),
         },
-        (a, b) => Err(rt_err(format!("несовместимые типы в арифметической операции: {} и {}", a.type_name(), b.type_name()))),
+        (a, b) => Err(rt_err(format!(
+            "несовместимые типы в арифметической операции: {} и {}",
+            a.type_name(),
+            b.type_name()
+        ))),
     }
 }
 
@@ -545,7 +683,13 @@ fn compare(op: &OpCode, a: Value, b: Value) -> RResult<Value> {
         let eq = values_equal(&a, &b);
         return Ok(Value::Bool(if matches!(op, OpCode::Eq) { eq } else { !eq }));
     }
-    let ord = ordering.ok_or_else(|| rt_err(format!("несравнимые типы: {} и {}", a.type_name(), b.type_name())))?;
+    let ord = ordering.ok_or_else(|| {
+        rt_err(format!(
+            "несравнимые типы: {} и {}",
+            a.type_name(),
+            b.type_name()
+        ))
+    })?;
     Ok(Value::Bool(match op {
         OpCode::Lt => ord.is_lt(),
         OpCode::Gt => ord.is_gt(),
@@ -595,7 +739,10 @@ fn index_get(target: &Value, idx: &Value) -> RResult<Value> {
             let i = normalize_index(*i, chars.len())?;
             Ok(Value::Str(chars[i].to_string()))
         }
-        (t, _) => Err(rt_err(format!("индексация не поддерживается для типа {}", t.type_name()))),
+        (t, _) => Err(rt_err(format!(
+            "индексация не поддерживается для типа {}",
+            t.type_name()
+        ))),
     }
 }
 
@@ -607,13 +754,19 @@ fn index_set(target: &Value, idx: &Value, value: Value) -> RResult<()> {
             items[i] = value;
             Ok(())
         }
-        (t, _) => Err(rt_err(format!("индексное присваивание не поддерживается для типа {}", t.type_name()))),
+        (t, _) => Err(rt_err(format!(
+            "индексное присваивание не поддерживается для типа {}",
+            t.type_name()
+        ))),
     }
 }
 
 fn normalize_index(i: i64, len: usize) -> RResult<usize> {
     if i < 0 || i as usize >= len {
-        return Err(rt_err(format!("индекс {} выходит за границы массива длины {}", i, len)));
+        return Err(rt_err(format!(
+            "индекс {} выходит за границы массива длины {}",
+            i, len
+        )));
     }
     Ok(i as usize)
 }

@@ -14,8 +14,8 @@ pub mod lexer;
 pub mod module_resolver;
 pub mod parser;
 pub mod runtime;
-pub mod sga_alphabet;
 pub mod semantic;
+pub mod sga_alphabet;
 pub mod typechecker;
 pub mod vm;
 
@@ -71,8 +71,12 @@ impl From<ParseFullError> for SgaError {
 /// в `module_resolver::resolve_imports`, которому не нужно (и не должно)
 /// знать о публичном `SgaError`.
 fn parse_full(source: &str) -> Result<Program, ParseFullError> {
-    let tokens = lexer::Lexer::new(source).tokenize().map_err(|e| ParseFullError::Lex(e.to_string()))?;
-    parser::Parser::new(tokens).parse_program().map_err(|e| ParseFullError::Parse(e.to_string()))
+    let tokens = lexer::Lexer::new(source)
+        .tokenize()
+        .map_err(|e| ParseFullError::Lex(e.to_string()))?;
+    parser::Parser::new(tokens)
+        .parse_program()
+        .map_err(|e| ParseFullError::Parse(e.to_string()))
 }
 
 fn parse_full_flat(source: &str) -> Result<Program, String> {
@@ -121,11 +125,17 @@ pub fn run_source(source: &str) -> Result<Value, SgaError> {
 /// резолвятся рекурсивно относительно директории каждого файла (см.
 /// `module_resolver` для полного описания семантики и ограничений).
 pub fn run_source_file(path: &Path) -> Result<Value, SgaError> {
-    let source = std::fs::read_to_string(path)
-        .map_err(|e| SgaError::Import(format!("не удалось прочитать '{}': {}", path.display(), e)))?;
+    let source = std::fs::read_to_string(path).map_err(|e| {
+        SgaError::Import(format!("не удалось прочитать '{}': {}", path.display(), e))
+    })?;
     let program = parse_full(&source)?;
-    let resolved = module_resolver::resolve_imports(program, path, &module_resolver::FsLoader, &parse_full_flat)
-        .map_err(|e| SgaError::Import(e.0))?;
+    let resolved = module_resolver::resolve_imports(
+        program,
+        path,
+        &module_resolver::FsLoader,
+        &parse_full_flat,
+    )
+    .map_err(|e| SgaError::Import(e.0))?;
     run_resolved_program(resolved)
 }
 
@@ -136,9 +146,16 @@ pub fn run_source_file(path: &Path) -> Result<Value, SgaError> {
 /// компиляция в байткод -> верификация байткода (`vm::Vm::new`) ->
 /// исполнение.
 fn run_resolved_program(program: Program) -> Result<Value, SgaError> {
-    semantic::Analyzer::new().analyze(&program).map_err(|e| SgaError::Semantic(e.to_string()))?;
-    typechecker::Typechecker::new().analyze(&program).map_err(|e| SgaError::Type(e.to_string()))?;
+    semantic::Analyzer::new()
+        .analyze(&program)
+        .map_err(|e| SgaError::Semantic(e.to_string()))?;
+    typechecker::Typechecker::new()
+        .analyze(&program)
+        .map_err(|e| SgaError::Type(e.to_string()))?;
     let compiled = codegen::compile(&program);
-    let (mut machine, main_chunk) = vm::Vm::new(compiled).map_err(|e| SgaError::Runtime(e.to_string()))?;
-    machine.run(&main_chunk).map_err(|e| SgaError::Runtime(e.to_string()))
+    let (mut machine, main_chunk) =
+        vm::Vm::new(compiled).map_err(|e| SgaError::Runtime(e.to_string()))?;
+    machine
+        .run(&main_chunk)
+        .map_err(|e| SgaError::Runtime(e.to_string()))
 }

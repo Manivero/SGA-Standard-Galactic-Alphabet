@@ -72,6 +72,10 @@ struct FunctionDef {
 | `Index`                  | `arr idx -> v`                                  |
 | `IndexAssign`            | `arr idx v -> v`                                |
 | `Return(has_value)`      | завершает выполнение текущего `run_chunk`, возвращая `v` либо `Nil` |
+| `MakeStruct{type_name,fields}` | `v1..vN -> struct` (значения полей в порядке `fields`, снизу вверх) |
+| `GetField(name)`         | `struct -> v`                                   |
+| `SetField(name)`         | `struct v -> v` (мутирует struct по reference-семантике, см. §6 `docs/LANGUAGE_SPEC.md`) |
+| `CallMethod{method,argc}` | `obj a1..aN -> r` (разрешается как `{TypeName}_{method}` по фактическому типу `obj`, вызывается с `obj` как первым аргументом/`self`) |
 
 **Инвариант стека:** любое выражение (`Expr`) после компиляции оставляет
 ровно одно значение на стеке; любой statement (`Stmt`) — ровно ноль. Это
@@ -126,5 +130,15 @@ struct FunctionDef {
 
 ## Builtin-функции (`src/runtime/mod.rs`)
 
-`len`, `push`, `to_string`, `to_int`, `to_float` — вызываются через
-`Call`, перехватываются `Vm::call()` до поиска пользовательской функции.
+23 функции — вызываются через `Call`, перехватываются `Vm::call()` до
+поиска пользовательской функции:
+- **Коллекции/общие:** `len`, `push`, `keys`, `range`, `to_string`,
+  `to_int`, `to_float`, `type_of`
+- **Числовые:** `sqrt`, `floor`, `ceil`, `abs`, `min`, `max`, `pow`
+- **Строковые:** `str_split`, `str_contains`, `str_trim`,
+  `str_starts_with`, `str_ends_with`, `str_replace`, `str_upper`,
+  `str_lower`
+
+`len`/`keys` также понимают `Value::Struct` (не только `Array`/`Str`).
+Полный список и сигнатуры — `src/runtime/mod.rs::call_builtin`/
+`is_builtin`.

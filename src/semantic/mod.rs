@@ -68,15 +68,27 @@ impl Default for Analyzer {
 
 impl Analyzer {
     pub fn new() -> Self {
-        Analyzer { scopes: vec![Scope { vars: HashMap::new() }], functions: HashMap::new(), structs: HashMap::new(), loop_depth: 0, fn_depth: 0 }
+        Analyzer {
+            scopes: vec![Scope {
+                vars: HashMap::new(),
+            }],
+            functions: HashMap::new(),
+            structs: HashMap::new(),
+            loop_depth: 0,
+            fn_depth: 0,
+        }
     }
 
     fn err(msg: impl Into<String>) -> SemError {
-        SemError { message: msg.into() }
+        SemError {
+            message: msg.into(),
+        }
     }
 
     fn push_scope(&mut self) {
-        self.scopes.push(Scope { vars: HashMap::new() });
+        self.scopes.push(Scope {
+            vars: HashMap::new(),
+        });
     }
 
     fn pop_scope(&mut self) {
@@ -86,7 +98,10 @@ impl Analyzer {
     fn declare(&mut self, name: &str, mutable: bool) -> SResult<()> {
         let scope = self.scopes.last_mut().unwrap();
         if scope.vars.contains_key(name) {
-            return Err(Self::err(format!("переменная '{}' уже объявлена в этой области видимости", name)));
+            return Err(Self::err(format!(
+                "переменная '{}' уже объявлена в этой области видимости",
+                name
+            )));
         }
         scope.vars.insert(name.to_string(), mutable);
         Ok(())
@@ -182,13 +197,20 @@ impl Analyzer {
                     return Err(Self::err(format!("функция '{}' уже объявлена", name)));
                 }
                 let mut_params = params.iter().map(|p| p.mutable).collect();
-                self.functions.insert(name.clone(), FnInfo { arity: params.len(), mut_params });
+                self.functions.insert(
+                    name.clone(),
+                    FnInfo {
+                        arity: params.len(),
+                        mut_params,
+                    },
+                );
             }
             if let Stmt::StructDecl { name, fields } = stmt {
                 if self.structs.contains_key(name) {
                     return Err(Self::err(format!("тип '{}' уже объявлен", name)));
                 }
-                self.structs.insert(name.clone(), fields.iter().cloned().collect());
+                self.structs
+                    .insert(name.clone(), fields.iter().cloned().collect());
             }
         }
         for stmt in program {
@@ -208,7 +230,12 @@ impl Analyzer {
 
     fn check_stmt(&mut self, stmt: &Stmt) -> SResult<()> {
         match stmt {
-            Stmt::VarDecl { name, value, mutable, .. } => {
+            Stmt::VarDecl {
+                name,
+                value,
+                mutable,
+                ..
+            } => {
                 self.check_expr(value)?;
                 self.declare(name, *mutable)?;
                 Ok(())
@@ -220,7 +247,11 @@ impl Analyzer {
                 }
                 Ok(())
             }
-            Stmt::If { cond, then_branch, else_branch } => {
+            Stmt::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
                 self.check_expr(cond)?;
                 self.check_block(then_branch)?;
                 if let Some(else_b) = else_branch {
@@ -235,7 +266,12 @@ impl Analyzer {
                 self.loop_depth -= 1;
                 r
             }
-            Stmt::ForIn { var, start, end, body } => {
+            Stmt::ForIn {
+                var,
+                start,
+                end,
+                body,
+            } => {
                 self.check_expr(start)?;
                 self.check_expr(end)?;
                 self.push_scope();
@@ -248,7 +284,12 @@ impl Analyzer {
                 self.pop_scope();
                 Ok(())
             }
-            Stmt::FnDecl { name: _, params, body, .. } => {
+            Stmt::FnDecl {
+                name: _,
+                params,
+                body,
+                ..
+            } => {
                 // Сбрасываем loop_depth на время проверки тела функции.
                 // На практике для Stmt::FnDecl это недостижимо иначе как
                 // через 0 (FnDecl гарантированно top-level — см.
@@ -356,7 +397,9 @@ impl Analyzer {
                     if info.arity != args.len() {
                         return Err(Self::err(format!(
                             "функция '{}' ожидает {} аргумент(ов), передано {}",
-                            name, info.arity, args.len()
+                            name,
+                            info.arity,
+                            args.len()
                         )));
                     }
                 } else if let Some((min, max)) = builtin_arity(name) {
@@ -368,7 +411,9 @@ impl Analyzer {
                         };
                         return Err(Self::err(format!(
                             "функция '{}' ожидает {} аргумент(ов), передано {}",
-                            name, expected, args.len()
+                            name,
+                            expected,
+                            args.len()
                         )));
                     }
                 }
@@ -509,12 +554,14 @@ impl Analyzer {
                 for (field_name, field_expr) in fields {
                     if !declared.contains(field_name) {
                         return Err(Self::err(format!(
-                            "тип '{}' не имеет поля '{}'", type_name, field_name
+                            "тип '{}' не имеет поля '{}'",
+                            type_name, field_name
                         )));
                     }
                     if !seen.insert(field_name) {
                         return Err(Self::err(format!(
-                            "поле '{}' указано дважды в литерале '{}'", field_name, type_name
+                            "поле '{}' указано дважды в литерале '{}'",
+                            field_name, type_name
                         )));
                     }
                     self.check_expr(field_expr)?;
@@ -566,29 +613,29 @@ fn is_builtin(name: &str) -> bool {
 /// её stdlib (см. MIGRATION_REPORT.md, раздел "Stdlib").
 fn builtin_arity(name: &str) -> Option<(usize, usize)> {
     match name {
-        "len"             => Some((1, 1)),
-        "push"            => Some((1, 2)),
-        "to_string"       => Some((1, 1)),
-        "to_int"          => Some((1, 1)),
-        "to_float"        => Some((1, 1)),
-        "type_of"         => Some((1, 1)),
-        "keys"            => Some((1, 1)),
-        "range"           => Some((1, 2)),
-        "sqrt"            => Some((1, 1)),
-        "floor"           => Some((1, 1)),
-        "ceil"            => Some((1, 1)),
-        "abs"             => Some((1, 1)),
-        "min"             => Some((2, 2)),
-        "max"             => Some((2, 2)),
-        "pow"             => Some((2, 2)),
-        "str_split"       => Some((2, 2)),
-        "str_contains"    => Some((2, 2)),
-        "str_trim"        => Some((1, 1)),
+        "len" => Some((1, 1)),
+        "push" => Some((1, 2)),
+        "to_string" => Some((1, 1)),
+        "to_int" => Some((1, 1)),
+        "to_float" => Some((1, 1)),
+        "type_of" => Some((1, 1)),
+        "keys" => Some((1, 1)),
+        "range" => Some((1, 2)),
+        "sqrt" => Some((1, 1)),
+        "floor" => Some((1, 1)),
+        "ceil" => Some((1, 1)),
+        "abs" => Some((1, 1)),
+        "min" => Some((2, 2)),
+        "max" => Some((2, 2)),
+        "pow" => Some((2, 2)),
+        "str_split" => Some((2, 2)),
+        "str_contains" => Some((2, 2)),
+        "str_trim" => Some((1, 1)),
         "str_starts_with" => Some((2, 2)),
-        "str_ends_with"   => Some((2, 2)),
-        "str_replace"     => Some((3, 3)),
-        "str_upper"       => Some((1, 1)),
-        "str_lower"       => Some((1, 1)),
+        "str_ends_with" => Some((2, 2)),
+        "str_replace" => Some((3, 3)),
+        "str_upper" => Some((1, 1)),
+        "str_lower" => Some((1, 1)),
         _ => None,
     }
 }

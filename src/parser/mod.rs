@@ -20,7 +20,11 @@ pub struct ParseError {
 
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[{}:{}] ошибка парсера: {}", self.line, self.col, self.message)
+        write!(
+            f,
+            "[{}:{}] ошибка парсера: {}",
+            self.line, self.col, self.message
+        )
     }
 }
 
@@ -86,7 +90,11 @@ type PResult<T> = Result<T, ParseError>;
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Parser { tokens, pos: 0, depth: 0 }
+        Parser {
+            tokens,
+            pos: 0,
+            depth: 0,
+        }
     }
 
     /// Входная точка в рекурсию с проверкой глубины. Увеличивает
@@ -95,7 +103,11 @@ impl Parser {
     /// держать `&mut self.depth` живым одновременно с `&mut self`,
     /// нужным внутри `f`, не проходит borrow checker — вместо этого
     /// декремент выполняется явно после вызова `f`, последовательно.
-    fn guarded_recursion<T>(&mut self, what: &str, f: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<T> {
+    fn guarded_recursion<T>(
+        &mut self,
+        what: &str,
+        f: impl FnOnce(&mut Self) -> PResult<T>,
+    ) -> PResult<T> {
         self.depth += 1;
         if self.depth > MAX_PARSE_DEPTH {
             self.depth -= 1;
@@ -130,14 +142,22 @@ impl Parser {
     }
 
     fn err(&self, msg: &str) -> ParseError {
-        ParseError { message: msg.into(), line: self.peek().line, col: self.peek().col }
+        ParseError {
+            message: msg.into(),
+            line: self.peek().line,
+            col: self.peek().col,
+        }
     }
 
     fn expect(&mut self, kind: TokenKind, what: &str) -> PResult<Token> {
         if self.check(&kind) {
             Ok(self.advance())
         } else {
-            Err(self.err(&format!("ожидался {}, получено {:?}", what, self.peek_kind())))
+            Err(self.err(&format!(
+                "ожидался {}, получено {:?}",
+                what,
+                self.peek_kind()
+            )))
         }
     }
 
@@ -156,7 +176,10 @@ impl Parser {
     /// `parse_postfix`, ветка `TokenKind::Dot`, для объяснения, почему
     /// это необходимо.
     fn next_is_dot(&self) -> bool {
-        matches!(self.tokens.get(self.pos + 1).map(|t| &t.kind), Some(TokenKind::Dot))
+        matches!(
+            self.tokens.get(self.pos + 1).map(|t| &t.kind),
+            Some(TokenKind::Dot)
+        )
     }
 
     /// Лукахед: текущая позиция — на `{`, и непосредственно перед ней —
@@ -168,7 +191,10 @@ impl Parser {
         match self.tokens.get(self.pos + 1).map(|t| &t.kind) {
             Some(TokenKind::RBrace) => true,
             Some(TokenKind::Ident(_)) => {
-                matches!(self.tokens.get(self.pos + 2).map(|t| &t.kind), Some(TokenKind::Colon))
+                matches!(
+                    self.tokens.get(self.pos + 2).map(|t| &t.kind),
+                    Some(TokenKind::Colon)
+                )
             }
             _ => false,
         }
@@ -193,7 +219,9 @@ impl Parser {
     }
 
     fn parse_stmt(&mut self, top_level: bool) -> PResult<Stmt> {
-        self.guarded_recursion("блоков/операторов", |p| p.parse_stmt_inner(top_level))
+        self.guarded_recursion("блоков/операторов", |p| {
+            p.parse_stmt_inner(top_level)
+        })
     }
 
     /// `top_level=true` только для statement'ов непосредственно в теле
@@ -243,7 +271,11 @@ impl Parser {
                 } else {
                     None
                 };
-                Ok(Stmt::If { cond, then_branch, else_branch })
+                Ok(Stmt::If {
+                    cond,
+                    then_branch,
+                    else_branch,
+                })
             }
             TokenKind::While => {
                 self.advance();
@@ -260,7 +292,12 @@ impl Parser {
                 self.expect(TokenKind::Dot, "'.' (диапазон '..')")?;
                 let end = self.parse_expr()?;
                 let body = self.parse_block()?;
-                Ok(Stmt::ForIn { var, start, end, body })
+                Ok(Stmt::ForIn {
+                    var,
+                    start,
+                    end,
+                    body,
+                })
             }
             TokenKind::Struct => {
                 // FUSION: перенесено из родительской ветки B — в ветке A
@@ -269,9 +306,7 @@ impl Parser {
                 // именованный FN, по тем же причинам (см. комментарий
                 // выше у TokenKind::Fn).
                 if !top_level {
-                    return Err(self.err(
-                        "STRUCT допустим только на верхнем уровне программы",
-                    ));
+                    return Err(self.err("STRUCT допустим только на верхнем уровне программы"));
                 }
                 self.advance();
                 let name = self.parse_ident_name()?;
@@ -302,7 +337,10 @@ impl Parser {
                         s
                     }
                     other => {
-                        return Err(self.err(&format!("ожидался строковый литерал с путём после IMPORT, получено {:?}", other)))
+                        return Err(self.err(&format!(
+                            "ожидался строковый литерал с путём после IMPORT, получено {:?}",
+                            other
+                        )))
                     }
                 };
                 self.match_kind(&TokenKind::Semicolon);
@@ -323,7 +361,10 @@ impl Parser {
                 // в ветку именованной формы и падал с ParseError на
                 // токене `(` — грамматическая дыра, найденная и закрытая
                 // здесь.
-                let next_is_ident = matches!(self.tokens.get(self.pos + 1).map(|t| &t.kind), Some(TokenKind::Ident(_)));
+                let next_is_ident = matches!(
+                    self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                    Some(TokenKind::Ident(_))
+                );
                 if next_is_ident {
                     if !top_level {
                         return Err(self.err(
@@ -347,7 +388,12 @@ impl Parser {
                         None
                     };
                     let body = self.parse_block()?;
-                    Ok(Stmt::FnDecl { name, params, body, return_ty })
+                    Ok(Stmt::FnDecl {
+                        name,
+                        params,
+                        body,
+                        return_ty,
+                    })
                 } else {
                     // Анонимная форма как statement — делегируем в
                     // обычный expression-parsing (parse_primary уже умеет
@@ -400,7 +446,12 @@ impl Parser {
         self.expect(TokenKind::Assign, "'='")?;
         let value = self.parse_expr()?;
         self.match_kind(&TokenKind::Semicolon);
-        Ok(Stmt::VarDecl { name, value, mutable: !mutable_is_false, ty })
+        Ok(Stmt::VarDecl {
+            name,
+            value,
+            mutable: !mutable_is_false,
+            ty,
+        })
     }
 
     fn parse_ident_name(&mut self) -> PResult<String> {
@@ -688,7 +739,10 @@ impl Parser {
                 // "(" (без имени). Параметры лямбды — простые имена, без
                 // MUT/типов (см. ast::Expr::Lambda).
                 self.advance();
-                self.expect(TokenKind::LParen, "'(' (анонимная функция: 'FN(параметры) { тело }', без имени)")?;
+                self.expect(
+                    TokenKind::LParen,
+                    "'(' (анонимная функция: 'FN(параметры) { тело }', без имени)",
+                )?;
                 let mut params = Vec::new();
                 if !self.check(&TokenKind::RParen) {
                     params.push(self.parse_ident_name()?);
@@ -743,7 +797,10 @@ impl Parser {
                         }
                     }
                     self.expect(TokenKind::RBrace, "'}'")?;
-                    Ok(Expr::StructLit { type_name: name, fields })
+                    Ok(Expr::StructLit {
+                        type_name: name,
+                        fields,
+                    })
                 } else {
                     Ok(Expr::Ident(name))
                 }
