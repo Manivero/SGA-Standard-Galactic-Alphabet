@@ -17,7 +17,7 @@
 //! union/intersection-типы, вывод типов для сложных выражений за пределами
 //! литералов и бинарных операций.
 
-use crate::ast::{BinOp, Expr, Program, Stmt, TypeAnnotation, UnOp};
+use crate::ast::{BinOp, Expr, Pattern, Program, Stmt, TypeAnnotation, UnOp};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -488,6 +488,28 @@ impl Typechecker {
                 self.infer(obj)?;
                 for a in args {
                     self.infer(a)?;
+                }
+                Any
+            }
+            Expr::Match(scrutinee, arms) => {
+                // Инвариант "catch-all обязан быть последним" уже
+                // проверен semantic::Analyzer РАНЬШЕ typechecker в общем
+                // пайплайне (см. lib.rs::run_source) — здесь достаточно
+                // рекурсивно проверить типы внутри (чтобы ошибки типов в
+                // scrutinee/телах arm'ов не проходили молча), само MATCH
+                // типизируется как Any, как и большинство нетривиальных
+                // выражений в градуальной системе типов v0.1.
+                self.infer(scrutinee)?;
+                for arm in arms {
+                    if let Pattern::Bind(name) = &arm.pattern {
+                        self.push_scope();
+                        self.declare(name, Any);
+                        let result = self.infer(&arm.body);
+                        self.pop_scope();
+                        result?;
+                    } else {
+                        self.infer(&arm.body)?;
+                    }
                 }
                 Any
             }

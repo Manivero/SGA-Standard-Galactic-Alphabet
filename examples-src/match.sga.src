@@ -1,0 +1,61 @@
+// MATCH-выражение: pattern matching с литералами и catch-all (T006)
+let day = 3;
+let day_name = match day {
+    1 -> "понедельник",
+    2 -> "вторник",
+    3 -> "среда",
+    4 -> "четверг",
+    5 -> "пятница",
+    6 -> "суббота",
+    7 -> "воскресенье",
+    _ -> "некорректный день"
+};
+print("день", day, "=", day_name);
+
+// Bind-паттерн: если ни один литерал не подошёл, значение доступно
+// под собственным именем в теле catch-all-arm'а
+fn describe(n) {
+    return match n {
+        0 -> "ноль",
+        1 -> "один",
+        -1 -> "минус один",
+        n -> "какое-то другое число: " + to_string(n)
+    };
+}
+print(describe(0));
+print(describe(1));
+print(describe(-1));
+print(describe(42));
+
+// MATCH — выражение: используется прямо в арифметике/аргументах, без
+// временной переменной, и arm'ы могут быть вложенным MATCH
+fn http_status_text(code) {
+    return match code {
+        200 -> "OK",
+        404 -> "Not Found",
+        500 -> "Internal Server Error",
+        code -> "код " + to_string(code) + ": неизвестный статус"
+    };
+}
+print(http_status_text(200));
+print(http_status_text(404));
+print(http_status_text(999));
+
+// Пример вложенного MATCH: сначала различаем чётность, затем — знак.
+// ВАЖНО: catch-all обязателен ВСЕГДА, даже когда паттерны выглядят
+// исчерпывающими (true/false для bool) — MATCH не анализирует домен
+// значений scrutinee статически (динамическая типизация), поэтому
+// компилятор требует явный '_' в любом случае.
+fn classify(n) {
+    return match n % 2 {
+        0 -> match n < 0 {
+            true -> "чётное отрицательное",
+            false -> "чётное неотрицательное",
+            _ -> "недостижимо"
+        },
+        _ -> "нечётное"
+    };
+}
+print(-4, "->", classify(-4));
+print(3, "->", classify(3));
+print(6, "->", classify(6));

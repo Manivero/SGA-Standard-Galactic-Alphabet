@@ -46,6 +46,9 @@ pub enum TokenKind {
     /// `IMPORT` — статический импорт модуля. См. `ast::Stmt::Import` и
     /// `src/module_resolver.rs`.
     Import,
+    /// `MATCH` — pattern-matching выражение (T006, M002). См.
+    /// `ast::Expr::Match`, `ast::Pattern`.
+    Match,
 
     // Операторы и пунктуация (обычный ASCII)
     Plus,
@@ -107,6 +110,7 @@ pub fn keyword_from_mnemonic(word: &str) -> Option<TokenKind> {
         "NIL" => TokenKind::Nil,
         "MUT" => TokenKind::Mut,
         "IMPORT" => TokenKind::Import,
+        "MATCH" => TokenKind::Match,
         _ => return None,
     })
 }

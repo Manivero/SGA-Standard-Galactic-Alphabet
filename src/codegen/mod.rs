@@ -7,7 +7,7 @@
 //! фиксируется в стеке контекстов циклов и патчится постфактум, когда стаёт
 //! известен адрес конца цикла.
 
-use crate::ast::{BinOp, Expr, Program, Stmt, UnOp};
+use crate::ast::{BinOp, Expr, Pattern, Program, Stmt, UnOp};
 use crate::runtime::{is_builtin, Value};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -43,6 +43,16 @@ pub struct Compiler {
     /// вложенного `Compiler` (тело функции/лямбды) — набор имён общий
     /// для всей программы и не меняется во время компиляции.
     known_functions: Rc<HashSet<String>>,
+    /// Счётчик для генерации уникальных имён скрытых compiler-generated
+    /// переменных (T006, M002: scrutinee выражения MATCH хранится в
+    /// переменной вида `__match_N`, чтобы вычислить его РОВНО ОДИН РАЗ
+    /// и переиспользовать при сравнении с каждым паттерном — см.
+    /// `compile_expr`, ветка `Expr::Match`). Достаточно per-`Compiler`
+    /// счётчика (не глобального): уникальность нужна только для
+    /// ВЛОЖЕННЫХ `MATCH` внутри одного и того же чанка — соседние
+    /// (не вложенные) `MATCH` никогда не пересекаются по времени жизни
+    /// scope'а, поэтому переиспользование имени между ними безопасно.
+    match_counter: usize,
 }
 
 pub fn compile(program: &Program) -> CompiledProgram {
@@ -59,6 +69,7 @@ pub fn compile(program: &Program) -> CompiledProgram {
         chunk: Chunk::default(),
         loop_stack: Vec::new(),
         known_functions: known_functions.clone(),
+        match_counter: 0,
     };
 
     // FUSION-ПРИМЕЧАНИЕ: значение ПОСЛЕДНЕГО top-level statement'а,
@@ -95,6 +106,7 @@ pub fn compile(program: &Program) -> CompiledProgram {
                 chunk: Chunk::default(),
                 loop_stack: Vec::new(),
                 known_functions: known_functions.clone(),
+                match_counter: 0,
             };
             for s in body {
                 fc.compile_stmt(s);
@@ -468,6 +480,7 @@ impl Compiler {
                     chunk: Chunk::default(),
                     loop_stack: Vec::new(),
                     known_functions: self.known_functions.clone(),
+                    match_counter: 0,
                 };
                 for s in body {
                     lambda_compiler.compile_stmt(s);
@@ -529,6 +542,94 @@ impl Compiler {
                     argc: args.len(),
                 });
             }
+            Expr::Match(scrutinee, arms) => {
+                // T006 (M002). Компилируется ИСКЛЮЧИТЕЛЬНО в уже
+                // существующие опкоды (PushConst/LoadVar/DefineVar/
+                // PushScope/PopScope/Eq/Jump/JumpIfFalse) — ни одного
+                // нового opcode не добавлено, см. Feature Contract в
+                // PROJECT_STATUS.md. semantic::Analyzer УЖЕ гарантировал
+                // (до кодогенерации): arms непуст, последний arm —
+                // catch-all, остальные — нет. compile_expr поэтому не
+                // проверяет эти инварианты повторно — полагается на то,
+                // что semantic-проход обязателен и предшествует codegen
+                // во всём пайплайне (см. lib.rs::run_source).
+                let scrutinee_var = format!("__match_{}", self.match_counter);
+                self.match_counter += 1;
+                self.compile_expr(scrutinee);
+                self.emit(OpCode::PushScope);
+                self.emit(OpCode::DefineVar(scrutinee_var.clone(), false));
+
+                let mut end_patches = Vec::new();
+                let last_idx = arms.len() - 1;
+                for (i, arm) in arms.iter().enumerate() {
+                    let is_last = i == last_idx;
+                    match &arm.pattern {
+                        Pattern::Wildcard => {
+                            // Catch-all без связывания: scrutinee_var уже
+                            // не нужна, просто компилируем тело.
+                            self.compile_expr(&arm.body);
+                        }
+                        Pattern::Bind(name) => {
+                            self.emit(OpCode::PushScope);
+                            self.emit(OpCode::LoadVar(scrutinee_var.clone()));
+                            self.emit(OpCode::DefineVar(name.clone(), false));
+                            self.compile_expr(&arm.body);
+                            self.emit(OpCode::PopScope);
+                        }
+                        literal => {
+                            self.emit(OpCode::LoadVar(scrutinee_var.clone()));
+                            self.compile_pattern_literal(literal);
+                            self.emit(OpCode::Eq);
+                            let jif = self.emit(OpCode::JumpIfFalse(0));
+                            self.compile_expr(&arm.body);
+                            if !is_last {
+                                end_patches.push(self.emit(OpCode::Jump(0)));
+                            }
+                            let next_arm = self.here();
+                            self.patch_jump(jif, next_arm);
+                        }
+                    }
+                }
+                let end = self.here();
+                for p in end_patches {
+                    self.patch_jump(p, end);
+                }
+                self.emit(OpCode::PopScope);
+            }
+        }
+    }
+
+    /// Компилирует литеральный `Pattern` как значение для сравнения
+    /// (`Eq`) — та же таблица констант/opcodes, что и для одноимённых
+    /// вариантов `Expr` в этой же функции. Вызывается только для
+    /// литеральных вариантов `Pattern` (`Wildcard`/`Bind` обрабатываются
+    /// отдельно в вызывающем коде, до этой функции, и никогда сюда не
+    /// попадают — см. `compile_expr`, ветка `Expr::Match`).
+    fn compile_pattern_literal(&mut self, pattern: &Pattern) {
+        match pattern {
+            Pattern::Int(v) => {
+                let idx = self.add_const(Value::Int(*v));
+                self.emit(OpCode::PushConst(idx));
+            }
+            Pattern::Float(v) => {
+                let idx = self.add_const(Value::Float(*v));
+                self.emit(OpCode::PushConst(idx));
+            }
+            Pattern::Str(s) => {
+                let idx = self.add_const(Value::Str(s.clone()));
+                self.emit(OpCode::PushConst(idx));
+            }
+            Pattern::Bool(b) => {
+                let idx = self.add_const(Value::Bool(*b));
+                self.emit(OpCode::PushConst(idx));
+            }
+            Pattern::Nil => {
+                let idx = self.add_const(Value::Nil);
+                self.emit(OpCode::PushConst(idx));
+            }
+            Pattern::Wildcard | Pattern::Bind(_) => unreachable!(
+                "compile_pattern_literal вызывается только для литеральных паттернов, catch-all обрабатывается отдельно в Expr::Match"
+            ),
         }
     }
 }

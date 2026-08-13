@@ -8,7 +8,7 @@
 //! `IMPORT` и именованный `FN имя(...)` синтаксически допустимы ТОЛЬКО
 //! там, см. docs/COMPILER_SPEC.md.
 
-use crate::ast::{BinOp, Expr, Param, Stmt, TypeAnnotation, UnOp};
+use crate::ast::{BinOp, Expr, MatchArm, Param, Pattern, Stmt, TypeAnnotation, UnOp};
 use crate::lexer::token::{Token, TokenKind};
 
 #[derive(Debug, Clone)]
@@ -757,6 +757,28 @@ impl Parser {
                 let body = self.parse_block()?;
                 Ok(Expr::Lambda { params, body })
             }
+            TokenKind::Match => {
+                // MATCH scrutinee { паттерн -> выражение, ... } — T006
+                // (M002). Выражение (не statement), как и Lambda/FN.
+                // Обязательность catch-all последним пунктом парсер НЕ
+                // проверяет (только форму паттернов) — это делает
+                // semantic::Analyzer, см. ast::Pattern/ast::MatchArm.
+                self.advance();
+                let scrutinee = self.parse_expr()?;
+                self.expect(TokenKind::LBrace, "'{' (после выражения в MATCH)")?;
+                let mut arms = Vec::new();
+                if !self.check(&TokenKind::RBrace) {
+                    arms.push(self.parse_match_arm()?);
+                    while self.match_kind(&TokenKind::Comma) {
+                        if self.check(&TokenKind::RBrace) {
+                            break;
+                        }
+                        arms.push(self.parse_match_arm()?);
+                    }
+                }
+                self.expect(TokenKind::RBrace, "'}' (конец MATCH)")?;
+                Ok(Expr::Match(Box::new(scrutinee), arms))
+            }
             TokenKind::Ident(name) => {
                 self.advance();
                 if self.check(&TokenKind::LParen) {
@@ -824,6 +846,78 @@ impl Parser {
                 Ok(e)
             }
             other => Err(self.err(&format!("неожиданный токен в выражении: {:?}", other))),
+        }
+    }
+
+    /// Один пункт MATCH: `паттерн -> выражение`. См. `parse_pattern`.
+    fn parse_match_arm(&mut self) -> PResult<MatchArm> {
+        let pattern = self.parse_pattern()?;
+        self.expect(TokenKind::Arrow, "'->' (после паттерна в MATCH)")?;
+        let body = self.parse_expr()?;
+        Ok(MatchArm { pattern, body })
+    }
+
+    /// Паттерн в v0.1 — только литералы (включая отрицательные числа
+    /// через unary `-`, т.к. лексер не сворачивает их в единый токен) и
+    /// два вида catch-all: `_` (wildcard, не связывает имя) и простой
+    /// идентификатор (bind — связывает значение scrutinee с этим именем,
+    /// проверяется в `semantic::Analyzer`). Никакой структурной
+    /// struct-деструктуризации в v0.1 (см. docs/ROADMAP.md).
+    fn parse_pattern(&mut self) -> PResult<Pattern> {
+        match self.peek_kind().clone() {
+            TokenKind::IntLit(v) => {
+                self.advance();
+                Ok(Pattern::Int(v))
+            }
+            TokenKind::FloatLit(v) => {
+                self.advance();
+                Ok(Pattern::Float(v))
+            }
+            TokenKind::StringLit(s) => {
+                self.advance();
+                Ok(Pattern::Str(s))
+            }
+            TokenKind::True => {
+                self.advance();
+                Ok(Pattern::Bool(true))
+            }
+            TokenKind::False => {
+                self.advance();
+                Ok(Pattern::Bool(false))
+            }
+            TokenKind::Nil => {
+                self.advance();
+                Ok(Pattern::Nil)
+            }
+            TokenKind::Minus => {
+                self.advance();
+                match self.peek_kind().clone() {
+                    TokenKind::IntLit(v) => {
+                        self.advance();
+                        Ok(Pattern::Int(-v))
+                    }
+                    TokenKind::FloatLit(v) => {
+                        self.advance();
+                        Ok(Pattern::Float(-v))
+                    }
+                    other => Err(self.err(&format!(
+                        "после '-' в паттерне MATCH ожидалось число, получено {:?}",
+                        other
+                    ))),
+                }
+            }
+            TokenKind::Ident(name) if name == "_" => {
+                self.advance();
+                Ok(Pattern::Wildcard)
+            }
+            TokenKind::Ident(name) => {
+                self.advance();
+                Ok(Pattern::Bind(name))
+            }
+            other => Err(self.err(&format!(
+                "ожидался паттерн (литерал, '_' или имя-привязка) в MATCH, получено {:?}",
+                other
+            ))),
         }
     }
 }

@@ -171,6 +171,39 @@ pub enum Expr {
     /// `MUT self`, если метод должен мутировать поля через присваивание
     /// `self.field = ...` — см. docs/LANGUAGE_SPEC.md, §8).
     MethodCall(Box<Expr>, String, Vec<Expr>),
+    /// `MATCH scrutinee { паттерн -> выражение, ... }` — T006 (M002).
+    /// Выражение (не statement), как и `Lambda`: результат — значение
+    /// тела ПЕРВОГО совпавшего `arm`. Последний `arm` в списке ОБЯЗАН
+    /// быть catch-all (`Pattern::Wildcard` или `Pattern::Bind`) — это
+    /// проверяется `semantic::Analyzer`, не парсером (см.
+    /// `docs/LANGUAGE_SPEC.md`, §9 — раздел про MATCH). Только
+    /// литеральные паттерны в v0.1 — без структурной деструктуризации
+    /// struct/массивов (см. docs/ROADMAP.md).
+    Match(Box<Expr>, Vec<MatchArm>),
+}
+
+/// Паттерн одного `arm` в `Expr::Match` (T006, M002). Только литералы и
+/// два вида catch-all — см. `docs/LANGUAGE_SPEC.md`, §9.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pattern {
+    Int(i64),
+    Float(f64),
+    Str(String),
+    Bool(bool),
+    Nil,
+    /// `_` — catch-all, совпадает с чем угодно, не связывает имя.
+    Wildcard,
+    /// Простой идентификатор в позиции паттерна — catch-all, совпадает с
+    /// чем угодно И связывает значение scrutinee с этим именем как
+    /// новую immutable-переменную, видимую только в теле своего `arm`.
+    Bind(String),
+}
+
+/// Один пункт `MATCH`: `паттерн -> тело`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub body: Expr,
 }
 
 #[derive(Debug, Clone, PartialEq)]

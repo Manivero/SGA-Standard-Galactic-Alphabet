@@ -1316,3 +1316,296 @@ fn test_stdlib_builtin_arity_is_checked_for_new_functions() {
         ),
     }
 }
+
+// ===== MATCH-выражение (T006, M002) =====
+//
+// Feature Contract — см. PROJECT_STATUS.md. Кратко: MATCH — ВЫРАЖЕНИЕ
+// (не statement), только литеральные паттерны + два вида catch-all
+// (`_` — wildcard, идентификатор — bind), последний arm ОБЯЗАН быть
+// catch-all (ошибка компиляции иначе — не runtime error).
+//
+// ВАЖНО: `_` — единственный паттерн, который пишется как обычный ASCII
+// символ подчёркивания (это не SGA-ключевое слово, а обычный
+// идентификатор на уровне лексера, см. src/lexer/mod.rs). ЛЮБОЙ другой
+// SGA-keyword в исходнике (MATCH, TRUE, FALSE, NIL, LET, VAR, FN, ...)
+// обязан идти через `kw(...)` — иначе он лексится как обычный Ident, а
+// не как соответствующий TokenKind, и тест проверяет не то, что должен.
+
+#[test]
+fn test_match_literal_patterns_all_types() {
+    // AC-02: int/float/string/bool/nil, включая отрицательные числа.
+    let arms = format!(
+        "1 -> \"one\", 2 -> \"two\", -3 -> \"neg-three\", 3.5 -> \"three-half\", \
+         -2.5 -> \"neg-two-half\", \"hello\" -> \"greeting\", {true_} -> \"yes\", \
+         {false_} -> \"no\", {nil_} -> \"nothing\", _ -> \"other\"",
+        true_ = kw("TRUE"),
+        false_ = kw("FALSE"),
+        nil_ = kw("NIL")
+    );
+    let cases: &[(&str, &str)] = &[
+        ("1", "one"),
+        ("2", "two"),
+        ("-3", "neg-three"),
+        ("3.5", "three-half"),
+        ("-2.5", "neg-two-half"),
+        ("\"hello\"", "greeting"),
+        (&kw("TRUE"), "yes"),
+        (&kw("FALSE"), "no"),
+        (&kw("NIL"), "nothing"),
+        ("12345", "other"),
+    ];
+    for (scrutinee, expected) in cases {
+        let src = format!(
+            "{m} {s} {{ {arms} }};",
+            m = kw("MATCH"),
+            s = scrutinee,
+            arms = arms
+        );
+        match run(&src) {
+            Ok(Value::Str(s)) => assert_eq!(s, *expected, "scrutinee = {scrutinee}"),
+            other => {
+                panic!("scrutinee = {scrutinee}: ожидался Str({expected:?}), получено {other:?}")
+            }
+        }
+    }
+}
+
+#[test]
+fn test_match_wildcard_catches_unmatched_and_binds_nothing() {
+    // AC-03: `_` — catch-all, срабатывает, когда ни один литерал не
+    // подошёл, и НЕ вводит новое имя (в отличие от Bind).
+    let src = format!(
+        "{let_} x = {m} 999 {{ 1 -> \"one\", _ -> \"fallback\" }}; x;",
+        let_ = kw("LET"),
+        m = kw("MATCH")
+    );
+    assert_eq!(run(&src).unwrap(), Value::Str("fallback".into()));
+}
+
+#[test]
+fn test_match_bind_pattern_captures_scrutinee_value() {
+    // AC-04 (часть 1): Bind-паттерн связывает СКРУТИНИ (не что-то ещё) с
+    // новым именем, видимым в теле arm'а.
+    let src = format!(
+        "{let_} result = {m} 42 {{ 0 -> \"zero\", n -> n * 2 }}; result;",
+        let_ = kw("LET"),
+        m = kw("MATCH")
+    );
+    assert_eq!(run(&src).unwrap(), Value::Int(84));
+}
+
+#[test]
+fn test_match_bind_name_reassignment_is_rejected() {
+    // AC-04 (часть 2): Bind-имя immutable, как любое LET-имя — попытка
+    // присвоить ему новое значение внутри тела arm'а — ошибка семантики.
+    // (Тело arm'а — ОДНО выражение, не блок — присваивание `n = 10`
+    // само по себе валидное выражение, отдельный `{...}`-блок не нужен.)
+    let src = format!(
+        "{let_} r = {m} 5 {{ n -> n = 10 }};",
+        let_ = kw("LET"),
+        m = kw("MATCH")
+    );
+    match run(&src) {
+        Err(SgaError::Semantic(_)) => {}
+        other => panic!(
+            "ожидалась SemError: Bind-имя 'n' должно быть immutable, получено {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn test_match_bind_name_scoped_only_to_its_own_arm() {
+    // Bind-имя не должно "протекать" за пределы своего arm'а — если бы
+    // scope не закрывался (PopScope), обращение к `n` после MATCH было
+    // бы (ошибочно) видно. Проверяем, что ссылка на `n` СНАРУЖИ MATCH —
+    // неопределённая переменная.
+    let src = format!(
+        "{let_} x = {m} 1 {{ n -> n }}; n;",
+        let_ = kw("LET"),
+        m = kw("MATCH")
+    );
+    match run(&src) {
+        Err(SgaError::Semantic(_)) => {}
+        other => panic!(
+            "ожидалась SemError: 'n' не должно быть видно после MATCH, получено {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn test_match_missing_catch_all_is_semantic_error() {
+    // AC-05: последний arm не catch-all — ошибка КОМПИЛЯЦИИ, не runtime.
+    let src = format!(
+        "{let_} x = {m} 5 {{ 1 -> \"a\", 2 -> \"b\" }};",
+        let_ = kw("LET"),
+        m = kw("MATCH")
+    );
+    match run(&src) {
+        Err(SgaError::Semantic(msg)) => {
+            assert!(
+                msg.contains("catch-all"),
+                "сообщение должно объяснять отсутствие catch-all, получено: {msg}"
+            );
+        }
+        other => panic!(
+            "ожидалась SemError (нет catch-all последним), получено {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn test_match_catch_all_not_last_is_semantic_error_wildcard() {
+    // AC-06: `_` раньше последней позиции — недостижимый код.
+    let src = format!(
+        "{let_} x = {m} 5 {{ _ -> \"a\", 1 -> \"b\" }};",
+        let_ = kw("LET"),
+        m = kw("MATCH")
+    );
+    match run(&src) {
+        Err(SgaError::Semantic(msg)) => {
+            assert!(
+                msg.contains("недостижим"),
+                "сообщение должно объяснять недостижимость, получено: {msg}"
+            );
+        }
+        other => panic!("ожидалась SemError, получено {:?}", other),
+    }
+}
+
+#[test]
+fn test_match_catch_all_not_last_is_semantic_error_bind() {
+    // AC-06, вторая форма catch-all (Bind, не только Wildcard).
+    let src = format!(
+        "{let_} x = {m} 5 {{ n -> n, 1 -> \"b\" }};",
+        let_ = kw("LET"),
+        m = kw("MATCH")
+    );
+    match run(&src) {
+        Err(SgaError::Semantic(_)) => {}
+        other => panic!(
+            "ожидалась SemError (Bind не последним), получено {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn test_match_empty_is_semantic_error() {
+    // AC-07: пустой MATCH — нет arm'ов вовсе, нет catch-all по построению.
+    let src = format!("{let_} x = {m} 5 {{}};", let_ = kw("LET"), m = kw("MATCH"));
+    match run(&src) {
+        Err(SgaError::Semantic(_)) => {}
+        other => panic!("ожидалась SemError для пустого MATCH, получено {:?}", other),
+    }
+}
+
+#[test]
+fn test_match_scrutinee_evaluated_exactly_once() {
+    // AC-08: если бы scrutinee вычислялось заново для КАЖДОГО сравнения
+    // паттерна (баг реализации без кеширования в скрытой переменной),
+    // побочный эффект (push в MUT-массив) произошёл бы несколько раз.
+    // `counter` — VAR (не LET): передаётся в `bump(MUT c)`, требующий
+    // var-bound аргумента (см. semantic::check_call_borrows).
+    let src = format!(
+        "{var_} counter = []; \
+         {fn_} bump({mut_} c) {{ push(c, 1); {return_} len(c); }} \
+         {let_} result = {m} bump(counter) {{ \
+             1 -> \"matched-first-call\", \
+             2 -> \"matched-second-call\", \
+             _ -> \"other\" \
+         }}; \
+         [result, len(counter)];",
+        var_ = kw("VAR"),
+        let_ = kw("LET"),
+        fn_ = kw("FN"),
+        mut_ = kw("MUT"),
+        return_ = kw("RETURN"),
+        m = kw("MATCH")
+    );
+    match run(&src) {
+        Ok(Value::Array(items)) => {
+            let items = items.borrow();
+            assert_eq!(
+                items[0],
+                Value::Str("matched-first-call".into()),
+                "bump(counter) должен вернуть 1 (первый и единственный вызов push)"
+            );
+            assert_eq!(
+                items[1],
+                Value::Int(1),
+                "counter должен вырасти РОВНО на 1 элемент — scrutinee вычислен ровно один раз, \
+                 а не по разу на каждый паттерн"
+            );
+        }
+        other => panic!("ожидался Array([Str, Int]), получено {:?}", other),
+    }
+}
+
+#[test]
+fn test_match_is_an_expression_assignable_and_usable_in_arithmetic() {
+    // AC-09 (часть 1): результат MATCH участвует в арифметике напрямую,
+    // без промежуточной переменной.
+    let src = format!("1 + {m} 5 {{ 5 -> 10, _ -> 0 }};", m = kw("MATCH"));
+    assert_eq!(run(&src).unwrap(), Value::Int(11));
+}
+
+#[test]
+fn test_match_can_be_passed_as_function_argument() {
+    // AC-09 (часть 2): результат MATCH — обычное значение, передаваемое
+    // как аргумент вызова.
+    let src = format!(
+        "{fn_} double(x) {{ {return_} x * 2; }} double({m} 3 {{ 3 -> 21, _ -> 0 }});",
+        fn_ = kw("FN"),
+        return_ = kw("RETURN"),
+        m = kw("MATCH")
+    );
+    assert_eq!(run(&src).unwrap(), Value::Int(42));
+}
+
+#[test]
+fn test_match_can_be_nested() {
+    // AC-09 (часть 3): MATCH внутри тела arm'а другого MATCH — проверяет
+    // и грамматику (парсер), и уникальность скрытых имён scrutinee для
+    // вложенных MATCH в одном chunk'е (см. Compiler::match_counter).
+    let src = format!(
+        "{m} 1 {{ 1 -> {m} 2 {{ 2 -> \"inner-matched\", _ -> \"inner-fallback\" }}, \
+         _ -> \"outer-fallback\" }};",
+        m = kw("MATCH")
+    );
+    assert_eq!(run(&src).unwrap(), Value::Str("inner-matched".into()));
+}
+
+#[test]
+fn test_match_first_matching_arm_wins_not_last() {
+    // Порядок arm'ов значим: первый совпавший литерал побеждает.
+    let src = format!(
+        "{m} 1 {{ 1 -> \"first\", 1 -> \"unreachable-duplicate\", _ -> \"fallback\" }};",
+        m = kw("MATCH")
+    );
+    assert_eq!(run(&src).unwrap(), Value::Str("first".into()));
+}
+
+#[test]
+fn test_match_inside_loop_recompiles_correctly_each_iteration() {
+    // Регрессионный тест на PushScope/PopScope-баланс: MATCH внутри
+    // WHILE-тела не должен "накапливать" незакрытые scope между
+    // итерациями (это привело бы к растущему стеку scope и, в конечном
+    // счёте, к неверному разрешению имён или падению).
+    let src = format!(
+        "{var_} i = 0; {var2_} total = 0; \
+         {while_} i < 5 {{ \
+             total = total + {m} i {{ 0 -> 100, n -> n }}; \
+             i = i + 1; \
+         }} \
+         total;",
+        var_ = kw("VAR"),
+        var2_ = kw("VAR"),
+        while_ = kw("WHILE"),
+        m = kw("MATCH")
+    );
+    // i=0 -> 100, i=1..4 -> n (1+2+3+4=10) => 100+10=110
+    assert_eq!(run(&src).unwrap(), Value::Int(110));
+}

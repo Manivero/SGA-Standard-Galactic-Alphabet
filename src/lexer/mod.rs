@@ -356,6 +356,7 @@ mod tests {
             ("NIL", TokenKind::Nil),
             ("MUT", TokenKind::Mut),
             ("IMPORT", TokenKind::Import),
+            ("MATCH", TokenKind::Match),
         ];
         for (mnemonic, expected) in pairs {
             let src = kw(mnemonic);

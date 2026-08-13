@@ -1,78 +1,88 @@
 {
-  "let": {
-    "prefix": "let",
-    "body": "\uEB4B\uEB44\uEB53 ${1:name} = ${2:value};",
-    "description": "LET (immutable) — SGA-кодпоинты"
-  },
-  "var": {
-    "prefix": "var",
-    "body": "\uEB55\uEB40\uEB51 ${1:name} = ${2:value};",
-    "description": "VAR (mutable) — SGA-кодпоинты"
-  },
-  "fn": {
-    "prefix": "fn",
-    "body": [
-      "\uEB45\uEB4D ${1:name}(${2:params}) {",
-      "\t$0",
-      "}"
-    ],
-    "description": "FN — объявление функции"
-  },
-  "fnmut": {
-    "prefix": "fnmut",
-    "body": [
-      "\uEB45\uEB4D ${1:name}(\uEB4C\uEB54\uEB53 ${2:param}) {",
-      "\t$0",
-      "}"
-    ],
-    "description": "FN с MUT-параметром (Ownership/Borrowing) — вызывающая сторона обязана передать VAR-переменную"
-  },
-  "if": {
-    "prefix": "if",
-    "body": [
-      "\uEB48\uEB45 ${1:cond} {",
-      "\t$0",
-      "}"
-    ],
-    "description": "IF"
-  },
-  "ifelse": {
-    "prefix": "ifelse",
-    "body": [
-      "\uEB48\uEB45 ${1:cond} {",
-      "\t$2",
-      "} \uEB44\uEB4B\uEB52\uEB44 {",
-      "\t$0",
-      "}"
-    ],
-    "description": "IF / ELSE"
-  },
-  "while": {
-    "prefix": "while",
-    "body": [
-      "\uEB56\uEB47\uEB48\uEB4B\uEB44 ${1:cond} {",
-      "\t$0",
-      "}"
-    ],
-    "description": "WHILE"
-  },
-  "for": {
-    "prefix": "for",
-    "body": [
-      "\uEB45\uEB4E\uEB51 ${1:i} \uEB48\uEB4D ${2:0}..${3:10} {",
-      "\t$0",
-      "}"
-    ],
-    "description": "FOR ... IN ... .. ..."
-  },
-  "print": {
-    "prefix": "print",
-    "body": "\uEB4F\uEB51\uEB48\uEB4D\uEB53(${1:value});",
-    "description": "PRINT"
-  },
-  "return": {
-    "prefix": "return",
-    "body": "\uEB51\uEB44\uEB53\uEB54\uEB51\uEB4D ${1:value};",
-    "description": "RETURN"
-  }
+	"let": {
+		"prefix": "let",
+		"body": " ${1:name} = ${2:value};",
+		"description": "LET (immutable) — SGA-кодпоинты"
+	},
+	"var": {
+		"prefix": "var",
+		"body": " ${1:name} = ${2:value};",
+		"description": "VAR (mutable) — SGA-кодпоинты"
+	},
+	"fn": {
+		"prefix": "fn",
+		"body": [
+			" ${1:name}(${2:params}) {",
+			"\t$0",
+			"}"
+		],
+		"description": "FN — объявление функции"
+	},
+	"fnmut": {
+		"prefix": "fnmut",
+		"body": [
+			" ${1:name}( ${2:param}) {",
+			"\t$0",
+			"}"
+		],
+		"description": "FN с MUT-параметром (Ownership/Borrowing) — вызывающая сторона обязана передать VAR-переменную"
+	},
+	"if": {
+		"prefix": "if",
+		"body": [
+			" ${1:cond} {",
+			"\t$0",
+			"}"
+		],
+		"description": "IF"
+	},
+	"ifelse": {
+		"prefix": "ifelse",
+		"body": [
+			" ${1:cond} {",
+			"\t$2",
+			"}  {",
+			"\t$0",
+			"}"
+		],
+		"description": "IF / ELSE"
+	},
+	"while": {
+		"prefix": "while",
+		"body": [
+			" ${1:cond} {",
+			"\t$0",
+			"}"
+		],
+		"description": "WHILE"
+	},
+	"for": {
+		"prefix": "for",
+		"body": [
+			" ${1:i}  ${2:0}..${3:10} {",
+			"\t$0",
+			"}"
+		],
+		"description": "FOR ... IN ... .. ..."
+	},
+	"print": {
+		"prefix": "print",
+		"body": "(${1:value});",
+		"description": "PRINT"
+	},
+	"return": {
+		"prefix": "return",
+		"body": " ${1:value};",
+		"description": "RETURN"
+	},
+	"match": {
+		"prefix": "match",
+		"body": [
+			" ${1:scrutinee} {",
+			"\t${2:pattern} -> ${3:expr},",
+			"\t_ -> $0",
+			"}"
+		],
+		"description": "MATCH ... { паттерн -> выражение, ..., _ -> ... }"
+	}
 }

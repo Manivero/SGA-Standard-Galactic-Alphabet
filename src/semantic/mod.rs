@@ -19,7 +19,7 @@
 //! времена жизни — в т.ч. для замыканий, захватывающих окружение) НЕ
 //! реализован — см. docs/ROADMAP.md.
 
-use crate::ast::{Expr, Stmt};
+use crate::ast::{Expr, Pattern, Stmt};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -595,6 +595,49 @@ impl Analyzer {
                 self.check_expr(obj)?;
                 for a in args {
                     self.check_expr(a)?;
+                }
+                Ok(())
+            }
+            Expr::Match(scrutinee, arms) => {
+                // T006 (M002): последний arm ОБЯЗАН быть catch-all
+                // ('_' или имя-привязка) — устраняет непокрытый случай
+                // на этапе компиляции вместо runtime-ошибки (осознанное
+                // решение, см. Feature Contract в PROJECT_STATUS.md).
+                // Catch-all раньше последней позиции — недостижимый код.
+                self.check_expr(scrutinee)?;
+                if arms.is_empty() {
+                    return Err(Self::err(
+                        "MATCH без единого arm — нужен хотя бы завершающий catch-all ('_' или имя-привязка)"
+                            .to_string(),
+                    ));
+                }
+                let last_idx = arms.len() - 1;
+                for (i, arm) in arms.iter().enumerate() {
+                    let is_catch_all = matches!(arm.pattern, Pattern::Wildcard | Pattern::Bind(_));
+                    if is_catch_all && i != last_idx {
+                        return Err(Self::err(format!(
+                            "недостижимый паттерн в MATCH: catch-all ('_' или имя-привязка) на позиции {} — arm'ы после него никогда не выполнятся; catch-all обязан быть последним",
+                            i + 1
+                        )));
+                    }
+                    if i == last_idx && !is_catch_all {
+                        return Err(Self::err(
+                            "MATCH обязан заканчиваться catch-all-паттерном ('_' или имя-привязка) — иначе возможен непокрытый случай"
+                                .to_string(),
+                        ));
+                    }
+                    if let Pattern::Bind(name) = &arm.pattern {
+                        // Bind связывает scrutinee с новым именем,
+                        // видимым только в теле СВОЕГО arm — immutable,
+                        // как LET (та же семантика, что и параметры
+                        // замыкания, см. Expr::Lambda выше).
+                        self.push_scope();
+                        self.declare(name, false)?;
+                        self.check_expr(&arm.body)?;
+                        self.pop_scope();
+                    } else {
+                        self.check_expr(&arm.body)?;
+                    }
                 }
                 Ok(())
             }
