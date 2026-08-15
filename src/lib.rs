@@ -10,6 +10,7 @@
 
 pub mod ast;
 pub mod codegen;
+pub mod json;
 pub mod lexer;
 pub mod module_resolver;
 pub mod parser;

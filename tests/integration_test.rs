@@ -1609,3 +1609,197 @@ fn test_match_inside_loop_recompiles_correctly_each_iteration() {
     // i=0 -> 100, i=1..4 -> n (1+2+3+4=10) => 100+10=110
     assert_eq!(run(&src).unwrap(), Value::Int(110));
 }
+
+// ===== std/json: json_stringify / json_parse (T008, M003) =====
+//
+// Feature Contract — см. PROJECT_STATUS.md. Value <-> JSON: Nil<->null,
+// Bool<->true/false, Int/Float<->число, Str<->строка, Array<->массив,
+// Struct (только stringify)->JSON-объект из реальных полей, JSON-объект
+// (только parse)->Array из 2-элементных [ключ,значение] (нет map-типа
+// в v0.1). Closure->ошибка при stringify.
+
+#[test]
+fn test_json_stringify_scalars() {
+    let cases: &[(&str, &str)] = &[
+        (&kw("NIL"), "null"),
+        (&kw("TRUE"), "true"),
+        (&kw("FALSE"), "false"),
+        ("42", "42"),
+        ("-7", "-7"),
+        ("\"hello\"", "\"hello\""),
+    ];
+    for (expr, expected_json) in cases {
+        let src = format!("json_stringify({});", expr);
+        match run(&src) {
+            Ok(Value::Str(s)) => assert_eq!(s, *expected_json, "expr = {expr}"),
+            other => panic!("expr = {expr}: ожидался Str({expected_json:?}), получено {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn test_json_stringify_array_nested() {
+    let src = format!(
+        "json_stringify([1, \"two\", [3, 4], {true_}, {nil_}]);",
+        true_ = kw("TRUE"),
+        nil_ = kw("NIL")
+    );
+    assert_eq!(
+        run(&src).unwrap(),
+        Value::Str("[1,\"two\",[3,4],true,null]".into())
+    );
+}
+
+#[test]
+fn test_json_stringify_struct_uses_real_field_names() {
+    // AC-01: Struct -> JSON-объект из РЕАЛЬНЫХ полей (не array-of-pairs
+    // — это только для parse, см. AC-02/асимметрию в контракте).
+    let src = format!(
+        "{struct_} Point {{ x, y }} {let_} p = Point {{ x: 1, y: 2 }}; json_stringify(p);",
+        struct_ = kw("STRUCT"),
+        let_ = kw("LET")
+    );
+    // Поля сортируются по имени для детерминированного вывода (HashMap
+    // внутри Value::Struct не гарантирует порядок) — см. src/json.rs.
+    assert_eq!(run(&src).unwrap(), Value::Str("{\"x\":1,\"y\":2}".into()));
+}
+
+#[test]
+fn test_json_stringify_closure_is_runtime_error() {
+    // AC-05
+    let src = format!(
+        "json_stringify({fn_}(x) {{ {return_} x; }});",
+        fn_ = kw("FN"),
+        return_ = kw("RETURN")
+    );
+    match run(&src) {
+        Err(SgaError::Runtime(msg)) => {
+            assert!(msg.contains("closure"), "получено: {msg}");
+        }
+        other => panic!("ожидалась RuntimeError, получено {:?}", other),
+    }
+}
+
+#[test]
+fn test_json_parse_scalars() {
+    let cases: &[(&str, Value)] = &[
+        ("null", Value::Nil),
+        ("true", Value::Bool(true)),
+        ("false", Value::Bool(false)),
+        ("42", Value::Int(42)),
+        ("-7", Value::Int(-7)),
+        ("3.5", Value::Float(3.5)),
+        ("\\\"hi\\\"", Value::Str("hi".into())),
+    ];
+    for (json_lit, expected) in cases {
+        let src = format!("json_parse(\"{}\");", json_lit);
+        assert_eq!(run(&src).unwrap(), *expected, "json_lit = {json_lit}");
+    }
+}
+
+#[test]
+fn test_json_parse_array() {
+    let src = "json_parse(\"[1, 2, 3]\");";
+    match run(src) {
+        Ok(Value::Array(items)) => {
+            let items = items.borrow();
+            assert_eq!(*items, vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        }
+        other => panic!("ожидался Array, получено {:?}", other),
+    }
+}
+
+#[test]
+fn test_json_parse_object_becomes_array_of_key_value_pairs() {
+    // AC-02: JSON-объект -> Array из 2-элементных Array [ключ, значение]
+    let src = "json_parse(\"{\\\"a\\\": 1, \\\"b\\\": 2}\");";
+    match run(src) {
+        Ok(Value::Array(items)) => {
+            let items = items.borrow();
+            assert_eq!(items.len(), 2);
+            match &items[0] {
+                Value::Array(pair) => {
+                    let pair = pair.borrow();
+                    assert_eq!(pair[0], Value::Str("a".into()));
+                    assert_eq!(pair[1], Value::Int(1));
+                }
+                other => panic!("ожидалась пара [ключ, значение], получено {:?}", other),
+            }
+        }
+        other => panic!(
+            "ожидался Array (представление объекта), получено {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn test_json_parse_invalid_is_runtime_error() {
+    // AC-04
+    for bad in ["\"not json\"", "\"[1, 2,]\"", "\"{\\\"a\\\": }\"", "\"\""] {
+        let src = format!("json_parse({});", bad);
+        match run(&src) {
+            Err(SgaError::Runtime(_)) => {}
+            other => panic!("bad = {bad}: ожидалась RuntimeError, получено {:?}", other),
+        }
+    }
+}
+
+#[test]
+fn test_json_roundtrip_via_sga_code() {
+    // AC-03: полный round-trip внутри самого SGA-кода (не только в
+    // Rust-unit-тестах src/json.rs), через реальный VM pipeline.
+    //
+    // ВАЖНО: сравнение делается на уровне Rust (Value: PartialEq,
+    // структурное сравнение через Rc<RefCell<Vec<Value>>>), а НЕ через
+    // оператор `==` внутри самого SGA-кода — у SGA `==` для массивов
+    // это identity-equality (`Rc::ptr_eq`, см. src/vm/mod.rs,
+    // values_equal), осознанная и задокументированная семантика
+    // "reference-типа" (LANGUAGE_SPEC.md §2): `restored` и `original` —
+    // заведомо РАЗНЫЕ Rc-аллокации с одинаковым содержимым, поэтому
+    // `restored == original` внутри SGA корректно даёт `FALSE`, даже
+    // при идеальном round-trip. Это не баг json.rs — это поведение
+    // языка, и данный тест проверяет содержимое, а не identity.
+    let src = format!(
+        "{let_} original = [1, \"two\", {true_}, {nil_}, 3.5]; \
+         json_parse(json_stringify(original));",
+        let_ = kw("LET"),
+        true_ = kw("TRUE"),
+        nil_ = kw("NIL")
+    );
+    match run(&src) {
+        Ok(Value::Array(items)) => {
+            let items = items.borrow();
+            assert_eq!(
+                *items,
+                vec![
+                    Value::Int(1),
+                    Value::Str("two".into()),
+                    Value::Bool(true),
+                    Value::Nil,
+                    Value::Float(3.5),
+                ]
+            );
+        }
+        other => panic!("ожидался Array, получено {:?}", other),
+    }
+}
+
+#[test]
+fn test_json_wrong_arity_is_semantic_error() {
+    // AC-06
+    match run("json_stringify();") {
+        Err(SgaError::Semantic(_)) => {}
+        other => panic!(
+            "ожидалась SemError для json_stringify() без аргументов, получено {:?}",
+            other
+        ),
+    }
+    match run("json_parse(\"1\", \"2\");") {
+        Err(SgaError::Semantic(_)) => {}
+        other => panic!(
+            "ожидалась SemError для json_parse() с 2 аргументами, получено {:?}",
+            other
+        ),
+    }
+}

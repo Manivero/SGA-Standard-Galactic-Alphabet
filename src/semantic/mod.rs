@@ -679,6 +679,8 @@ fn builtin_arity(name: &str) -> Option<(usize, usize)> {
         "str_replace" => Some((3, 3)),
         "str_upper" => Some((1, 1)),
         "str_lower" => Some((1, 1)),
+        "json_stringify" => Some((1, 1)),
+        "json_parse" => Some((1, 1)),
         _ => None,
     }
 }

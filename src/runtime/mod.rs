@@ -310,6 +310,8 @@ pub fn is_builtin(name: &str) -> bool {
             | "str_upper"
             | "str_lower"
             | "range"
+            | "json_stringify"
+            | "json_parse"
     )
 }
 
@@ -632,6 +634,21 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> {
             )),
             None => Err("str_lower() ожидает 1 аргумент, передано 0".to_string()),
         },
+
+        // ── std/json (T008, M003) ───────────────────────────────────────
+        "json_stringify" => match args.first() {
+            Some(v) => crate::json::stringify(v).map(Value::Str),
+            None => Err("json_stringify() ожидает 1 аргумент, передано 0".to_string()),
+        },
+        "json_parse" => match args.first() {
+            Some(Value::Str(s)) => crate::json::parse(s),
+            Some(v) => Err(format!(
+                "json_parse() ожидает string, получено {}",
+                v.type_display_name()
+            )),
+            None => Err("json_parse() ожидает 1 аргумент, передано 0".to_string()),
+        },
+
         _ => Err(format!("неизвестная встроенная функция '{}'", name)),
     }
 }

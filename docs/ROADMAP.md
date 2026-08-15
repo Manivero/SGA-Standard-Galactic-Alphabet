@@ -25,8 +25,8 @@
 - ✅ 10 примеров (`examples/`), все реально выполняются — включая
   новые `closures.sga`, `ownership.sga`, `modules.sga`+`modules_math.sga`,
   демонстрирующие совместную работу фич, объединённых при слиянии
-- ✅ 130 тестов (92 интеграционных + 12 модульных + 26 unit-тестов
-  лексера, включая регрессионные на
+- ✅ 144 теста (102 интеграционных + 12 модульных + 26 unit-тестов
+  лексера + 4 unit-теста json, включая регрессионные на
   реально найденные дыры — см. ниже и docs/SECURITY.md, и на конфликт
   грамматики между field-access и `FOR..IN`, найденный при слиянии со
   structs-веткой)
@@ -76,6 +76,14 @@
   см. `docs/LANGUAGE_SPEC.md` §4.1). Компилируется целиком в уже
   существующие опкоды VM — ни один новый opcode не добавлен. Нет
   структурной struct-деструктуризации (см. "Не сделано" ниже).
+- ✅ **`std/json`** (roadmap-приоритет 1, T008/M003, 2026-08-14):
+  `json_stringify(v)`/`json_parse(s)`, ручной parser/serializer
+  (`src/json.rs`), БЕЗ внешних зависимостей — весь проект написан с нуля,
+  `serde_json` стал бы первой внешней зависимостью за всю историю
+  проекта. `Struct` сериализуется по реальным полям; JSON-объект при
+  парсинге становится `Array` из пар `[ключ, значение]` (у SGA v0.1 нет
+  generic map-типа — честная асимметрия, не баг). `std/io` (следующая
+  задача, T009) остаётся нереализованным.
 - ✅ **Расширенная стандартная библиотека**: `type_of`, `keys`, `range`,
   `sqrt`, `floor`, `ceil`, `abs`, `min`, `max`, `pow`, `str_split`,
   `str_contains`, `str_trim`, `str_starts_with`, `str_ends_with`,
@@ -120,12 +128,14 @@
 Реализовано: `len`, `push`, `to_string`, `to_int`, `to_float`, `type_of`,
 `keys`, `range`, `sqrt`, `floor`, `ceil`, `abs`, `min`, `max`, `pow`,
 `str_split`, `str_contains`, `str_trim`, `str_starts_with`,
-`str_ends_with`, `str_replace`, `str_upper`, `str_lower`
-(`src/runtime/mod.rs`). **Не реализовано**: `std/io` (файлы, помимо
-`print`), `std/fs`, `std/net`, `std/http`, `std/crypto`, `std/time`,
-`std/math` (кроме встроенных операторов), `std/json`, `std/random`,
-`std/thread`, `std/async`, `std/process`, `std/collections` (кроме
-базового `array`). Каждый из них требует системных вызовов/внешних
+`str_ends_with`, `str_replace`, `str_upper`, `str_lower`,
+`json_stringify`, `json_parse` (T008/M003, 2026-08-14 — см. "Сделано в
+v0.1.0" ниже) (`src/runtime/mod.rs`, `src/json.rs`). **Не реализовано**:
+`std/io` (файлы, помимо `print` — T009/M003, следующая задача), `std/fs`,
+`std/net`, `std/http`, `std/crypto`, `std/time`, `std/math` (кроме
+встроенных операторов), `std/random`, `std/thread`, `std/async`,
+`std/process`, `std/collections` (кроме базового `array`). Каждый из них
+требует системных вызовов/внешних
 крейтов и отдельного дизайна безопасности (permission system для
 sandboxed I/O) — нельзя честно "обозначить как готово" без реализации.
 
@@ -195,7 +205,10 @@ Rust целиком"): нет lifetimes, нет анализа aliasing двух
 не входившие явно в 10-пунктовый приоритет) — выполнены, см. секции
 выше и `docs/MIGRATION_REPORT.md`. Дальше по тому же приоритету:
 
-1. `std/io` (чтение файлов) + `std/json` (т.к. часто нужны вместе).
+1. ~~`std/io` (чтение файлов) + `std/json`~~ — **`std/json` реализован
+   в T008/M003** (2026-08-14, `json_stringify`/`json_parse`, см. "Сделано
+   в v0.1.0"). `std/io` (чтение файлов) остаётся — T009/M003, следующая
+   задача; требует переноса confinement-логики `IMPORT` в рантайм VM.
 2. Optimizer (constant folding, DCE) — пункт 4 исходного приоритета.
 3. WASM-бэкенд, затем LLVM-бэкенд (пункт 5 исходного приоритета).
 4. Package Manager — резолвер зависимостей/реестр для `sga.toml`

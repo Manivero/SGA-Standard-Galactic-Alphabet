@@ -130,7 +130,7 @@ struct FunctionDef {
 
 ## Builtin-функции (`src/runtime/mod.rs`)
 
-23 функции — вызываются через `Call`, перехватываются `Vm::call()` до
+25 функций — вызываются через `Call`, перехватываются `Vm::call()` до
 поиска пользовательской функции:
 - **Коллекции/общие:** `len`, `push`, `keys`, `range`, `to_string`,
   `to_int`, `to_float`, `type_of`
@@ -138,6 +138,13 @@ struct FunctionDef {
 - **Строковые:** `str_split`, `str_contains`, `str_trim`,
   `str_starts_with`, `str_ends_with`, `str_replace`, `str_upper`,
   `str_lower`
+- **std/json (T008, M003):** `json_stringify(v) -> string`,
+  `json_parse(s) -> v` — ручной parser/serializer без внешних
+  зависимостей (`src/json.rs`). `Struct` сериализуется по реальным
+  полям (отсортированным по имени для детерминированного вывода); JSON-
+  объект при парсинге становится `Array` из 2-элементных `[ключ,
+  значение]` — у SGA v0.1 нет generic map-типа. `Closure` не
+  сериализуется (`RuntimeError`).
 
 `len`/`keys` также понимают `Value::Struct` (не только `Array`/`Str`).
 Полный список и сигнатуры — `src/runtime/mod.rs::call_builtin`/
