@@ -124,6 +124,13 @@ pub struct Vm {
     /// полноценная модель прав доступа — см. docs/ROADMAP.md).
     call_depth: usize,
     max_call_depth: usize,
+    /// Confinement-граница для `read_file` (T009, M003) — `None`, если
+    /// программа запущена через `run_source` (нет файлового пути, не с
+    /// чем сравнивать), `Some(root)` при запуске через `run_source_file`
+    /// (`root` — тот же каталог, что confinement-граница `IMPORT`, см.
+    /// `module_resolver::compute_confinement_root`). Единственный
+    /// потребитель — `call_read_file` ниже.
+    sandbox_root: Option<std::path::PathBuf>,
 }
 
 impl Vm {
@@ -135,13 +142,23 @@ impl Vm {
     /// при ручном конструировании `Chunk`/`CompiledProgram` в обход
     /// компилятора — оба типа публичны). См. `verify_program` выше для
     /// подробного обоснования.
-    pub fn new(program: CompiledProgram) -> RResult<(Self, Chunk)> {
+    ///
+    /// `sandbox_root` (T009, M003): `None`, если программа запущена
+    /// через `run_source` (нет файлового контекста), `Some(root)` при
+    /// запуске через `run_source_file` — та же confinement-граница, что
+    /// `IMPORT` (см. `module_resolver::compute_confinement_root`).
+    /// Единственный потребитель — `read_file`.
+    pub fn new(
+        program: CompiledProgram,
+        sandbox_root: Option<std::path::PathBuf>,
+    ) -> RResult<(Self, Chunk)> {
         verify_program(&program.main, &program.functions)?;
         Ok((
             Vm {
                 functions: program.functions,
                 call_depth: 0,
                 max_call_depth: 200,
+                sandbox_root,
             },
             program.main,
         ))
@@ -522,6 +539,12 @@ impl Vm {
     /// `param_mut`, и здесь стояло `(a, true)` для всех параметров без
     /// исключения). Слияние восстанавливает фикс.
     fn call(&mut self, name: &str, args: Vec<Value>) -> RResult<Value> {
+        // T009 (M003): read_file перехватывается ДО общего диспетча
+        // builtin — нужен доступ к self.sandbox_root, которого нет у
+        // свободной функции call_builtin. См. call_read_file ниже.
+        if name == "read_file" {
+            return self.call_read_file(args);
+        }
         if is_builtin(name) {
             return call_builtin(name, args).map_err(rt_err);
         }
@@ -559,6 +582,65 @@ impl Vm {
         let result = self.run_chunk(&def.chunk, &mut frame_scopes);
         self.call_depth -= 1;
         result
+    }
+
+    /// Реализация `read_file` (T009, M003, `std/io`) — sandboxed чтение
+    /// файла. НЕ в `runtime::call_builtin` (в отличие от 25 остальных
+    /// builtin), т.к. нужен `self.sandbox_root`, которого у той
+    /// свободной функции нет. Перехватывается в `call()` выше, до
+    /// общего диспетча builtin.
+    ///
+    /// SECURITY: переиспользует РОВНО ТУ ЖЕ confinement-границу и
+    /// проверку, что `IMPORT` (`module_resolver::is_within_root`,
+    /// `module_resolver::compute_confinement_root`) — не дублирует эту
+    /// логику. Абсолютные пути отклоняются безусловно, ДО join с
+    /// `root` (тот же порядок и то же обоснование, что для `IMPORT` в
+    /// `module_resolver.rs::resolve_program`: `Path::join` с абсолютным
+    /// аргументом полностью заменяет базу — без этой проверки
+    /// `read_file("/etc/passwd")` читал бы произвольный файл с правами
+    /// процесса, игнорируя `root` целиком).
+    fn call_read_file(&self, args: Vec<Value>) -> RResult<Value> {
+        if args.len() != 1 {
+            return Err(rt_err(format!(
+                "read_file() ожидает 1 аргумент, передано {}",
+                args.len()
+            )));
+        }
+        let path_str = match &args[0] {
+            Value::Str(s) => s.clone(),
+            v => {
+                return Err(rt_err(format!(
+                    "read_file() ожидает string, получено {}",
+                    v.type_display_name()
+                )))
+            }
+        };
+        let root = self.sandbox_root.as_ref().ok_or_else(|| {
+            rt_err(
+                "read_file() недоступен: программа запущена без файлового контекста \
+                 (через run_source, а не run_source_file) — файловый I/O не может быть \
+                 ограничен песочницей без известного корня каталога",
+            )
+        })?;
+        if std::path::Path::new(&path_str).is_absolute() {
+            return Err(rt_err(format!(
+                "read_file(\"{}\"): абсолютные пути запрещены — путь обязан быть относительным \
+                 и не выходить за пределы каталога входного файла программы",
+                path_str
+            )));
+        }
+        let full_path = root.join(&path_str);
+        if !crate::module_resolver::is_within_root(&full_path, root) {
+            return Err(rt_err(format!(
+                "read_file(\"{}\"): путь выходит за пределы каталога входного файла программы \
+                 ('{}'); обход через '..' запрещён",
+                path_str,
+                root.display()
+            )));
+        }
+        std::fs::read_to_string(&full_path)
+            .map(Value::Str)
+            .map_err(|e| rt_err(format!("read_file(\"{}\"): {}", path_str, e)))
     }
 
     /// Вызывает значение `callee` (ожидается `Value::Closure`) с

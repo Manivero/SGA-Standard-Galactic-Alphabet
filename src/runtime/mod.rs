@@ -312,6 +312,12 @@ pub fn is_builtin(name: &str) -> bool {
             | "range"
             | "json_stringify"
             | "json_parse"
+            // T009 (M003): read_file зарегистрирован здесь (нужно
+            // codegen'у и semantic'у), но НЕ реализован ниже в
+            // call_builtin — перехватывается раньше, в Vm::call(),
+            // т.к. нужен доступ к Vm::sandbox_root, которого у этой
+            // свободной функции нет. См. src/vm/mod.rs::call_read_file.
+            | "read_file"
     )
 }
 
@@ -648,6 +654,18 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> {
             )),
             None => Err("json_parse() ожидает 1 аргумент, передано 0".to_string()),
         },
+
+        // T009 (M003): read_file НЕ реализован здесь — перехватывается
+        // раньше, в Vm::call(), т.к. нужен доступ к Vm::sandbox_root
+        // (см. is_builtin выше). Достижение этой ветки означает, что
+        // перехват в Vm::call() был обойдён или удалён — явная паника с
+        // понятным сообщением лучше молчаливого "неизвестная функция"
+        // ниже, которое ввело бы в заблуждение (read_file — известный
+        // builtin, просто реализован в другом месте).
+        "read_file" => unreachable!(
+            "call_builtin(\"read_file\", ...) не должен вызываться напрямую — \
+             ожидался перехват в Vm::call() (см. src/vm/mod.rs::call_read_file)"
+        ),
 
         _ => Err(format!("неизвестная встроенная функция '{}'", name)),
     }

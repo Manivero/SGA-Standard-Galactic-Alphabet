@@ -119,7 +119,10 @@ fn reject_imports(program: &Program) -> Result<(), SgaError> {
 pub fn run_source(source: &str) -> Result<Value, SgaError> {
     let program = parse_full(source)?;
     reject_imports(&program)?;
-    run_resolved_program(program)
+    // T009 (M003): нет файлового пути — нет confinement-границы для
+    // read_file. `None` даёт понятную RuntimeError при попытке вызова
+    // (см. vm::Vm::call_read_file), а не тихо угадывает cwd процесса.
+    run_resolved_program(program, None)
 }
 
 /// Полный конвейер для файла на диске, с поддержкой `IMPORT`. Импорты
@@ -137,7 +140,11 @@ pub fn run_source_file(path: &Path) -> Result<Value, SgaError> {
         &parse_full_flat,
     )
     .map_err(|e| SgaError::Import(e.0))?;
-    run_resolved_program(resolved)
+    // T009 (M003): та же confinement-граница, что уже вычислена внутри
+    // resolve_imports для IMPORT — единый источник истины, см.
+    // module_resolver::compute_confinement_root.
+    let sandbox_root = Some(module_resolver::compute_confinement_root(path));
+    run_resolved_program(resolved, sandbox_root)
 }
 
 /// Общий хвост пайплайна после того, как `Program` гарантированно не
@@ -146,7 +153,13 @@ pub fn run_source_file(path: &Path) -> Result<Value, SgaError> {
 /// (включая Ownership/Borrowing) -> проверка типов (градуальная) ->
 /// компиляция в байткод -> верификация байткода (`vm::Vm::new`) ->
 /// исполнение.
-fn run_resolved_program(program: Program) -> Result<Value, SgaError> {
+///
+/// `sandbox_root` (T009, M003) — confinement-граница для `read_file`;
+/// `None` от `run_source`, `Some(..)` от `run_source_file`.
+fn run_resolved_program(
+    program: Program,
+    sandbox_root: Option<std::path::PathBuf>,
+) -> Result<Value, SgaError> {
     semantic::Analyzer::new()
         .analyze(&program)
         .map_err(|e| SgaError::Semantic(e.to_string()))?;
@@ -155,7 +168,7 @@ fn run_resolved_program(program: Program) -> Result<Value, SgaError> {
         .map_err(|e| SgaError::Type(e.to_string()))?;
     let compiled = codegen::compile(&program);
     let (mut machine, main_chunk) =
-        vm::Vm::new(compiled).map_err(|e| SgaError::Runtime(e.to_string()))?;
+        vm::Vm::new(compiled, sandbox_root).map_err(|e| SgaError::Runtime(e.to_string()))?;
     machine
         .run(&main_chunk)
         .map_err(|e| SgaError::Runtime(e.to_string()))

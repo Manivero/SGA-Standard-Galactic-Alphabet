@@ -130,7 +130,7 @@ struct FunctionDef {
 
 ## Builtin-функции (`src/runtime/mod.rs`)
 
-25 функций — вызываются через `Call`, перехватываются `Vm::call()` до
+26 функций — вызываются через `Call`, перехватываются `Vm::call()` до
 поиска пользовательской функции:
 - **Коллекции/общие:** `len`, `push`, `keys`, `range`, `to_string`,
   `to_int`, `to_float`, `type_of`
@@ -145,6 +145,16 @@ struct FunctionDef {
   объект при парсинге становится `Array` из 2-элементных `[ключ,
   значение]` — у SGA v0.1 нет generic map-типа. `Closure` не
   сериализуется (`RuntimeError`).
+- **std/io (T009, M003):** `read_file(path) -> string` — единственный
+  builtin из 26, реализованный НЕ в `runtime::call_builtin`, а
+  перехватываемый напрямую в `Vm::call()` (нужен доступ к
+  `Vm::sandbox_root`, которого нет у свободной функции `call_builtin`;
+  `runtime::is_builtin`/`semantic::builtin_arity` всё равно знают о нём
+  — нужно codegen'у для статического `OpCode::Call`). Sandboxed:
+  переиспользует confinement-границу `IMPORT`
+  (`module_resolver::is_within_root`/`compute_confinement_root`), см.
+  `docs/SECURITY.md`. Только чтение; `run_source` (без файлового пути)
+  → `RuntimeError` при вызове.
 
 `len`/`keys` также понимают `Value::Struct` (не только `Array`/`Str`).
 Полный список и сигнатуры — `src/runtime/mod.rs::call_builtin`/

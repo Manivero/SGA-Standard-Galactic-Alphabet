@@ -683,7 +683,7 @@ fn test_vm_rejects_chunk_with_out_of_bounds_const_index_instead_of_panicking() {
         main: chunk,
         functions: HashMap::new(),
     };
-    match Vm::new(program) {
+    match Vm::new(program, None) {
         Err(_) => {}
         Ok(_) => panic!("ожидалась ошибка верификации байткода (PushConst вне границ пула констант), получен Ok"),
     }
@@ -700,7 +700,7 @@ fn test_vm_rejects_chunk_with_jump_target_past_end() {
         main: chunk,
         functions: HashMap::new(),
     };
-    match Vm::new(program) {
+    match Vm::new(program, None) {
         Err(_) => {}
         Ok(_) => {
             panic!("ожидалась ошибка верификации байткода (Jump за пределы чанка), получен Ok")
@@ -720,7 +720,7 @@ fn test_vm_accepts_chunk_with_jump_target_exactly_at_end() {
         main: chunk,
         functions: HashMap::new(),
     };
-    assert!(Vm::new(program).is_ok());
+    assert!(Vm::new(program, None).is_ok());
 }
 
 /// Verifier должен проверять не только main-чанк, но и чанк каждой
@@ -749,7 +749,7 @@ fn test_vm_rejects_corrupted_function_chunk_not_just_main() {
         },
         functions,
     };
-    match Vm::new(program) {
+    match Vm::new(program, None) {
         Err(_) => {}
         Ok(_) => panic!("ожидалась ошибка верификации байткода функции 'broken', получен Ok"),
     }
@@ -786,7 +786,7 @@ fn test_vm_defines_var_after_scope_underflow_returns_runtime_error_not_panic() {
     };
     // Верификатор не проверяет баланс PushScope/PopScope (см. docstring
     // выше), поэтому Vm::new должен пройти успешно...
-    let (mut vm, main) = Vm::new(program).expect(
+    let (mut vm, main) = Vm::new(program, None).expect(
         "verify_program не должен отклонять этот чанк — баланс scope не проверяется статически",
     );
     // ...а паника должна быть превращена в RuntimeError на этапе run().
@@ -1001,7 +1001,7 @@ fn test_vm_enforces_param_immutability_even_if_semantic_is_bypassed() {
         main: main_chunk,
         functions,
     };
-    let (mut machine, main) = Vm::new(program).expect("байткод должен пройти верификатор");
+    let (mut machine, main) = Vm::new(program, None).expect("байткод должен пройти верификатор");
     match machine.run(&main) {
         Err(_) => {}
         Ok(_) => panic!(
@@ -1802,4 +1802,180 @@ fn test_json_wrong_arity_is_semantic_error() {
             other
         ),
     }
+}
+
+// ===== std/io: read_file (T009, M003) =====
+//
+// Feature Contract — см. PROJECT_STATUS.md. read_file — sandboxed чтение
+// файлов, только ЧТЕНИЕ, переиспользует confinement-границу IMPORT.
+// В отличие от большинства тестов файла, эти тесты используют
+// РЕАЛЬНЫЕ файлы на диске и run_source_file (не run_source) — read_file
+// требует файловый контекст.
+
+/// Создаёт временную директорию с уникальным именем (PID процесса +
+/// монотонный счётчик) для теста. Без внешнего крейта `tempfile` —
+/// проект остаётся без внешних зависимостей (тот же принцип, что и в
+/// src/json.rs).
+fn temp_test_dir(name: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("sga_test_{}_{}_{}", std::process::id(), name, n));
+    std::fs::create_dir_all(&dir)
+        .expect("не удалось создать временную директорию для теста read_file");
+    dir
+}
+
+#[test]
+fn test_read_file_reads_sibling_file_within_root() {
+    // AC-01
+    let dir = temp_test_dir("read_ok");
+    std::fs::write(dir.join("data.txt"), "hello from file").unwrap();
+    let entry = dir.join("main.sga");
+    let src = format!(
+        "{let_} content = read_file(\"data.txt\"); content;",
+        let_ = kw("LET")
+    );
+    std::fs::write(&entry, &src).unwrap();
+    let result = sga::run_source_file(&entry);
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(result.unwrap(), Value::Str("hello from file".into()));
+}
+
+#[test]
+fn test_read_file_absolute_path_is_rejected() {
+    // AC-02: абсолютный путь запрещён безусловно, даже указывая на
+    // реально существующий, доступный файл.
+    let dir = temp_test_dir("read_abs");
+    let secret = dir.join("secret.txt");
+    std::fs::write(&secret, "should not be readable via absolute path").unwrap();
+    let entry = dir.join("main.sga");
+    let src = format!("read_file(\"{}\");", secret.to_string_lossy());
+    std::fs::write(&entry, &src).unwrap();
+    let result = sga::run_source_file(&entry);
+    std::fs::remove_dir_all(&dir).ok();
+    match result {
+        Err(SgaError::Runtime(msg)) => {
+            assert!(msg.contains("абсолютн"), "получено: {msg}");
+        }
+        other => panic!(
+            "ожидалась RuntimeError (абсолютный путь), получено {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn test_read_file_parent_escape_is_rejected() {
+    // AC-03: '..', выходящий за пределы root, запрещён.
+    let outer = temp_test_dir("read_escape_outer");
+    let inner = outer.join("inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    std::fs::write(outer.join("secret.txt"), "outside root").unwrap();
+    let entry = inner.join("main.sga");
+    let src = format!(
+        "read_file(\"{}\");",
+        std::path::Path::new("..")
+            .join("secret.txt")
+            .to_string_lossy()
+    );
+    std::fs::write(&entry, &src).unwrap();
+    let result = sga::run_source_file(&entry);
+    std::fs::remove_dir_all(&outer).ok();
+    match result {
+        Err(SgaError::Runtime(msg)) => {
+            assert!(msg.contains("выходит за пределы"), "получено: {msg}");
+        }
+        other => panic!(
+            "ожидалась RuntimeError (выход за root), получено {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn test_read_file_without_file_context_is_runtime_error() {
+    // AC-04: run_source (не run_source_file) — нет файлового контекста.
+    let src = "read_file(\"anything.txt\");";
+    match run(src) {
+        Err(SgaError::Runtime(msg)) => {
+            assert!(msg.contains("файлового контекста"), "получено: {msg}");
+        }
+        other => panic!(
+            "ожидалась RuntimeError (нет файлового контекста), получено {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn test_read_file_nonexistent_file_is_runtime_error_not_panic() {
+    // AC-05
+    let dir = temp_test_dir("read_missing");
+    let entry = dir.join("main.sga");
+    let src = "read_file(\"does_not_exist.txt\");";
+    std::fs::write(&entry, src).unwrap();
+    let result = sga::run_source_file(&entry);
+    std::fs::remove_dir_all(&dir).ok();
+    match result {
+        Err(SgaError::Runtime(_)) => {}
+        other => panic!(
+            "ожидалась RuntimeError (файл не существует), получено {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn test_read_file_wrong_arity_is_semantic_error() {
+    // AC-06
+    match run("read_file();") {
+        Err(SgaError::Semantic(_)) => {}
+        other => panic!(
+            "ожидалась SemError для read_file() без аргументов, получено {:?}",
+            other
+        ),
+    }
+    match run("read_file(\"a\", \"b\");") {
+        Err(SgaError::Semantic(_)) => {}
+        other => panic!(
+            "ожидалась SemError для read_file() с 2 аргументами, получено {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn test_read_file_wrong_type_argument_is_runtime_error() {
+    let dir = temp_test_dir("read_wrongtype");
+    let entry = dir.join("main.sga");
+    let src = "read_file(42);";
+    std::fs::write(&entry, src).unwrap();
+    let result = sga::run_source_file(&entry);
+    std::fs::remove_dir_all(&dir).ok();
+    match result {
+        Err(SgaError::Runtime(msg)) => assert!(msg.contains("string"), "получено: {msg}"),
+        other => panic!("ожидалась RuntimeError (не string), получено {:?}", other),
+    }
+}
+
+#[test]
+fn test_read_file_in_subdirectory_within_root_works() {
+    // Поддиректория ВНУТРИ root — не то же самое, что выход за root
+    // ('..') — должна работать нормально.
+    let dir = temp_test_dir("read_subdir");
+    let sub = dir.join("subdir");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join("nested.txt"), "nested content").unwrap();
+    let entry = dir.join("main.sga");
+    let src = format!(
+        "read_file(\"{}\");",
+        std::path::Path::new("subdir")
+            .join("nested.txt")
+            .to_string_lossy()
+    );
+    std::fs::write(&entry, &src).unwrap();
+    let result = sga::run_source_file(&entry);
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(result.unwrap(), Value::Str("nested content".into()));
 }

@@ -25,7 +25,7 @@
 - ✅ 10 примеров (`examples/`), все реально выполняются — включая
   новые `closures.sga`, `ownership.sga`, `modules.sga`+`modules_math.sga`,
   демонстрирующие совместную работу фич, объединённых при слиянии
-- ✅ 144 теста (102 интеграционных + 12 модульных + 26 unit-тестов
+- ✅ 152 теста (110 интеграционных + 12 модульных + 26 unit-тестов
   лексера + 4 unit-теста json, включая регрессионные на
   реально найденные дыры — см. ниже и docs/SECURITY.md, и на конфликт
   грамматики между field-access и `FOR..IN`, найденный при слиянии со
@@ -82,8 +82,20 @@
   `serde_json` стал бы первой внешней зависимостью за всю историю
   проекта. `Struct` сериализуется по реальным полям; JSON-объект при
   парсинге становится `Array` из пар `[ключ, значение]` (у SGA v0.1 нет
-  generic map-типа — честная асимметрия, не баг). `std/io` (следующая
-  задача, T009) остаётся нереализованным.
+  generic map-типа — честная асимметрия, не баг). `std/io` реализован
+  следующим же T009 (см. ниже).
+- ✅ **`std/io`** (roadmap-приоритет 1, T009/M003, 2026-08-16):
+  `read_file(path) -> string` — единственная функция v0.1 (только
+  чтение; запись/удаление осознанно вне scope, см. `docs/ROADMAP.md`,
+  "Не сделано"). Sandboxed: переиспользует ту же confinement-границу и
+  проверку, что `IMPORT` (`module_resolver::is_within_root`/
+  `compute_confinement_root`, обе сделаны `pub` специально для этого —
+  единый источник истины) — абсолютные пути и выход за каталог входного
+  файла программы через `..` отклоняются безусловно. Программы,
+  запущенные через `run_source` (без файлового пути), получают понятную
+  `RuntimeError` при вызове, а не тихо читают cwd процесса. Единственный
+  builtin, реализованный НЕ в `runtime::call_builtin` (перехватывается в
+  `Vm::call()` — нужен доступ к `Vm::sandbox_root`), см. `docs/VM_SPEC.md`.
 - ✅ **Расширенная стандартная библиотека**: `type_of`, `keys`, `range`,
   `sqrt`, `floor`, `ceil`, `abs`, `min`, `max`, `pow`, `str_split`,
   `str_contains`, `str_trim`, `str_starts_with`, `str_ends_with`,
@@ -129,9 +141,10 @@
 `keys`, `range`, `sqrt`, `floor`, `ceil`, `abs`, `min`, `max`, `pow`,
 `str_split`, `str_contains`, `str_trim`, `str_starts_with`,
 `str_ends_with`, `str_replace`, `str_upper`, `str_lower`,
-`json_stringify`, `json_parse` (T008/M003, 2026-08-14 — см. "Сделано в
-v0.1.0" ниже) (`src/runtime/mod.rs`, `src/json.rs`). **Не реализовано**:
-`std/io` (файлы, помимо `print` — T009/M003, следующая задача), `std/fs`,
+`json_stringify`, `json_parse` (T008/M003, 2026-08-14), `read_file`
+(T009/M003, 2026-08-16, sandboxed — см. "Сделано в
+v0.1.0" ниже) (`src/runtime/mod.rs`, `src/json.rs`, `src/vm/mod.rs`).
+**Не реализовано**: запись/удаление файлов, listing каталогов, `std/fs`,
 `std/net`, `std/http`, `std/crypto`, `std/time`, `std/math` (кроме
 встроенных операторов), `std/random`, `std/thread`, `std/async`,
 `std/process`, `std/collections` (кроме базового `array`). Каждый из них
@@ -205,10 +218,10 @@ Rust целиком"): нет lifetimes, нет анализа aliasing двух
 не входившие явно в 10-пунктовый приоритет) — выполнены, см. секции
 выше и `docs/MIGRATION_REPORT.md`. Дальше по тому же приоритету:
 
-1. ~~`std/io` (чтение файлов) + `std/json`~~ — **`std/json` реализован
-   в T008/M003** (2026-08-14, `json_stringify`/`json_parse`, см. "Сделано
-   в v0.1.0"). `std/io` (чтение файлов) остаётся — T009/M003, следующая
-   задача; требует переноса confinement-логики `IMPORT` в рантайм VM.
+1. ~~`std/io` (чтение файлов) + `std/json`~~ — **оба реализованы**:
+   `std/json` в T008/M003 (2026-08-14), `std/io` (`read_file`) в
+   T009/M003 (2026-08-16) — см. "Сделано в v0.1.0" выше. **M003
+   COMPLETED.**
 2. Optimizer (constant folding, DCE) — пункт 4 исходного приоритета.
 3. WASM-бэкенд, затем LLVM-бэкенд (пункт 5 исходного приоритета).
 4. Package Manager — резолвер зависимостей/реестр для `sga.toml`

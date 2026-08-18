@@ -198,7 +198,7 @@ trait (`FsLoader`) — для тестов используется in-memory р
 
 ## Тесты
 
-`tests/integration_test.rs` (102 теста) + `tests/module_resolver_test.rs`
+`tests/integration_test.rs` (110 тестов) + `tests/module_resolver_test.rs`
 (12 тестов) + 26 unit-тестов лексера + 4 unit-теста json (`src/lexer/mod.rs`, `src/json.rs`) — через публичный API `sga::run_source()`/`run_source_file()`,
 проверяющих как успешные программы (арифметика, рекурсия, циклы, массивы,
 типизированный и смешанный typed/untyped код, `MUT`-параметры, замыкания,

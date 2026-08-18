@@ -79,6 +79,24 @@ impl ModuleLoader for FsLoader {
     }
 }
 
+/// Вычисляет confinement-границу ("root") для данного entry-файла — ТУ
+/// ЖЕ границу, что `resolve_imports` использует для `IMPORT` (см.
+/// docs/SECURITY.md, "IMPORT confinement"). Публична отдельно от
+/// `resolve_imports`, чтобы другие подсистемы, которым тоже нужна
+/// файловая песочница (`std/io`/`read_file`, T009/M003), могли
+/// использовать РОВНО ТУ ЖЕ границу без дублирования этой логики —
+/// дублирование security-критичного кода рискует со временем разойтись
+/// и стать источником обхода песочницы. `resolve_imports` ниже сама
+/// вызывает эту функцию — единственный источник истины для обоих
+/// потребителей.
+pub fn compute_confinement_root(entry_path: &Path) -> PathBuf {
+    let entry_dir = entry_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    lexically_normalize(&entry_dir)
+}
+
 /// Резолвит все `IMPORT` в `program`, который был распарсен из файла
 /// `entry_path`. Возвращает плоский `Program` без единого `Stmt::Import`
 /// — готовый к передаче в `semantic::Analyzer::analyze` как обычно.
@@ -108,7 +126,7 @@ pub fn resolve_imports<L: ModuleLoader>(
     // относительных путей. Если бы каждый уровень вычислял свою
     // собственную границу из своего `current_dir`, `..` мог бы "сбежать"
     // выше предыдущей границы на каждом новом уровне импорта.
-    let root = lexically_normalize(&entry_dir);
+    let root = compute_confinement_root(entry_path);
     visited.insert(normalize_key(entry_path));
     in_progress.push(normalize_key(entry_path));
     let resolved = resolve_program(
@@ -182,7 +200,10 @@ fn lexically_normalize(path: &Path) -> PathBuf {
 /// недоступна (путь ещё не существует на диске — в частности, ВСЕГДА
 /// верно для in-memory `ModuleLoader` в тестах), используется
 /// лексический fallback.
-fn is_within_root(candidate: &Path, root: &Path) -> bool {
+/// НЕ приватная: переиспользуется `Vm::call_read_file` (T009, M002/M003
+/// — `read_file`) для той же проверки confinement, без дублирования
+/// логики. См. doc-комментарий выше для полного объяснения семантики.
+pub fn is_within_root(candidate: &Path, root: &Path) -> bool {
     match (
         std::fs::canonicalize(candidate),
         std::fs::canonicalize(root),

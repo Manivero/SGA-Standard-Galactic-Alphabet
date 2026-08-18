@@ -1,0 +1,14 @@
+// std/io: read_file(path) — sandboxed чтение файлов (T009)
+//
+// ВАЖНО: путь всегда относителен каталогу ЭТОГО файла (read_file.sga) и
+// не может выйти за его пределы — ни через абсолютный путь, ни через
+// "..". Рядом лежит data/greeting.txt, специально созданный для этого
+// примера.
+let greeting = read_file("data/greeting.txt");
+print("Прочитано из файла:", greeting);
+
+// read_file можно свободно комбинировать с остальным языком — например,
+// с std/json (T008), чтобы прочитать и распарсить структурированные
+// данные одним выражением.
+let config = json_parse(read_file("data/config.json"));
+print("Распарсенный JSON:", json_stringify(config));
