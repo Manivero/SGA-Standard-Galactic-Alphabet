@@ -4,7 +4,7 @@
 
 ```bash
 cargo build               # компилятор + VM
-cargo test                # 152 теста (110 интеграционных + 12 модульных + 26 unit-тестов лексера + 4 unit-теста json)
+cargo test                # 178 тестов (119 интеграционных + 12 модульных + 26 unit-тестов лексера + 4 unit-теста json + 17 unit-тестов optimizer)
 cargo build --manifest-path tools/translit/Cargo.toml   # инструмент транслитерации
 ```
 

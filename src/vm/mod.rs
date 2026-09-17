@@ -698,7 +698,7 @@ impl Vm {
     }
 }
 
-fn arith(op: &OpCode, a: Value, b: Value) -> RResult<Value> {
+pub(crate) fn arith(op: &OpCode, a: Value, b: Value) -> RResult<Value> {
     use Value::*;
     match (a, b) {
         (Int(x), Int(y)) => Ok(Int(match op {
@@ -750,7 +750,7 @@ fn arith(op: &OpCode, a: Value, b: Value) -> RResult<Value> {
     }
 }
 
-fn compare(op: &OpCode, a: Value, b: Value) -> RResult<Value> {
+pub(crate) fn compare(op: &OpCode, a: Value, b: Value) -> RResult<Value> {
     use Value::*;
     let ordering = match (&a, &b) {
         (Int(x), Int(y)) => x.partial_cmp(y),
@@ -781,7 +781,7 @@ fn compare(op: &OpCode, a: Value, b: Value) -> RResult<Value> {
     }))
 }
 
-fn values_equal(a: &Value, b: &Value) -> bool {
+pub(crate) fn values_equal(a: &Value, b: &Value) -> bool {
     use Value::*;
     match (a, b) {
         (Int(x), Int(y)) => x == y,

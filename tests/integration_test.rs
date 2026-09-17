@@ -1979,3 +1979,153 @@ fn test_read_file_in_subdirectory_within_root_works() {
     std::fs::remove_dir_all(&dir).ok();
     assert_eq!(result.unwrap(), Value::Str("nested content".into()));
 }
+
+// ===== Optimizer: constant folding + DCE (T010, M004) =====
+//
+// Feature Contract — см. PROJECT_STATUS.md. Полное покрытие самого
+// сворачивания/DCE — в src/optimizer.rs (unit-тесты, работают с AST
+// напрямую). Здесь — тесты через ПОЛНЫЙ pipeline (run_source), которые
+// unit-тесты в изоляции принципиально не могут проверить: (а) что
+// оптимизатор реально подключён и не ломает работающие программы, (б)
+// САМОЕ ВАЖНОЕ — что семантические ошибки в НЕДОСТИЖИМОМ (после DCE)
+// коде по-прежнему ловятся КОМПИЛЯЦИЕЙ, а не тихо исчезают вместе с
+// удаляемым кодом (AC-11) — это проверяет ПОРЯДОК прохода в pipeline
+// (semantic/typechecker ДО optimizer), а не сам optimizer.rs в изоляции.
+
+#[test]
+fn test_optimizer_folds_arithmetic_through_full_pipeline() {
+    let src = format!("{let_} x = 2 * (3 + 4); x;", let_ = kw("LET"));
+    assert_eq!(run(&src).unwrap(), Value::Int(14));
+}
+
+#[test]
+fn test_optimizer_overflow_still_errors_identically_through_full_pipeline() {
+    let src_overflow = format!("{let_} x = 9223372036854775807 + 1; x;", let_ = kw("LET"));
+    let src_non_const = format!(
+        "{let_} a = 9223372036854775807; {let_} x = a + 1; x;",
+        let_ = kw("LET")
+    );
+    let r1 = run(&src_overflow);
+    let r2 = run(&src_non_const);
+    assert!(
+        matches!(r1, Err(SgaError::Runtime(_))),
+        "получено: {:?}",
+        r1
+    );
+    assert!(
+        matches!(r2, Err(SgaError::Runtime(_))),
+        "получено: {:?}",
+        r2
+    );
+}
+
+#[test]
+fn test_optimizer_division_by_zero_still_errors_through_full_pipeline() {
+    let src = format!("{let_} x = 1 / 0; x;", let_ = kw("LET"));
+    match run(&src) {
+        Err(SgaError::Runtime(_)) => {}
+        other => panic!(
+            "ожидалась RuntimeError (деление на ноль), получено {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn test_optimizer_dce_does_not_hide_semantic_error_in_dead_if_branch() {
+    let src = format!(
+        "{if_} {false_} {{ undefined_variable_xyz; }}",
+        if_ = kw("IF"),
+        false_ = kw("FALSE")
+    );
+    match run(&src) {
+        Err(SgaError::Semantic(_)) => {}
+        other => panic!(
+            "ожидалась SemError даже в недостижимой ветке (DCE не должен прятать ошибки), получено {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn test_optimizer_dce_does_not_hide_semantic_error_in_while_false_body() {
+    let src = format!(
+        "{while_} {false_} {{ undefined_variable_xyz; }}",
+        while_ = kw("WHILE"),
+        false_ = kw("FALSE")
+    );
+    match run(&src) {
+        Err(SgaError::Semantic(_)) => {}
+        other => panic!(
+            "ожидалась SemError даже в WHILE FALSE (DCE не должен прятать ошибки), получено {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn test_optimizer_unreachable_code_after_return_does_not_hide_semantic_error() {
+    let src = format!(
+        "{fn_} f() {{ {return_} 1; undefined_variable_xyz; }} f();",
+        fn_ = kw("FN"),
+        return_ = kw("RETURN")
+    );
+    match run(&src) {
+        Err(SgaError::Semantic(_)) => {}
+        other => panic!(
+            "ожидалась SemError для кода после RETURN (DCE не должен прятать ошибки), получено {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn test_optimizer_if_true_dce_preserves_scoping() {
+    let src = format!(
+        "{if_} {true_} {{ {let_} y = 5; }} y;",
+        if_ = kw("IF"),
+        true_ = kw("TRUE"),
+        let_ = kw("LET")
+    );
+    match run(&src) {
+        Err(SgaError::Semantic(_)) => {}
+        other => panic!(
+            "ожидалась SemError: 'y' не должно быть видно снаружи свёрнутого IF, получено {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn test_optimizer_while_false_removed_body_never_executes() {
+    let src = format!(
+        "{var_} counter = 0; \
+         {while_} {false_} {{ counter = counter + 1; }} \
+         counter;",
+        var_ = kw("VAR"),
+        while_ = kw("WHILE"),
+        false_ = kw("FALSE")
+    );
+    assert_eq!(run(&src).unwrap(), Value::Int(0));
+}
+
+#[test]
+fn test_optimizer_string_and_logical_folding_through_full_pipeline() {
+    let src = format!(
+        "{let_} s = \"foo\" + \"bar\"; {let_} b = {true_} {and_} {false_}; [s, b];",
+        let_ = kw("LET"),
+        true_ = kw("TRUE"),
+        and_ = kw("AND"),
+        false_ = kw("FALSE")
+    );
+    match run(&src) {
+        Ok(Value::Array(items)) => {
+            let items = items.borrow();
+            assert_eq!(
+                *items,
+                vec![Value::Str("foobar".into()), Value::Bool(false)]
+            );
+        }
+        other => panic!("ожидался Array, получено {:?}", other),
+    }
+}

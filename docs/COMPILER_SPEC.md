@@ -24,6 +24,11 @@ AST без IMPORT        — top-level statement'ы импортированны
    ▼  src/typechecker/mod.rs
 проверенный AST       — градуальная статическая типизация (только там,
    │                     где есть явная аннотация `: тип`)
+   ▼  src/optimizer.rs           (T010, M004)
+оптимизированный AST  — constant folding + dead code elimination;
+   │                     семантически прозрачен (работает НАД уже
+   │                     проверенным AST — недостижимый код по-прежнему
+   │                     был проверен строкой выше, до своего удаления)
    ▼  src/codegen/mod.rs
 CompiledProgram        — { main: Chunk, functions: HashMap<String, FunctionDef> }
    │                     каждая функция/замыкание — отдельный Chunk с
@@ -176,13 +181,26 @@ defense-in-depth для случая, когда `Chunk`/`CompiledProgram`
 публичны) — без верификации некорректные индексы давали бы Rust panic
 вместо управляемой `RuntimeError`.
 
-## Optimizer
+## Optimizer (`src/optimizer.rs`, T010/M004, 2026-08-18)
 
-В v0.1 **отсутствует** — байткод выполняется как сгенерирован, без
-constant folding / dead code elimination / inlining. Архитектурно для
-него зарезервирован шаг между `codegen` и `vm` (модуль `src/optimizer/`
-появится при реализации — см. ROADMAP, не создаём пустую заглушку, чтобы
-не выдавать несуществующий код за существующий).
+AST -> AST проход, между `typechecker` и `codegen` (НЕ между `codegen` и
+`vm`, как предполагалось раньше в этом документе, — осознанный выбор:
+оптимизация на уровне AST, а не байткода, проще рассуждать о корректности
+и позволяет напрямую переиспользовать типы `ast::Expr`/`ast::Stmt`).
+Constant folding (арифметика/сравнения/`AND`/`OR`/унарные `-`/`NOT` на
+литералах — рекурсивно, снизу вверх) + dead code elimination (код после
+`RETURN`/`BREAK`/`CONTINUE`; `IF`/`WHILE` со свёрнутым в константу
+условием). Семантически прозрачен: место в пайплайне — ПОСЛЕ
+`typechecker`, поэтому недостижимый код по-прежнему проверяется на
+ошибки ДО своего удаления. Арифметика НЕ дублируется заново —
+переиспользует `vm::arith`/`vm::compare`/`vm::values_equal` (сделаны
+`pub(crate)` специально для этого): если операция дала бы ошибку во
+время выполнения (переполнение `Int`, деление на ноль), выражение НЕ
+сворачивается — рантайм выдаёт ТУ ЖЕ ошибку, что и без оптимизатора.
+`AND`/`OR` в SGA не имеют short-circuit семантики (оба операнда всегда
+компилируются и вычисляются в runtime) — это упрощает их сворачивание.
+Инлайнинг функций — явно ВНЕ scope T010, отдельная возможная будущая
+задача.
 
 ## Module Resolver (`src/module_resolver.rs`)
 
@@ -198,8 +216,8 @@ trait (`FsLoader`) — для тестов используется in-memory р
 
 ## Тесты
 
-`tests/integration_test.rs` (110 тестов) + `tests/module_resolver_test.rs`
-(12 тестов) + 26 unit-тестов лексера + 4 unit-теста json (`src/lexer/mod.rs`, `src/json.rs`) — через публичный API `sga::run_source()`/`run_source_file()`,
+`tests/integration_test.rs` (119 тестов) + `tests/module_resolver_test.rs`
+(12 тестов) + 26 unit-тестов лексера + 4 unit-теста json + 17 unit-тестов optimizer (`src/lexer/mod.rs`, `src/json.rs`, `src/optimizer.rs`) — через публичный API `sga::run_source()`/`run_source_file()`,
 проверяющих как успешные программы (арифметика, рекурсия, циклы, массивы,
 типизированный и смешанный typed/untyped код, `MUT`-параметры, замыкания,
 IIFE, цепочки вызовов, импорты, диамант-импорты), так и обязательные

@@ -13,6 +13,7 @@ pub mod codegen;
 pub mod json;
 pub mod lexer;
 pub mod module_resolver;
+pub mod optimizer;
 pub mod parser;
 pub mod runtime;
 pub mod semantic;
@@ -166,6 +167,11 @@ fn run_resolved_program(
     typechecker::Typechecker::new()
         .analyze(&program)
         .map_err(|e| SgaError::Type(e.to_string()))?;
+    // T010 (M004): AST->AST проход между typechecker и codegen —
+    // семантически прозрачен (см. src/optimizer.rs), работает только
+    // над уже ВАЛИДИРОВАННЫМ AST (недостижимый код по-прежнему был
+    // проверен типами/семантикой ДО этой строки, до своего удаления).
+    let program = optimizer::optimize(program);
     let compiled = codegen::compile(&program);
     let (mut machine, main_chunk) =
         vm::Vm::new(compiled, sandbox_root).map_err(|e| SgaError::Runtime(e.to_string()))?;
