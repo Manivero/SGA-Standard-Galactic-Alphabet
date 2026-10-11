@@ -125,7 +125,7 @@ fn cmd_init(dir: &str) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let toml_path = format!("{}/sga.toml", dir);
-    let toml = "[package]\nname = \"my-sga-app\"\nversion = \"0.1.0\"\n\n[dependencies]\n\n[targets]\nplatforms = [\"windows\", \"linux\", \"macos\"]\narch = [\"x86_64\", \"arm64\"]\n\n[compiler]\nbackend = \"vm\"\n";
+    let toml = "[package]\nname = \"my-sga-app\"\nversion = \"0.1.0\"\n\n[dependencies]\n# Path-зависимости: путь считается от каталога ЭТОГО sga.toml.\n# В коде: IMPORT \"pkg:mylib/файл.sga\"; (файл ищется внутри каталога пакета)\n# mylib = { path = \"../mylib\" }\n\n[targets]\nplatforms = [\"windows\", \"linux\", \"macos\"]\narch = [\"x86_64\", \"arm64\"]\n\n[compiler]\nbackend = \"vm\"\n";
     if let Err(e) = fs::write(&toml_path, toml) {
         eprintln!("ошибка записи '{}': {}", toml_path, e);
         return ExitCode::FAILURE;

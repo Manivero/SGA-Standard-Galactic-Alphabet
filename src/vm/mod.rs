@@ -440,7 +440,7 @@ impl Vm {
                         );
                     }
                     values.reverse();
-                    for (name, value) in fields.iter().zip(values.into_iter()) {
+                    for (name, value) in fields.iter().zip(values) {
                         field_map.insert(name.clone(), value);
                     }
                     stack.push(Value::Struct {
@@ -570,12 +570,7 @@ impl Vm {
             )));
         }
         let mut base = HashMap::new();
-        for ((p, a), m) in def
-            .params
-            .iter()
-            .zip(args.into_iter())
-            .zip(def.param_mut.iter())
-        {
+        for ((p, a), m) in def.params.iter().zip(args).zip(def.param_mut.iter()) {
             base.insert(p.clone(), (a, *m));
         }
         let mut frame_scopes = vec![Scope { vars: base }];
@@ -688,7 +683,7 @@ impl Vm {
                 .collect(),
         };
         let mut param_vars = HashMap::new();
-        for (p, a) in closure.params.iter().zip(args.into_iter()) {
+        for (p, a) in closure.params.iter().zip(args) {
             param_vars.insert(p.clone(), (a, true));
         }
         let mut frame_scopes = vec![captured_scope, Scope { vars: param_vars }];

@@ -2129,3 +2129,500 @@ fn test_optimizer_string_and_logical_folding_through_full_pipeline() {
         other => panic!("ожидался Array, получено {:?}", other),
     }
 }
+
+// ===== Package Manager: path-зависимости (T011, M005) =====
+//
+// Feature Contract — см. PROJECT_STATUS.md. Только path-зависимости
+// (`name = { path = "..." }` в sga.toml), `IMPORT "pkg:имя/файл.sga";`.
+// Реальные временные директории на диске — как и для read_file (T009).
+
+fn write_test_file(path: &std::path::Path, content: &str) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(path, content).unwrap();
+}
+
+fn double_fn_src() -> String {
+    format!(
+        "{fn_} double(x) {{ {return_} x * 2; }}",
+        fn_ = kw("FN"),
+        return_ = kw("RETURN")
+    )
+}
+
+#[test]
+fn test_pkg_import_resolves_file_from_declared_path_dependency() {
+    // AC-02
+    let root = temp_test_dir("pkg_ok");
+    let project = root.join("project");
+    write_test_file(
+        &project.join("sga.toml"),
+        "[dependencies]\nmylib = { path = \"../mylib\" }\n",
+    );
+    write_test_file(&root.join("mylib").join("utils.sga"), &double_fn_src());
+    let entry = project.join("main.sga");
+    write_test_file(
+        &entry,
+        &format!(
+            "{import_} \"pkg:mylib/utils.sga\"; double(21);",
+            import_ = kw("IMPORT")
+        ),
+    );
+    let result = sga::run_source_file(&entry);
+    std::fs::remove_dir_all(&root).ok();
+    assert_eq!(result.unwrap(), Value::Int(42));
+}
+
+#[test]
+fn test_pkg_import_resolves_nested_subdirectory_inside_package() {
+    let root = temp_test_dir("pkg_nested");
+    let project = root.join("project");
+    write_test_file(
+        &project.join("sga.toml"),
+        "[dependencies]\nmylib = { path = \"../mylib\" }\n",
+    );
+    write_test_file(
+        &root.join("mylib").join("sub").join("deep.sga"),
+        &double_fn_src(),
+    );
+    let entry = project.join("main.sga");
+    write_test_file(
+        &entry,
+        &format!(
+            "{import_} \"pkg:mylib/sub/deep.sga\"; double(5);",
+            import_ = kw("IMPORT")
+        ),
+    );
+    let result = sga::run_source_file(&entry);
+    std::fs::remove_dir_all(&root).ok();
+    assert_eq!(result.unwrap(), Value::Int(10));
+}
+
+#[test]
+fn test_pkg_import_same_file_twice_is_deduplicated() {
+    // Повторный IMPORT того же pkg-файла не должен дублировать
+    // определения (иначе "функция уже объявлена" — тот же механизм
+    // visited, что и для обычных импортов).
+    let root = temp_test_dir("pkg_dedup");
+    let project = root.join("project");
+    write_test_file(
+        &project.join("sga.toml"),
+        "[dependencies]\nmylib = { path = \"../mylib\" }\n",
+    );
+    write_test_file(&root.join("mylib").join("utils.sga"), &double_fn_src());
+    let entry = project.join("main.sga");
+    write_test_file(
+        &entry,
+        &format!(
+            "{import_} \"pkg:mylib/utils.sga\"; {import_} \"pkg:mylib/utils.sga\"; double(4);",
+            import_ = kw("IMPORT")
+        ),
+    );
+    let result = sga::run_source_file(&entry);
+    std::fs::remove_dir_all(&root).ok();
+    assert_eq!(result.unwrap(), Value::Int(8));
+}
+
+#[test]
+fn test_pkg_import_undeclared_package_is_clear_import_error() {
+    // AC-03
+    let root = temp_test_dir("pkg_undeclared");
+    write_test_file(&root.join("sga.toml"), "[dependencies]\n");
+    let entry = root.join("main.sga");
+    write_test_file(
+        &entry,
+        &format!("{import_} \"pkg:nope/x.sga\";", import_ = kw("IMPORT")),
+    );
+    let result = sga::run_source_file(&entry);
+    std::fs::remove_dir_all(&root).ok();
+    match result {
+        Err(SgaError::Import(msg)) => {
+            assert!(msg.contains("не объявлен"), "получено: {msg}");
+            assert!(msg.contains("nope"), "получено: {msg}");
+        }
+        other => panic!("ожидалась ImportError, получено {:?}", other),
+    }
+}
+
+#[test]
+fn test_pkg_bare_version_dependency_is_clear_import_error() {
+    // AC-04: name = "1.0.0" без path — явная ошибка, не паника. Ошибка
+    // манифеста всплывает на pkg:-импорте (ленивая валидация — см. тест
+    // `test_malformed_manifest_does_not_affect_programs_without_pkg_imports`),
+    // поэтому программа обязана содержать pkg:-импорт.
+    let root = temp_test_dir("pkg_bare_version");
+    write_test_file(
+        &root.join("sga.toml"),
+        "[dependencies]\nmylib = \"1.0.0\"\n",
+    );
+    let entry = root.join("main.sga");
+    write_test_file(
+        &entry,
+        &format!("{import_} \"pkg:mylib/x.sga\";", import_ = kw("IMPORT")),
+    );
+    let result = sga::run_source_file(&entry);
+    std::fs::remove_dir_all(&root).ok();
+    match result {
+        Err(SgaError::Import(msg)) => {
+            assert!(msg.contains("path-зависимости"), "получено: {msg}");
+        }
+        other => panic!("ожидалась ImportError, получено {:?}", other),
+    }
+}
+
+#[test]
+fn test_pkg_import_dotdot_escaping_package_root_is_rejected() {
+    // AC-05 (форма 1): sub_path в самой pkg:-строке выходит за корень пакета.
+    let root = temp_test_dir("pkg_escape1");
+    let project = root.join("project");
+    write_test_file(
+        &project.join("sga.toml"),
+        "[dependencies]\nmylib = { path = \"../mylib\" }\n",
+    );
+    write_test_file(&root.join("mylib").join("ok.sga"), "1;");
+    write_test_file(&root.join("secret.sga"), "2;");
+    let entry = project.join("main.sga");
+    write_test_file(
+        &entry,
+        &format!(
+            "{import_} \"pkg:mylib/../secret.sga\";",
+            import_ = kw("IMPORT")
+        ),
+    );
+    let result = sga::run_source_file(&entry);
+    std::fs::remove_dir_all(&root).ok();
+    match result {
+        Err(SgaError::Import(msg)) => {
+            assert!(msg.contains("выходит за пределы"), "получено: {msg}");
+        }
+        other => panic!("ожидалась ImportError, получено {:?}", other),
+    }
+}
+
+#[test]
+fn test_pkg_internal_import_confined_to_package_root_not_main_project_root() {
+    // AC-05 (форма 2 — ключевая): пакет лежит ВНУТРИ каталога основного
+    // проекта (vendor/mylib), и его файл пытается импортировать
+    // ../../main_helper.sga — файл, лежащий внутри корня ОСНОВНОГО
+    // проекта, но ВНЕ корня пакета. Если бы confinement внутри пакета
+    // использовал корень основного проекта, это было бы разрешено —
+    // отказ доказывает, что у пакета СВОЙ собственный root.
+    let project = temp_test_dir("pkg_own_root");
+    write_test_file(
+        &project.join("sga.toml"),
+        "[dependencies]\nmylib = { path = \"vendor/mylib\" }\n",
+    );
+    write_test_file(&project.join("main_helper.sga"), "1;");
+    write_test_file(
+        &project.join("vendor").join("mylib").join("utils.sga"),
+        &format!(
+            "{import_} \"../../main_helper.sga\";",
+            import_ = kw("IMPORT")
+        ),
+    );
+    let entry = project.join("main.sga");
+    write_test_file(
+        &entry,
+        &format!("{import_} \"pkg:mylib/utils.sga\";", import_ = kw("IMPORT")),
+    );
+    let result = sga::run_source_file(&entry);
+    std::fs::remove_dir_all(&project).ok();
+    match result {
+        Err(SgaError::Import(msg)) => {
+            assert!(msg.contains("выходит за пределы"), "получено: {msg}");
+        }
+        other => panic!("ожидалась ImportError, получено {:?}", other),
+    }
+}
+
+#[test]
+fn test_pkg_transitive_pkg_import_inside_package_is_rejected() {
+    // AC-06
+    let root = temp_test_dir("pkg_transitive");
+    let project = root.join("project");
+    write_test_file(
+        &project.join("sga.toml"),
+        "[dependencies]\nmylib = { path = \"../mylib\" }\nother = { path = \"../other\" }\n",
+    );
+    write_test_file(&root.join("other").join("x.sga"), "1;");
+    write_test_file(
+        &root.join("mylib").join("utils.sga"),
+        &format!("{import_} \"pkg:other/x.sga\";", import_ = kw("IMPORT")),
+    );
+    let entry = project.join("main.sga");
+    write_test_file(
+        &entry,
+        &format!("{import_} \"pkg:mylib/utils.sga\";", import_ = kw("IMPORT")),
+    );
+    let result = sga::run_source_file(&entry);
+    std::fs::remove_dir_all(&root).ok();
+    match result {
+        Err(SgaError::Import(msg)) => {
+            assert!(msg.contains("транзитивные"), "получено: {msg}");
+        }
+        other => panic!("ожидалась ImportError, получено {:?}", other),
+    }
+}
+
+#[test]
+fn test_pkg_import_without_manifest_says_not_declared_not_manifest_missing() {
+    // AC-07: нет sga.toml вообще — pkg:-импорт даёт "не объявлен", а не
+    // "manifest не найден" (обратная совместимость: программы без
+    // зависимостей не обязаны иметь sga.toml).
+    // Примечание: поиск манифеста идёт ВВЕРХ по дереву, поэтому тест
+    // предполагает, что в окружении нет посторонних /tmp/sga.toml и
+    // /sga.toml (случайный чужой манифест выше изменил бы результат).
+    let root = temp_test_dir("pkg_no_manifest");
+    let entry = root.join("main.sga");
+    write_test_file(
+        &entry,
+        &format!("{import_} \"pkg:mylib/x.sga\";", import_ = kw("IMPORT")),
+    );
+    let result = sga::run_source_file(&entry);
+    std::fs::remove_dir_all(&root).ok();
+    match result {
+        Err(SgaError::Import(msg)) => {
+            assert!(msg.contains("не объявлен"), "получено: {msg}");
+            assert!(!msg.to_lowercase().contains("manifest"), "получено: {msg}");
+        }
+        other => panic!("ожидалась ImportError, получено {:?}", other),
+    }
+}
+
+#[test]
+fn test_regular_relative_import_still_works_without_any_manifest() {
+    // AC-07 (вторая половина): обычные (не pkg:) импорты не затронуты —
+    // обратная совместимость.
+    let root = temp_test_dir("pkg_regular_still_works");
+    write_test_file(&root.join("helper.sga"), &double_fn_src());
+    let entry = root.join("main.sga");
+    write_test_file(
+        &entry,
+        &format!(
+            "{import_} \"helper.sga\"; double(7);",
+            import_ = kw("IMPORT")
+        ),
+    );
+    let result = sga::run_source_file(&entry);
+    std::fs::remove_dir_all(&root).ok();
+    assert_eq!(result.unwrap(), Value::Int(14));
+}
+
+#[test]
+fn test_sga_init_generates_commented_path_dependency_example() {
+    // AC-08: `sga init` генерирует sga.toml с закомментированным примером
+    // path-зависимости (и этот пример НЕ ломает разбор манифеста —
+    // строки на '#' игнорируются парсером).
+    let dir = temp_test_dir("pkg_init");
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_sga"))
+        .arg("init")
+        .arg(&dir)
+        .output()
+        .expect("не удалось запустить sga init");
+    assert!(
+        status.status.success(),
+        "sga init завершился ошибкой: {:?}",
+        status
+    );
+    let toml = std::fs::read_to_string(dir.join("sga.toml")).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        toml.contains("# mylib = { path = \"../mylib\" }"),
+        "ожидался закомментированный пример, получено:\n{toml}"
+    );
+    // и сгенерированный манифест парсится без ошибок (пустая карта)
+    assert!(sga::manifest::load_dependencies(&dir).unwrap().is_empty());
+}
+
+#[test]
+fn test_malformed_manifest_does_not_affect_programs_without_pkg_imports() {
+    // Обратная совместимость (шире AC-07): sga.toml читается ЛИШЬ ради
+    // pkg:-импортов. Поиск идёт вверх по дереву, "ближайший" манифест
+    // может быть посторонним, — программа без pkg:-импортов обязана вести
+    // себя ровно как до T011, что бы в нём ни лежало.
+    let root = temp_test_dir("pkg_bad_manifest_unused");
+    write_test_file(
+        &root.join("sga.toml"),
+        "[dependencies]\nmylib = \"1.0.0\"\nnot even toml\n",
+    );
+    write_test_file(&root.join("helper.sga"), &double_fn_src());
+    let entry = root.join("main.sga");
+    write_test_file(
+        &entry,
+        &format!(
+            "{import_} \"helper.sga\"; double(8);",
+            import_ = kw("IMPORT")
+        ),
+    );
+    let result = sga::run_source_file(&entry);
+    std::fs::remove_dir_all(&root).ok();
+    assert_eq!(result.unwrap(), Value::Int(16));
+}
+
+#[test]
+fn test_pkg_manifest_in_parent_of_entry_dir_is_found_and_paths_are_relative_to_manifest() {
+    // AC-10: раскладка, которую создаёт `sga init` — sga.toml в корне
+    // проекта, запускаемый файл в src/. Путь "../mylib" считается от
+    // каталога МАНИФЕСТА (project/), а не от каталога входного файла
+    // (project/src/): от project/src он указывал бы на project/mylib,
+    // которого нет, — тест упал бы, если бы путь считался от входного файла.
+    let root = temp_test_dir("pkg_parent_manifest");
+    let project = root.join("project");
+    write_test_file(
+        &project.join("sga.toml"),
+        "[dependencies]\nmylib = { path = \"../mylib\" }\n",
+    );
+    write_test_file(&root.join("mylib").join("utils.sga"), &double_fn_src());
+    let entry = project.join("src").join("main.sga");
+    write_test_file(
+        &entry,
+        &format!(
+            "{import_} \"pkg:mylib/utils.sga\"; double(21);",
+            import_ = kw("IMPORT")
+        ),
+    );
+    let result = sga::run_source_file(&entry);
+    std::fs::remove_dir_all(&root).ok();
+    assert_eq!(result.unwrap(), Value::Int(42));
+}
+
+#[test]
+fn test_pkg_nearest_manifest_wins_over_ancestor_manifest() {
+    // AC-10: два манифеста по пути вверх — побеждает ближайший. Внешний
+    // даёт double = x*2, внутренний (ближайший) — double = x*3.
+    let root = temp_test_dir("pkg_nearest");
+    write_test_file(
+        &root.join("sga.toml"),
+        "[dependencies]\nmylib = { path = \"outer_lib\" }\n",
+    );
+    write_test_file(&root.join("outer_lib").join("utils.sga"), &double_fn_src());
+    let project = root.join("project");
+    write_test_file(
+        &project.join("sga.toml"),
+        "[dependencies]\nmylib = { path = \"../inner_lib\" }\n",
+    );
+    write_test_file(
+        &root.join("inner_lib").join("utils.sga"),
+        &format!(
+            "{fn_} double(x) {{ {return_} x * 3; }}",
+            fn_ = kw("FN"),
+            return_ = kw("RETURN")
+        ),
+    );
+    let entry = project.join("src").join("main.sga");
+    write_test_file(
+        &entry,
+        &format!(
+            "{import_} \"pkg:mylib/utils.sga\"; double(10);",
+            import_ = kw("IMPORT")
+        ),
+    );
+    let result = sga::run_source_file(&entry);
+    std::fs::remove_dir_all(&root).ok();
+    assert_eq!(result.unwrap(), Value::Int(30));
+}
+
+#[test]
+fn test_pkg_nearest_manifest_is_not_merged_with_ancestor_manifest() {
+    // AC-10: ближайший манифест побеждает ЦЕЛИКОМ, без слияния с внешним:
+    // зависимость, объявленная только во внешнем sga.toml, из вложенного
+    // проекта недоступна.
+    let root = temp_test_dir("pkg_no_merge");
+    write_test_file(
+        &root.join("sga.toml"),
+        "[dependencies]\nmylib = { path = \"mylib\" }\n",
+    );
+    write_test_file(&root.join("mylib").join("utils.sga"), &double_fn_src());
+    let project = root.join("project");
+    write_test_file(&project.join("sga.toml"), "[dependencies]\n");
+    let entry = project.join("main.sga");
+    write_test_file(
+        &entry,
+        &format!("{import_} \"pkg:mylib/utils.sga\";", import_ = kw("IMPORT")),
+    );
+    let result = sga::run_source_file(&entry);
+    std::fs::remove_dir_all(&root).ok();
+    match result {
+        Err(SgaError::Import(msg)) => {
+            assert!(msg.contains("не объявлен"), "получено: {msg}");
+        }
+        other => panic!("ожидалась ImportError, получено {:?}", other),
+    }
+}
+
+#[test]
+fn test_sga_init_scaffold_runs_with_path_dependency_end_to_end_via_cli() {
+    // AC-11: сквозной CLI-сценарий на раскладке, которую создаёт сам
+    // `sga init`: init -> раскомментировать пример зависимости ->
+    // `sga run <проект>/src/main.sga`. Три формы пути запускаемого файла:
+    // абсолютный; относительный из каталога проекта (`src/main.sga`);
+    // голое имя файла из каталога src/ (`main.sga` — родитель
+    // относительного пути пуст). До исправления дефекта (манифест
+    // искался только рядом с запускаемым файлом) все три давали "пакет
+    // 'mylib' не объявлен в [dependencies] sga.toml".
+    let root = temp_test_dir("pkg_cli_e2e");
+    let project = root.join("proj");
+    let bin = env!("CARGO_BIN_EXE_sga");
+    let init = std::process::Command::new(bin)
+        .arg("init")
+        .arg(&project)
+        .output()
+        .expect("не удалось запустить sga init");
+    assert!(init.status.success(), "sga init: {:?}", init);
+
+    let toml_path = project.join("sga.toml");
+    let toml = std::fs::read_to_string(&toml_path).unwrap();
+    let enabled = toml.replace(
+        "# mylib = { path = \"../mylib\" }",
+        "mylib = { path = \"../mylib\" }",
+    );
+    assert_ne!(
+        enabled, toml,
+        "в sga.toml не найден закомментированный пример"
+    );
+    std::fs::write(&toml_path, enabled).unwrap();
+    write_test_file(&root.join("mylib").join("utils.sga"), &double_fn_src());
+    let main_sga = project.join("src").join("main.sga");
+    std::fs::write(
+        &main_sga,
+        format!(
+            "{import_} \"pkg:mylib/utils.sga\"; {print_}(double(21));",
+            import_ = kw("IMPORT"),
+            print_ = kw("PRINT")
+        ),
+    )
+    .unwrap();
+
+    let absolute = std::process::Command::new(bin)
+        .arg("run")
+        .arg(&main_sga)
+        .output()
+        .unwrap();
+    let relative = std::process::Command::new(bin)
+        .current_dir(&project)
+        .arg("run")
+        .arg("src/main.sga")
+        .output()
+        .unwrap();
+    let bare_name = std::process::Command::new(bin)
+        .current_dir(project.join("src"))
+        .arg("run")
+        .arg("main.sga")
+        .output()
+        .unwrap();
+    std::fs::remove_dir_all(&root).ok();
+
+    for (label, out) in [
+        ("абсолютный путь", absolute),
+        ("относительный путь из каталога проекта", relative),
+        ("голое имя файла из src/", bare_name),
+    ] {
+        assert!(
+            out.status.success(),
+            "{label}: stderr = {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "42", "{label}");
+    }
+}

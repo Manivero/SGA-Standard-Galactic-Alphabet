@@ -35,9 +35,12 @@
 //!   - именованные модули/`USE module::item` синтаксис;
 //!   - приватность (`pub`/неэкспортируемые элементы);
 //!   - переименование при импорте (`IMPORT "x.sga" AS y`);
-//!   - разрешение пакетов по имени через package manager (которого нет).
+//!   - реестр пакетов / версии / транзитивные pkg:-зависимости (T011/M005
+//!     добавил ТОЛЬКО path-зависимости: `IMPORT "pkg:имя/файл.sga"`,
+//!     см. `crate::manifest` и docs/LANGUAGE_SPEC.md, §8.1).
 
 use crate::ast::{Program, Stmt};
+use crate::manifest::Manifest;
 use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -127,14 +130,36 @@ pub fn resolve_imports<L: ModuleLoader>(
     // собственную границу из своего `current_dir`, `..` мог бы "сбежать"
     // выше предыдущей границы на каждом новом уровне импорта.
     let root = compute_confinement_root(entry_path);
+    // T011 (M005): ближайший sga.toml ищется от каталога входного файла
+    // ВВЕРХ по дереву (как Cargo ищет Cargo.toml) и загружается ОДИН раз —
+    // единый источник для ВСЕХ pkg:-импортов во всём графе резолвинга,
+    // не перезагружается на каждом уровне рекурсии. Подъём вверх нужен,
+    // потому что `sga init` кладёт sga.toml в КОРЕНЬ проекта, а
+    // запускаемый файл — в `src/` (манифест лежит не рядом с ним). Нет
+    // манифеста нигде — не ошибка (`None`), см. manifest::load_nearest.
+    // Это НЕ меняет confinement-границу `root` (она по-прежнему каталог
+    // входного файла): манифест влияет только на разрешение pkg:-имён.
+    //
+    // Ошибка чтения/разбора манифеста здесь НЕ возвращается, а хранится в
+    // `manifest` и всплывает только в ветке pkg:-импорта (ленивая
+    // валидация). Причина: поиск идёт вверх по дереву, и "ближайший"
+    // sga.toml может оказаться посторонним (например, в домашнем
+    // каталоге) — программы без pkg:-импортов обязаны вести себя ровно
+    // как до T011, что бы ни лежало в таких файлах.
+    let manifest = crate::manifest::load_nearest(&entry_dir);
     visited.insert(normalize_key(entry_path));
     in_progress.push(normalize_key(entry_path));
+    let ctx = ResolveCtx {
+        root: &root,
+        manifest: &manifest,
+        loader,
+        parse_fn,
+    };
     let resolved = resolve_program(
         program,
         &entry_dir,
-        &root,
-        loader,
-        parse_fn,
+        false,
+        &ctx,
         &mut visited,
         &mut in_progress,
     )?;
@@ -213,19 +238,142 @@ pub fn is_within_root(candidate: &Path, root: &Path) -> bool {
     }
 }
 
+/// Неизменяемый контекст резолвинга — группирует параметры, которые
+/// остаются теми же на протяжении всей рекурсии `resolve_program` (за
+/// единственным исключением: при заходе в pkg:-пакет `root` заменяется
+/// на корень ЭТОГО пакета, остальные поля — те же). Введён в T011
+/// (M005) чтобы не раздувать сигнатуру `resolve_program` (clippy::
+/// too_many_arguments) по мере добавления параметров.
+struct ResolveCtx<'a, L: ModuleLoader> {
+    root: &'a Path,
+    /// Результат поиска ближайшего `sga.toml`: `Ok(Some(..))` — найден
+    /// (с каталогом, от которого считаются пути зависимостей), `Ok(None)` —
+    /// манифеста нет, `Err(..)` — манифест есть, но не читается/некорректен
+    /// (ошибка возвращается лишь при попытке `pkg:`-импорта).
+    manifest: &'a Result<Option<Manifest>, String>,
+    loader: &'a L,
+    parse_fn: &'a dyn Fn(&str) -> Result<Program, String>,
+}
+
 fn resolve_program<L: ModuleLoader>(
     program: Program,
     current_dir: &Path,
-    root: &Path,
-    loader: &L,
-    parse_fn: &dyn Fn(&str) -> Result<Program, String>,
+    in_package: bool,
+    ctx: &ResolveCtx<'_, L>,
     visited: &mut HashSet<String>,
     in_progress: &mut Vec<String>,
 ) -> IResult<Program> {
+    // Все поля — ссылки (Copy), поэтому деструктуризация через `*ctx`
+    // допустима, и остальное тело функции остаётся без изменений.
+    let ResolveCtx {
+        root,
+        manifest,
+        loader,
+        parse_fn,
+    } = *ctx;
     let mut out = Vec::new();
     for stmt in program {
         match stmt {
             Stmt::Import(rel_path) => {
+                // T011 (M005): "pkg:имя/путь" — явный префикс, отличает
+                // package-импорт от обычного файлового IMPORT. Проверяется
+                // ПЕРВЫМ, до проверки абсолютного пути ниже (у pkg:-строк
+                // своя, отдельная логика резолвинга).
+                if let Some(pkg_import) = rel_path.strip_prefix("pkg:") {
+                    if in_package {
+                        return Err(ImportError(format!(
+                            "IMPORT \"pkg:{}\": транзитивные pkg:-зависимости (пакет, импортирующий другой пакет) не поддерживаются в v0.1",
+                            pkg_import
+                        )));
+                    }
+                    let (pkg_name, sub_path) = pkg_import.split_once('/').ok_or_else(|| {
+                        ImportError(format!(
+                            "IMPORT \"pkg:{}\": ожидался формат \"pkg:имя/путь/к/файлу.sga\"",
+                            pkg_import
+                        ))
+                    })?;
+                    // Нерабочий манифест (ошибка чтения/разбора) — это отказ
+                    // именно ЭТОГО pkg:-импорта, а не всей программы.
+                    let found_manifest = match manifest {
+                        Ok(found) => found.as_ref(),
+                        Err(e) => return Err(ImportError(e.clone())),
+                    };
+                    // Нет манифеста вообще (`None`) и "манифест есть, но имя в
+                    // нём не объявлено" — для пользователя один и тот же отказ
+                    // "не объявлен" (AC-07: НЕ "manifest не найден").
+                    let declared = found_manifest.and_then(|m| {
+                        m.dependencies
+                            .get(pkg_name)
+                            .map(|dep| (m.dir.as_path(), dep))
+                    });
+                    let (manifest_dir, dep_path) = declared.ok_or_else(|| {
+                        ImportError(format!(
+                            "IMPORT \"pkg:{}\": пакет '{}' не объявлен в [dependencies] sga.toml",
+                            pkg_import, pkg_name
+                        ))
+                    })?;
+                    // SECURITY: путь зависимости — относительно КАТАЛОГА
+                    // МАНИФЕСТА (того sga.toml, где зависимость объявлена, —
+                    // см. resolve_imports), а не каталога входного файла и не
+                    // места использования: тот же якорь для ВСЕХ pkg:-импортов
+                    // во всём графе резолвинга, независимо от уровня
+                    // вложенности IMPORT (Cargo делает то же самое: path в
+                    // Cargo.toml всегда относителен ЕГО СОБСТВЕННОЙ
+                    // директории).
+                    let pkg_root = lexically_normalize(&manifest_dir.join(dep_path));
+                    let pkg_file = pkg_root.join(sub_path);
+                    if !is_within_root(&pkg_file, &pkg_root) {
+                        return Err(ImportError(format!(
+                            "IMPORT \"pkg:{}\": путь выходит за пределы каталога пакета '{}' ('{}'); обход через '..' запрещён",
+                            pkg_import,
+                            pkg_name,
+                            pkg_root.display()
+                        )));
+                    }
+                    let key = normalize_key(&pkg_file);
+                    if in_progress.contains(&key) {
+                        return Err(ImportError(format!(
+                            "циклический IMPORT: \"pkg:{}\" участвует в цикле импортов",
+                            pkg_import
+                        )));
+                    }
+                    if !visited.contains(&key) {
+                        visited.insert(key.clone());
+                        let source = loader.read(&pkg_file)?;
+                        let imported_program = parse_fn(&source).map_err(|e| {
+                            ImportError(format!(
+                                "IMPORT \"pkg:{}\": ошибка разбора '{}': {}",
+                                pkg_import,
+                                pkg_file.display(),
+                                e
+                            ))
+                        })?;
+                        in_progress.push(key.clone());
+                        let pkg_dir = pkg_file
+                            .parent()
+                            .map(Path::to_path_buf)
+                            .unwrap_or_else(|| pkg_root.clone());
+                        // Новый контекст: root — КОРЕНЬ ПАКЕТА (не основного
+                        // проекта), остальные поля те же.
+                        let pkg_ctx = ResolveCtx {
+                            root: &pkg_root,
+                            manifest,
+                            loader,
+                            parse_fn,
+                        };
+                        let resolved_imported = resolve_program(
+                            imported_program,
+                            &pkg_dir,
+                            true, // in_package: транзитивные pkg: внутри запрещены
+                            &pkg_ctx,
+                            visited,
+                            in_progress,
+                        )?;
+                        in_progress.pop();
+                        out.extend(resolved_imported);
+                    }
+                    continue;
+                }
                 // SECURITY: абсолютные пути в IMPORT запрещены безусловно.
                 // `Path::join` в Rust, если аргумент абсолютный, ПОЛНОСТЬЮ
                 // заменяет базовый путь (это документированное поведение
@@ -286,9 +434,8 @@ fn resolve_program<L: ModuleLoader>(
                 let resolved_imported = resolve_program(
                     imported_program,
                     &imported_dir,
-                    root,
-                    loader,
-                    parse_fn,
+                    in_package,
+                    ctx,
                     visited,
                     in_progress,
                 )?;

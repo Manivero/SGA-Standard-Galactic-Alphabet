@@ -11,8 +11,8 @@ Vec<Token>            — SGA-кодпоинты декодируются в к�
    ▼  src/parser/mod.rs
 AST (src/ast/mod.rs)  — рекурсивный спуск, операторные приоритеты
    │                     (включая Lambda-выражения и IMPORT-statement)
-   ▼  src/module_resolver.rs   (только sga::run_source_file; пропускается,
-   │                            если в программе нет IMPORT — см. ниже)
+   ▼  src/module_resolver.rs   (только sga::run_source_file; программа без
+   │                            IMPORT проходит без изменений — см. ниже)
 AST без IMPORT        — top-level statement'ы импортированных файлов
    │                     инлайнятся рекурсивно; циклы/диамант-импорты
    │                     обработаны явно (ошибка цикла / дедупликация)
@@ -214,10 +214,31 @@ Constant folding (арифметика/сравнения/`AND`/`OR`/унарн�
 trait (`FsLoader`) — для тестов используется in-memory реализация без
 обращения к реальной файловой системе (`tests/module_resolver_test.rs`).
 
+### `pkg:`-импорты и `sga.toml` (T011, M005, 2026-10-10)
+
+`IMPORT "pkg:имя/путь/к/файлу.sga"` — отдельная ветка `Stmt::Import` в
+`resolve_program` (lexer/parser/AST не менялись: `pkg:` — просто префикс
+строки). Имя пакета ищется в `[dependencies]` БЛИЖАЙШЕГО `sga.toml`:
+`manifest::load_nearest` поднимается от каталога входного файла вверх по
+дереву (по канонизированному абсолютному пути — иначе `sga run main.sga`
+из `proj/src` упёрся бы в пустой родитель относительного пути) и берёт
+первый найденный манифест целиком, без слияния с внешними.
+`src/manifest.rs` — ручной мини-парсер ТОЛЬКО секции `[dependencies]`
+(формат `имя = { path = "..." }`), без внешнего `toml`-крейта. Путь
+зависимости считается от каталога манифеста; файл внутри пакета обязан
+остаться в каталоге пакета (`is_within_root` — та же проверка, что у
+обычного `IMPORT` и `read_file`, а не её копия). Контекст резолвинга
+(`ResolveCtx`: `root`, `manifest`, `loader`, `parse_fn`) передаётся
+неизменным вниз по рекурсии; при заходе в пакет `root` заменяется на
+каталог пакета, а флаг `in_package` запрещает транзитивные `pkg:`.
+Результат поиска манифеста хранится как `Result<Option<Manifest>, String>`,
+и его ошибка возвращается только из ветки `pkg:` (ленивая валидация):
+программы без `pkg:` не зависят от содержимого какого-либо `sga.toml`.
+
 ## Тесты
 
-`tests/integration_test.rs` (119 тестов) + `tests/module_resolver_test.rs`
-(12 тестов) + 26 unit-тестов лексера + 4 unit-теста json + 17 unit-тестов optimizer (`src/lexer/mod.rs`, `src/json.rs`, `src/optimizer.rs`) — через публичный API `sga::run_source()`/`run_source_file()`,
+`tests/integration_test.rs` (135 тестов) + `tests/module_resolver_test.rs`
+(12 тестов) + 26 unit-тестов лексера + 4 unit-теста json + 17 unit-тестов optimizer + 17 unit-тестов manifest (`src/lexer/mod.rs`, `src/json.rs`, `src/optimizer.rs`, `src/manifest.rs`) — через публичный API `sga::run_source()`/`run_source_file()`,
 проверяющих как успешные программы (арифметика, рекурсия, циклы, массивы,
 типизированный и смешанный typed/untyped код, `MUT`-параметры, замыкания,
 IIFE, цепочки вызовов, импорты, диамант-импорты), так и обязательные
