@@ -1,6 +1,6 @@
 //! CLI компилятора/интерпретатора SGA.
 
-use sga::{lexer, parser, sga_alphabet};
+use sga::{lexer, parser, sga_alphabet, RunOptions};
 
 use std::env;
 use std::fs;
@@ -9,8 +9,34 @@ use std::process::ExitCode;
 
 const VERSION: &str = "0.1.0";
 
+/// Аргументы командной строки как `String` (включая имя программы, как
+/// `env::args()`). В отличие от `env::args()`, не паникует на не-UTF-8
+/// аргументе, а возвращает понятное сообщение: строки SGA — это UTF-8,
+/// поэтому такой аргумент нельзя передать программе без потери данных
+/// (T012, M006: до этого `sga run файл <не-UTF-8>` завершался паникой).
+fn collect_args() -> Result<Vec<String>, String> {
+    env::args_os()
+        .enumerate()
+        .map(|(i, arg)| {
+            arg.into_string().map_err(|bad| {
+                format!(
+                    "аргумент командной строки №{} ({:?}) не является валидным UTF-8: \
+                     строки SGA — это UTF-8, передать такой аргумент программе нельзя",
+                    i, bad
+                )
+            })
+        })
+        .collect()
+}
+
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
+    let args = match collect_args() {
+        Ok(a) => a,
+        Err(msg) => {
+            eprintln!("{}", msg);
+            return ExitCode::FAILURE;
+        }
+    };
     if args.len() < 2 {
         print_usage();
         return ExitCode::FAILURE;
@@ -19,10 +45,12 @@ fn main() -> ExitCode {
     match args[1].as_str() {
         "run" => {
             if args.len() < 3 {
-                eprintln!("использование: sga run <файл.sga>");
+                eprintln!("использование: sga run <файл.sga> [аргументы...]");
                 return ExitCode::FAILURE;
             }
-            cmd_run(&args[2])
+            // Всё после пути файла — аргументы ПРОГРАММЫ (builtin `args()`),
+            // дословно, в т.ч. то, что выглядит как флаг (`--help`, `-v`).
+            cmd_run(&args[2], &args[3..])
         }
         "build" => {
             eprintln!("'sga build' (нативная компиляция через LLVM) пока не реализована.");
@@ -67,7 +95,12 @@ fn print_usage() {
     eprintln!("использование: sga <команда> [аргументы]");
     eprintln!();
     eprintln!("команды:");
-    eprintln!("  run <файл.sga>    скомпилировать и выполнить файл на встроенной VM");
+    eprintln!("  run <файл.sga> [аргументы...]");
+    eprintln!("                    скомпилировать и выполнить файл на встроенной VM;");
+    eprintln!("                    всё после файла передаётся программе (builtin args()),");
+    eprintln!(
+        "                    стандартный ввод процесса — builtin'ам read_line()/read_stdin()"
+    );
     eprintln!(
         "                    (поддерживает IMPORT \"путь.sga\"; — см. docs/COMPILER_SPEC.md)"
     );
@@ -79,8 +112,13 @@ fn print_usage() {
     eprintln!("  version           показать версию компилятора");
 }
 
-fn cmd_run(path: &str) -> ExitCode {
-    match sga::run_source_file(Path::new(path)) {
+fn cmd_run(path: &str, program_args: &[String]) -> ExitCode {
+    // Стандартный ввод процесса отдаётся программе целиком, но читается
+    // лениво — только когда она вызывает read_line()/read_stdin() (T013).
+    let options = RunOptions::new()
+        .with_args(program_args.iter().cloned())
+        .with_process_stdin();
+    match sga::run_source_file_with_options(Path::new(path), options) {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{}", e);

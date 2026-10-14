@@ -43,7 +43,17 @@ Vm::run(&chunk)        — стековый интерпретатор байт�
 `sga::run_source(text)` — конвейер БЕЗ файлового контекста; `IMPORT` в
 такой программе — явная ошибка (нет базовой директории для резолвинга
 путей). `sga::run_source_file(path)` — полный конвейер с
-`module_resolver`, см. `src/lib.rs`.
+`module_resolver`, см. `src/lib.rs`. Обе функции запускают программу с
+параметрами по умолчанию; параметры запуска (T012/T013, M006: аргументы
+командной строки для `args()` и источник стандартного ввода для
+`read_line()`/`read_stdin()`) передаются через
+`sga::run_source_with_options(text, RunOptions)` и
+`sga::run_source_file_with_options(path, RunOptions)`. `RunOptions` —
+builder (`RunOptions::new().with_args(..)`, `.with_stdin_bytes(..)`,
+`.with_process_stdin()`); параметры попадают в VM через `Vm::set_args` и
+`Vm::set_stdin` между `Vm::new` и `Vm::run`. По умолчанию ввод ПУСТ:
+стандартный ввод процесса библиотека не трогает, пока его явно не
+подключили (`with_process_stdin()`, так делает CLI).
 
 ## Lexer (`src/lexer/mod.rs`)
 
@@ -237,8 +247,8 @@ trait (`FsLoader`) — для тестов используется in-memory р
 
 ## Тесты
 
-`tests/integration_test.rs` (135 тестов) + `tests/module_resolver_test.rs`
-(12 тестов) + 26 unit-тестов лексера + 4 unit-теста json + 17 unit-тестов optimizer + 17 unit-тестов manifest (`src/lexer/mod.rs`, `src/json.rs`, `src/optimizer.rs`, `src/manifest.rs`) — через публичный API `sga::run_source()`/`run_source_file()`,
+`tests/integration_test.rs` (184 теста) + `tests/module_resolver_test.rs`
+(12 тестов) + 26 unit-тестов лексера + 4 unit-теста json + 17 unit-тестов optimizer + 17 unit-тестов manifest + 14 unit-тестов stdin (`src/lexer/mod.rs`, `src/json.rs`, `src/optimizer.rs`, `src/manifest.rs`, `src/stdin.rs`) — через публичный API `sga::run_source()`/`run_source_file()`,
 проверяющих как успешные программы (арифметика, рекурсия, циклы, массивы,
 типизированный и смешанный typed/untyped код, `MUT`-параметры, замыкания,
 IIFE, цепочки вызовов, импорты, диамант-импорты), так и обязательные

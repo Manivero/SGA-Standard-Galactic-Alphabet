@@ -682,6 +682,11 @@ fn builtin_arity(name: &str) -> Option<(usize, usize)> {
         "json_stringify" => Some((1, 1)),
         "json_parse" => Some((1, 1)),
         "read_file" => Some((1, 1)),
+        // T012 (M006): args() — без аргументов.
+        "args" => Some((0, 0)),
+        // T013 (M006): read_line() / read_stdin() — без аргументов.
+        "read_line" => Some((0, 0)),
+        "read_stdin" => Some((0, 0)),
         _ => None,
     }
 }

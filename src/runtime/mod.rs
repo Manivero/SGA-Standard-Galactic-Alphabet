@@ -318,6 +318,17 @@ pub fn is_builtin(name: &str) -> bool {
             // т.к. нужен доступ к Vm::sandbox_root, которого у этой
             // свободной функции нет. См. src/vm/mod.rs::call_read_file.
             | "read_file"
+            // T012 (M006): args — по той же причине, что read_file:
+            // аргументы программы хранятся в Vm (Vm::set_args), у
+            // свободной функции call_builtin доступа к ним нет. См.
+            // src/vm/mod.rs::call_args.
+            | "args"
+            // T013 (M006): read_line / read_stdin — по той же причине:
+            // читатель стандартного ввода хранится в Vm (Vm::set_stdin).
+            // См. src/vm/mod.rs::call_read_line / call_read_stdin; разбор
+            // самого ввода — src/stdin.rs.
+            | "read_line"
+            | "read_stdin"
     )
 }
 
@@ -655,16 +666,19 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> {
             None => Err("json_parse() ожидает 1 аргумент, передано 0".to_string()),
         },
 
-        // T009 (M003): read_file НЕ реализован здесь — перехватывается
-        // раньше, в Vm::call(), т.к. нужен доступ к Vm::sandbox_root
-        // (см. is_builtin выше). Достижение этой ветки означает, что
-        // перехват в Vm::call() был обойдён или удалён — явная паника с
-        // понятным сообщением лучше молчаливого "неизвестная функция"
-        // ниже, которое ввело бы в заблуждение (read_file — известный
-        // builtin, просто реализован в другом месте).
-        "read_file" => unreachable!(
-            "call_builtin(\"read_file\", ...) не должен вызываться напрямую — \
-             ожидался перехват в Vm::call() (см. src/vm/mod.rs::call_read_file)"
+        // T009 (M003): read_file, T012 (M006): args и T013 (M006): read_line,
+        // read_stdin НЕ реализованы здесь — перехватываются раньше, в
+        // Vm::call(), т.к. им нужно состояние VM (Vm::sandbox_root,
+        // Vm::args, Vm::stdin; см. is_builtin выше).
+        // Достижение этой ветки означает, что перехват в Vm::call() был
+        // обойдён или удалён — явная паника с понятным сообщением лучше
+        // молчаливого "неизвестная функция" ниже, которое ввело бы в
+        // заблуждение (это известные builtin'ы, просто реализованные в
+        // другом месте).
+        "read_file" | "args" | "read_line" | "read_stdin" => unreachable!(
+            "call_builtin(\"{}\", ...) не должен вызываться напрямую — \
+             ожидался перехват в Vm::call() (см. src/vm/mod.rs)",
+            name
         ),
 
         _ => Err(format!("неизвестная встроенная функция '{}'", name)),

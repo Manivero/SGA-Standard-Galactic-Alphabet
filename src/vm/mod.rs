@@ -18,6 +18,7 @@ use crate::codegen::{Chunk, CompiledProgram, FunctionDef, OpCode};
 use crate::runtime::{call_builtin, is_builtin, ClosureValue, Value};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::io::BufRead;
 use std::rc::Rc;
 
 #[derive(Debug)]
@@ -131,6 +132,16 @@ pub struct Vm {
     /// `module_resolver::compute_confinement_root`). Единственный
     /// потребитель — `call_read_file` ниже.
     sandbox_root: Option<std::path::PathBuf>,
+    /// Аргументы командной строки программы (T012, M006) — то, что
+    /// возвращает `args()`. Пусто по умолчанию; заполняется через
+    /// `set_args` ДО `run`. Путь к самой программе сюда не входит.
+    args: Vec<String>,
+    /// Стандартный ввод программы (T013, M006) — источник `read_line()` и
+    /// `read_stdin()`. По умолчанию пустой; заменяется через `set_stdin` ДО
+    /// `run`. Позиция чтения принадлежит VM: она не сбрасывается между
+    /// вызовами builtin'ов и (при повторном `run` на той же VM) между
+    /// запусками. Разбор ввода — `crate::stdin`.
+    stdin: Box<dyn BufRead>,
 }
 
 impl Vm {
@@ -159,9 +170,32 @@ impl Vm {
                 call_depth: 0,
                 max_call_depth: 200,
                 sandbox_root,
+                args: Vec::new(),
+                stdin: Box::new(std::io::empty()),
             },
             program.main,
         ))
+    }
+
+    /// Задаёт аргументы командной строки программы (T012, M006) — их
+    /// возвращает builtin `args()`. Вызывается между `Vm::new` и `run`;
+    /// отдельный сеттер, а не параметр `Vm::new`, чтобы сигнатура
+    /// `Vm::new(program, sandbox_root)` (публичный API, на неё опираются
+    /// тесты и внешние потребители крейта) осталась стабильной.
+    pub fn set_args(&mut self, args: Vec<String>) {
+        self.args = args;
+    }
+
+    /// Задаёт стандартный ввод программы (T013, M006) — из него читают
+    /// builtin'ы `read_line()` и `read_stdin()`. Вызывается между `Vm::new`
+    /// и `run`; по умолчанию ввод пуст (`read_line()` сразу даёт `nil`).
+    /// Отдельный сеттер по той же причине, что `set_args`: сигнатура
+    /// `Vm::new(program, sandbox_root)` остаётся стабильной. Принимает любой
+    /// `BufRead` (`Cursor`, `io::stdin().lock()`, читатель с буфером в 1
+    /// байт в тестах); читатель переживает один `run` и продолжает с того
+    /// же места при повторном — позиция чтения принадлежит VM.
+    pub fn set_stdin(&mut self, input: impl BufRead + 'static) {
+        self.stdin = Box::new(input);
     }
 
     pub fn run(&mut self, chunk: &Chunk) -> RResult<Value> {
@@ -539,11 +573,18 @@ impl Vm {
     /// `param_mut`, и здесь стояло `(a, true)` для всех параметров без
     /// исключения). Слияние восстанавливает фикс.
     fn call(&mut self, name: &str, args: Vec<Value>) -> RResult<Value> {
-        // T009 (M003): read_file перехватывается ДО общего диспетча
-        // builtin — нужен доступ к self.sandbox_root, которого нет у
-        // свободной функции call_builtin. См. call_read_file ниже.
-        if name == "read_file" {
-            return self.call_read_file(args);
+        // Builtin'ы, которым нужно состояние VM, перехватываются ДО общего
+        // диспетча — у свободной функции call_builtin доступа к нему нет:
+        // read_file (T009, M003) — self.sandbox_root, см. call_read_file;
+        // args (T012, M006) — self.args, см. call_args;
+        // read_line / read_stdin (T013, M006) — self.stdin, см.
+        // call_read_line / call_read_stdin.
+        match name {
+            "read_file" => return self.call_read_file(args),
+            "args" => return self.call_args(args),
+            "read_line" => return self.call_read_line(args),
+            "read_stdin" => return self.call_read_stdin(args),
+            _ => {}
         }
         if is_builtin(name) {
             return call_builtin(name, args).map_err(rt_err);
@@ -636,6 +677,76 @@ impl Vm {
         std::fs::read_to_string(&full_path)
             .map(Value::Str)
             .map_err(|e| rt_err(format!("read_file(\"{}\"): {}", path_str, e)))
+    }
+
+    /// Реализация `args()` (T012, M006, `std/process`) — аргументы
+    /// командной строки программы как массив строк, БЕЗ пути к самой
+    /// программе. НЕ в `runtime::call_builtin`, т.к. нужен `self.args`
+    /// (см. `call_read_file` — тот же приём).
+    ///
+    /// Каждый вызов строит НОВЫЙ массив: `Value::Array` — это общий
+    /// `Rc<RefCell<..>>` буфер, и если бы VM отдавала один и тот же
+    /// экземпляр, `VAR a = args(); push(a, "x");` изменил бы результат
+    /// всех последующих вызовов `args()`.
+    ///
+    /// Проверка арности — defense-in-depth (статически её делает
+    /// `semantic::builtin_arity`): VM можно запустить на вручную
+    /// собранном байткоде в обход semantic.
+    fn call_args(&self, args: Vec<Value>) -> RResult<Value> {
+        if !args.is_empty() {
+            return Err(rt_err(format!(
+                "args() не принимает аргументов, передано {}",
+                args.len()
+            )));
+        }
+        let items: Vec<Value> = self.args.iter().cloned().map(Value::Str).collect();
+        Ok(Value::Array(Rc::new(RefCell::new(items))))
+    }
+
+    /// Реализация `read_line()` (T013, M006, `std/io`) — следующая строка
+    /// стандартного ввода как `Value::Str` без завершающего `\n`/`\r\n`;
+    /// `Value::Nil`, когда ввод закончился. НЕ в `runtime::call_builtin`,
+    /// т.к. нужен `self.stdin` (см. `call_read_file` — тот же приём).
+    ///
+    /// Формат строки, обработка `\r`, невалидный UTF-8 и ошибки читателя —
+    /// в `crate::stdin::read_line` (там же юнит-тесты). Читает только до
+    /// первого перевода строки — не ждёт EOF, поэтому интерактивный ввод и
+    /// не закрытый pipe работают построчно.
+    ///
+    /// Проверка арности — defense-in-depth (статически её делает
+    /// `semantic::builtin_arity`): VM можно запустить на вручную
+    /// собранном байткоде в обход semantic.
+    fn call_read_line(&mut self, args: Vec<Value>) -> RResult<Value> {
+        if !args.is_empty() {
+            return Err(rt_err(format!(
+                "read_line() не принимает аргументов, передано {}",
+                args.len()
+            )));
+        }
+        match crate::stdin::read_line(&mut *self.stdin) {
+            Ok(Some(line)) => Ok(Value::Str(line)),
+            Ok(None) => Ok(Value::Nil),
+            Err(e) => Err(rt_err(format!("read_line(): {}", e))),
+        }
+    }
+
+    /// Реализация `read_stdin()` (T013, M006, `std/io`) — весь остаток
+    /// стандартного ввода одной строкой, дословно (переводы строк не
+    /// нормализуются); `""`, если ввод уже исчерпан. После вызова ввод
+    /// исчерпан: `read_line()` даст `nil`, повторный `read_stdin()` — `""`.
+    /// Невалидный UTF-8 и ошибки читателя — `RuntimeError` (см.
+    /// `crate::stdin::read_all`). Арность проверяется так же, как у
+    /// `call_read_line`.
+    fn call_read_stdin(&mut self, args: Vec<Value>) -> RResult<Value> {
+        if !args.is_empty() {
+            return Err(rt_err(format!(
+                "read_stdin() не принимает аргументов, передано {}",
+                args.len()
+            )));
+        }
+        crate::stdin::read_all(&mut *self.stdin)
+            .map(Value::Str)
+            .map_err(|e| rt_err(format!("read_stdin(): {}", e)))
     }
 
     /// Вызывает значение `callee` (ожидается `Value::Closure`) с

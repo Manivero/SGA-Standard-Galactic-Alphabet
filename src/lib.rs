@@ -19,6 +19,7 @@ pub mod parser;
 pub mod runtime;
 pub mod semantic;
 pub mod sga_alphabet;
+mod stdin;
 pub mod typechecker;
 pub mod vm;
 
@@ -108,6 +109,83 @@ fn reject_imports(program: &Program) -> Result<(), SgaError> {
     Ok(())
 }
 
+/// Откуда программа получает стандартный ввод (`read_line()` /
+/// `read_stdin()`, T013, M006). Тип приватный: наружу видны только
+/// builder-методы `RunOptions::with_stdin_bytes` / `with_process_stdin`.
+#[derive(Debug, Clone, Default)]
+enum StdinSource {
+    /// Пустой ввод: `read_line()` сразу даёт `nil`, `read_stdin()` — `""`.
+    /// Значение по умолчанию — библиотечные точки входа не читают stdin
+    /// процесса, пока их об этом явно не попросили.
+    #[default]
+    Empty,
+    /// Заданные байты (детерминированные тесты, встраивание без процесса).
+    Bytes(Vec<u8>),
+    /// stdin текущего процесса — так программу запускает CLI.
+    Process,
+}
+
+/// Параметры запуска программы, не относящиеся к её исходному тексту
+/// (M006): всё, что окружение передаёт программе «снаружи». Для запуска
+/// с параметрами — `run_source_with_options` / `run_source_file_with_options`;
+/// `run_source` / `run_source_file` запускают с параметрами по умолчанию
+/// (без аргументов, с пустым вводом).
+///
+/// Строится цепочкой builder-методов (`RunOptions::new().with_args(..)`).
+/// Поля приватны намеренно: следующие задачи M006 добавляют сюда новые
+/// параметры (разрешение записи — T015), и это не должно ломать
+/// существующих вызывающих.
+#[derive(Debug, Clone, Default)]
+pub struct RunOptions {
+    args: Vec<String>,
+    stdin: StdinSource,
+}
+
+impl RunOptions {
+    /// Параметры по умолчанию: программа запускается без аргументов и с
+    /// пустым стандартным вводом.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Аргументы командной строки программы (T012, M006) — то, что вернёт
+    /// builtin `args()`, в том же порядке. Путь к самой программе сюда НЕ
+    /// входит. Повторный вызов заменяет ранее заданные аргументы.
+    pub fn with_args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.args = args.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Задаёт стандартный ввод программы (T013, M006) — байты, которые
+    /// увидят `read_line()` и `read_stdin()`. Не обязаны быть валидным
+    /// UTF-8: невалидный ввод даёт `RuntimeError` при чтении, а не при
+    /// запуске. Каждый запуск читает заданные байты С НАЧАЛА, поэтому одни и
+    /// те же `RunOptions` (или их клон) можно переиспользовать для
+    /// нескольких запусков. Повторный вызов этого метода или
+    /// `with_process_stdin` заменяет ранее заданный источник ввода.
+    pub fn with_stdin_bytes(mut self, bytes: impl Into<Vec<u8>>) -> Self {
+        self.stdin = StdinSource::Bytes(bytes.into());
+        self
+    }
+
+    /// Подключает программе стандартный ввод ТЕКУЩЕГО ПРОЦЕССА (T013,
+    /// M006) — так запускает программы CLI (`sga run`). Чтение ленивое:
+    /// stdin не трогается, пока программа сама не вызовет `read_line()` или
+    /// `read_stdin()`. На время запуска блокируется общий буфер stdin
+    /// процесса (`io::stdin().lock()`), поэтому два запуска с этим режимом в
+    /// разных потоках одного процесса выполняются по очереди. Повторный
+    /// вызов этого метода или `with_stdin_bytes` заменяет ранее заданный
+    /// источник ввода.
+    pub fn with_process_stdin(mut self) -> Self {
+        self.stdin = StdinSource::Process;
+        self
+    }
+}
+
 /// Полный конвейер для исходного текста БЕЗ файлового контекста:
 /// исходный текст -> токены -> AST -> (явный отказ при наличии IMPORT,
 /// см. `reject_imports`) -> семантическая проверка -> проверка типов
@@ -118,19 +196,38 @@ fn reject_imports(program: &Program) -> Result<(), SgaError> {
 /// Для программ с `IMPORT` используйте `run_source_file`, у которой
 /// есть путь к файлу на диске и, соответственно, базовая директория,
 /// относительно которой резолвятся относительные пути импортов.
+///
+/// Запускает программу с параметрами по умолчанию (`RunOptions::new()`:
+/// без аргументов — `args()` вернёт пустой массив — и с пустым вводом —
+/// `read_line()` сразу даст `nil`); для передачи параметров —
+/// `run_source_with_options`.
 pub fn run_source(source: &str) -> Result<Value, SgaError> {
+    run_source_with_options(source, RunOptions::default())
+}
+
+/// То же, что `run_source`, но с явными параметрами запуска (T012, M006).
+pub fn run_source_with_options(source: &str, options: RunOptions) -> Result<Value, SgaError> {
     let program = parse_full(source)?;
     reject_imports(&program)?;
     // T009 (M003): нет файлового пути — нет confinement-границы для
     // read_file. `None` даёт понятную RuntimeError при попытке вызова
     // (см. vm::Vm::call_read_file), а не тихо угадывает cwd процесса.
-    run_resolved_program(program, None)
+    run_resolved_program(program, None, options)
 }
 
 /// Полный конвейер для файла на диске, с поддержкой `IMPORT`. Импорты
 /// резолвятся рекурсивно относительно директории каждого файла (см.
 /// `module_resolver` для полного описания семантики и ограничений).
+///
+/// Запускает программу с параметрами по умолчанию (без аргументов, с пустым
+/// вводом); для передачи параметров — `run_source_file_with_options`.
 pub fn run_source_file(path: &Path) -> Result<Value, SgaError> {
+    run_source_file_with_options(path, RunOptions::default())
+}
+
+/// То же, что `run_source_file`, но с явными параметрами запуска (T012,
+/// M006).
+pub fn run_source_file_with_options(path: &Path, options: RunOptions) -> Result<Value, SgaError> {
     let source = std::fs::read_to_string(path).map_err(|e| {
         SgaError::Import(format!("не удалось прочитать '{}': {}", path.display(), e))
     })?;
@@ -146,7 +243,7 @@ pub fn run_source_file(path: &Path) -> Result<Value, SgaError> {
     // resolve_imports для IMPORT — единый источник истины, см.
     // module_resolver::compute_confinement_root.
     let sandbox_root = Some(module_resolver::compute_confinement_root(path));
-    run_resolved_program(resolved, sandbox_root)
+    run_resolved_program(resolved, sandbox_root, options)
 }
 
 /// Общий хвост пайплайна после того, как `Program` гарантированно не
@@ -158,9 +255,12 @@ pub fn run_source_file(path: &Path) -> Result<Value, SgaError> {
 ///
 /// `sandbox_root` (T009, M003) — confinement-граница для `read_file`;
 /// `None` от `run_source`, `Some(..)` от `run_source_file`.
+/// `options` (M006) — параметры запуска, которые передаются в VM между
+/// `Vm::new` и `run`.
 fn run_resolved_program(
     program: Program,
     sandbox_root: Option<std::path::PathBuf>,
+    options: RunOptions,
 ) -> Result<Value, SgaError> {
     semantic::Analyzer::new()
         .analyze(&program)
@@ -176,6 +276,12 @@ fn run_resolved_program(
     let compiled = codegen::compile(&program);
     let (mut machine, main_chunk) =
         vm::Vm::new(compiled, sandbox_root).map_err(|e| SgaError::Runtime(e.to_string()))?;
+    machine.set_args(options.args);
+    match options.stdin {
+        StdinSource::Empty => machine.set_stdin(std::io::empty()),
+        StdinSource::Bytes(bytes) => machine.set_stdin(std::io::Cursor::new(bytes)),
+        StdinSource::Process => machine.set_stdin(std::io::stdin().lock()),
+    }
     machine
         .run(&main_chunk)
         .map_err(|e| SgaError::Runtime(e.to_string()))

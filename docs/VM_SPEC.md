@@ -114,7 +114,7 @@ struct FunctionDef {
 
 `Chunk`/`OpCode`/`CompiledProgram` — все публичные типы, так что
 потребитель крейта `sga` может сконструировать `Chunk` вручную, в
-обход `codegen::compile()`. `Vm::new(program) -> Result<(Vm, Chunk), RuntimeError>`
+обход `codegen::compile()`. `Vm::new(program, sandbox_root) -> Result<(Vm, Chunk), RuntimeError>`
 проверяет ДО исполнения:
 - каждый `PushConst(idx)` — что `idx < constants.len()`;
 - каждый `Jump(target)`/`JumpIfFalse(target)` — что `target <= code.len()`;
@@ -130,7 +130,7 @@ struct FunctionDef {
 
 ## Builtin-функции (`src/runtime/mod.rs`)
 
-26 функций — вызываются через `Call`, перехватываются `Vm::call()` до
+29 функций — вызываются через `Call`, перехватываются `Vm::call()` до
 поиска пользовательской функции:
 - **Коллекции/общие:** `len`, `push`, `keys`, `range`, `to_string`,
   `to_int`, `to_float`, `type_of`
@@ -145,16 +145,54 @@ struct FunctionDef {
   объект при парсинге становится `Array` из 2-элементных `[ключ,
   значение]` — у SGA v0.1 нет generic map-типа. `Closure` не
   сериализуется (`RuntimeError`).
-- **std/io (T009, M003):** `read_file(path) -> string` — единственный
-  builtin из 26, реализованный НЕ в `runtime::call_builtin`, а
-  перехватываемый напрямую в `Vm::call()` (нужен доступ к
-  `Vm::sandbox_root`, которого нет у свободной функции `call_builtin`;
+- **std/io (T009, M003):** `read_file(path) -> string` — один из четырёх
+  builtin'ов из 29 (остальные — `args`, T012, и `read_line`/`read_stdin`,
+  T013), реализованных НЕ в
+  `runtime::call_builtin`, а перехватываемых напрямую в `Vm::call()`
+  (нужен доступ к состоянию VM — здесь `Vm::sandbox_root`, которого нет у
+  свободной функции `call_builtin`;
   `runtime::is_builtin`/`semantic::builtin_arity` всё равно знают о нём
   — нужно codegen'у для статического `OpCode::Call`). Sandboxed:
   переиспользует confinement-границу `IMPORT`
   (`module_resolver::is_within_root`/`compute_confinement_root`), см.
   `docs/SECURITY.md`. Только чтение; `run_source` (без файлового пути)
   → `RuntimeError` при вызове.
+- **std/process (T012, M006):** `args() -> array` — аргументы командной
+  строки программы как массив `string` в порядке передачи, БЕЗ пути к
+  самой программе (пустой массив, если аргументов нет). Арность (0, 0)
+  проверяет `semantic::builtin_arity`; в рантайме — перехват в
+  `Vm::call()` (`call_args`, нужен `Vm::args`), в `call_builtin` стоит
+  `unreachable!`, как у `read_file`. Аргументы задаются
+  `Vm::set_args(Vec<String>)` между `Vm::new` и `Vm::run` (сигнатура
+  `Vm::new(program, sandbox_root)` не менялась). Каждый вызов возвращает
+  НОВЫЙ массив: мутация результата не влияет на последующие вызовы.
+  Источник аргументов — `RunOptions` (`sga::run_source_with_options`,
+  `sga::run_source_file_with_options`); CLI `sga run файл арг1 арг2`
+  передаёт всё после пути файла дословно.
+- **std/io — стандартный ввод (T013, M006):** `read_line() -> string | nil`
+  и `read_stdin() -> string`. Арность (0, 0) у обоих
+  (`semantic::builtin_arity`); в рантайме — перехват в `Vm::call()`
+  (`call_read_line`/`call_read_stdin`, нужен читатель `Vm::stdin`), в
+  `call_builtin` стоит `unreachable!`, как у `read_file`/`args`. Читатель —
+  `Box<dyn BufRead>`, по умолчанию пустой ввод; задаётся
+  `Vm::set_stdin(impl BufRead + 'static)` между `Vm::new` и `Vm::run`
+  (сигнатура `Vm::new(program, sandbox_root)` не менялась). Позиция чтения
+  принадлежит VM: повторный `run` на той же VM продолжает с того места,
+  где остановился предыдущий. `read_line()` читает байты до первого `\n`
+  включительно (или до конца ввода); ни одного байта → `nil`; иначе
+  отбрасывается ОДИН завершающий `\n` и ОДИН `\r` непосредственно перед
+  ним (только если `\n` был): одиночный `\r` внутри строки и `\r` на конце
+  ввода без `\n` остаются данными; `""` — пустая строка, а не конец ввода.
+  `read_stdin()` читает ВСЕ оставшиеся байты, переводы строк не
+  нормализуются; после вызова ввод исчерпан (`read_line()` → `nil`,
+  повторный `read_stdin()` → `""`). Декодирование строгое: не-UTF-8 →
+  `RuntimeError` (сообщение называет UTF-8 и число валидных байт;
+  прочитанные байты потреблены), подстановки U+FFFD нет; ошибка чтения
+  читателя тоже `RuntimeError`, не panic. Чтение ленивое и инкрементальное
+  (`read_line()` не ждёт конца ввода). Разбор — `src/stdin.rs`
+  (`read_line`/`read_all` над `&mut dyn BufRead`, 14 unit-тестов). Источник
+  ввода — `RunOptions` (`with_stdin_bytes`, `with_process_stdin`; по
+  умолчанию пустой ввод); CLI `sga run` подключает stdin процесса.
 
 `len`/`keys` также понимают `Value::Struct` (не только `Array`/`Str`).
 Полный список и сигнатуры — `src/runtime/mod.rs::call_builtin`/

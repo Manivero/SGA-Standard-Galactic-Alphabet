@@ -16,20 +16,21 @@
 - ✅ Переменные: let/var/const
 - ✅ Функции верхнего уровня + рекурсия
 - ✅ if/else/while/for-in/break/continue
-- ✅ Встроенные функции: 23 функции — `len`, `push`, `keys`, `range`,
+- ✅ Встроенные функции: 29 функций — `len`, `push`, `keys`, `range`,
   `to_string`/`to_int`/`to_float`, `type_of`, `sqrt`/`floor`/`ceil`/`abs`/
-  `min`/`max`/`pow`, 7 строковых `str_*` (см. `docs/VM_SPEC.md`)
+  `min`/`max`/`pow`, 8 строковых `str_*`, `json_stringify`/`json_parse`,
+  `read_file`, `args`, `read_line`, `read_stdin` (см. `docs/VM_SPEC.md`)
 - ✅ CLI: `sga run`, `sga init`, `sga fmt` (печать AST), `sga version`
 - ✅ `sga.toml` (схема манифеста, генерируется `sga init`; секция `[dependencies]`
   читается и резолвится для path-зависимостей — T011/M005, см. ниже)
 - ✅ Инструмент `tools/translit` для записи кода в ASCII-мнемониках
-- ✅ 13 `.sga`-файлов в `examples/`, все реально выполняются
+- ✅ 15 `.sga`-файлов в `examples/`, все реально выполняются
   (`scripts/run_examples.sh`) — включая
   новые `closures.sga`, `ownership.sga`, `modules.sga`+`modules_math.sga`,
   демонстрирующие совместную работу фич, объединённых при слиянии
-- ✅ 211 тестов (135 интеграционных + 12 модульных + 26 unit-тестов
+- ✅ 274 теста (184 интеграционных + 12 модульных + 26 unit-тестов
   лексера + 4 unit-теста json + 17 unit-тестов optimizer + 17 unit-тестов
-  manifest, включая регрессионные на
+  manifest + 14 unit-тестов stdin, включая регрессионные на
   реально найденные дыры — см. ниже и docs/SECURITY.md, и на конфликт
   грамматики между field-access и `FOR..IN`, найденный при слиянии со
   structs-веткой)
@@ -96,9 +97,34 @@
   единый источник истины) — абсолютные пути и выход за каталог входного
   файла программы через `..` отклоняются безусловно. Программы,
   запущенные через `run_source` (без файлового пути), получают понятную
-  `RuntimeError` при вызове, а не тихо читают cwd процесса. Единственный
-  builtin, реализованный НЕ в `runtime::call_builtin` (перехватывается в
-  `Vm::call()` — нужен доступ к `Vm::sandbox_root`), см. `docs/VM_SPEC.md`.
+  `RuntimeError` при вызове, а не тихо читают cwd процесса. Реализован НЕ
+  в `runtime::call_builtin` (перехватывается в `Vm::call()` — нужен доступ
+  к `Vm::sandbox_root`; с T012 так же устроен `args()`), см.
+  `docs/VM_SPEC.md`.
+- ✅ **`std/process`: `args()`** (M006, T012, 2026-10-11): `args() -> array`
+  из string — аргументы командной строки программы (`sga run файл.sga арг1
+  арг2`; всё после пути файла передаётся дословно, путь к самой программе
+  в массив не входит; каждый вызов отдаёт новый массив). Параметры запуска
+  вводятся как `RunOptions` (`run_source_with_options` /
+  `run_source_file_with_options`); `Vm::new` не менялась — аргументы
+  приходят через `Vm::set_args`. Не-UTF-8 аргумент в CLI теперь даёт
+  понятную ошибку вместо паники. Пример — `examples/args.sga`.
+- ✅ **`std/io`: `read_line()` / `read_stdin()`** (M006, T013, 2026-10-14):
+  `read_line() -> string | nil` — следующая строка стандартного ввода без
+  завершающего `\n`/`\r\n` (`nil` — ввод закончился, `""` — пустая
+  строка); `read_stdin() -> string` — весь остаток ввода дословно (после
+  него ввод исчерпан). Ввод — строгий UTF-8 (не-UTF-8 → `RuntimeError`, без
+  подмены символов), чтение ленивое: `read_line()` потребляет одну строку и
+  не ждёт конца ввода. Разбор — `src/stdin.rs` (чистые функции над
+  `BufRead`); читатель принадлежит VM (`Vm::set_stdin`; `Vm::new` не
+  менялась). Источник задаёт запускающая сторона: CLI `sga run` всегда
+  подключает stdin процесса (`RunOptions::with_process_stdin()`),
+  библиотека по умолчанию даёт ПУСТОЙ ввод, заданные байты —
+  `RunOptions::with_stdin_bytes(..)`. Пример — `examples/stdin.sga`.
+  Известные ограничения: размер ввода и длина строки не ограничены
+  (`read_stdin()` держит ввод в памяти — на вводе 128 МиБ пик ≈259 МиБ, как
+  у `read_file`; построчный цикл по тем же 128 МиБ — ≈11 МиБ), BOM в
+  начале ввода остаётся данными первой строки.
 - ✅ **Optimizer** (roadmap-приоритет 4, T010/M004, 2026-08-18):
   constant folding + dead code elimination (DCE), `src/optimizer.rs` —
   AST→AST проход между `typechecker` и `codegen` (не между `codegen` и
@@ -181,11 +207,15 @@
 `str_ends_with`, `str_replace`, `str_upper`, `str_lower`,
 `json_stringify`, `json_parse` (T008/M003, 2026-08-14), `read_file`
 (T009/M003, 2026-08-16, sandboxed — см. "Сделано в
-v0.1.0" ниже) (`src/runtime/mod.rs`, `src/json.rs`, `src/vm/mod.rs`).
+v0.1.0" ниже), `args` (T012/M006, 2026-10-11), `read_line`/`read_stdin`
+(T013/M006, 2026-10-14)
+(`src/runtime/mod.rs`, `src/json.rs`, `src/stdin.rs`, `src/vm/mod.rs`).
 **Не реализовано**: запись/удаление файлов, listing каталогов, `std/fs`,
 `std/net`, `std/http`, `std/crypto`, `std/time`, `std/math` (кроме
 встроенных операторов), `std/random`, `std/thread`, `std/async`,
-`std/process`, `std/collections` (кроме базового `array`). Каждый из них
+`std/process` (кроме `args()`), `std/collections` (кроме базового
+`array`). Время и запись файлов с явным разрешением
+запланированы как T014–T015 (M006). Каждый из них
 требует системных вызовов/внешних
 крейтов и отдельного дизайна безопасности (permission system для
 sandboxed I/O) — нельзя честно "обозначить как готово" без реализации.
@@ -272,7 +302,9 @@ Rust целиком"): нет lifetimes, нет анализа aliasing двух
    `src/manifest.rs` + ветка `pkg:` в `src/module_resolver.rs`, см.
    "Сделано в v0.1.0" выше). **M005 COMPLETED.** Реестр, версии и
    транзитивные зависимости остаются отдельной будущей задачей.
-5. Остальной `std` (net/http/crypto/thread/async).
+5. Остальной `std`. **M006 в работе**: `args()` ✅ (T012), stdin ✅
+   (T013), далее время (T014), запись файлов с явным разрешением (T015);
+   net/http/crypto/thread/async — отдельно.
 6. LSP для VS Code (пункт 8).
 7. Async Runtime (пункт 9).
 8. ~~`match`-выражение~~ — **реализовано в T006/M002** (2026-08-11, см.

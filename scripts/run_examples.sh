@@ -8,8 +8,11 @@ if [ ! -x target/debug/sga ]; then
     cargo build
 fi
 
+# Примеры запускаются с пустым stdin (</dev/null): пример std/io читает
+# стандартный ввод (examples/stdin.sga) и в терминале ждал бы ввода с
+# клавиатуры. Со своим вводом: printf '...' | ./target/debug/sga run examples/stdin.sga
 for f in examples/*.sga; do
     echo "=== $f ==="
-    ./target/debug/sga run "$f"
+    ./target/debug/sga run "$f" </dev/null
     echo
 done

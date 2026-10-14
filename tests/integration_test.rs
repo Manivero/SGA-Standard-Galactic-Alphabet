@@ -16,7 +16,7 @@ use sga::codegen::{Chunk, CompiledProgram, FunctionDef, OpCode};
 use sga::runtime::Value;
 use sga::sga_alphabet::encode_word;
 use sga::vm::Vm;
-use sga::{codegen, lexer, parser, semantic, SgaError};
+use sga::{codegen, lexer, parser, semantic, RunOptions, SgaError};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -2625,4 +2625,1132 @@ fn test_sga_init_scaffold_runs_with_path_dependency_end_to_end_via_cli() {
         );
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "42", "{label}");
     }
+}
+
+// ===== std/process: args() (T012, M006) =====
+//
+// Feature Contract — см. PROJECT_STATUS.md. `args()` возвращает аргументы
+// командной строки ПРОГРАММЫ (без пути к ней) как массив string.
+// Параметры запуска передаются через `RunOptions` (builder), CLI
+// передаёт программе всё, что стоит после пути файла, дословно.
+//
+// Значения в тестах наблюдаются через значение последнего выражения
+// программы (`run*` его возвращает); сквозные тесты через настоящий
+// бинарник читают stdout.
+
+#[test]
+fn test_args_without_options_is_empty_array() {
+    // AC-01 (библиотека): `run_source`/`run_source_file` запускают
+    // программу с параметрами по умолчанию — аргументов нет.
+    assert_eq!(run("len(args());").unwrap(), Value::Int(0));
+    assert_eq!(
+        run("json_stringify(args());").unwrap(),
+        Value::Str("[]".into())
+    );
+
+    let dir = temp_test_dir("args_default_file");
+    let entry = dir.join("main.sga");
+    write_test_file(&entry, "len(args());");
+    let result = sga::run_source_file(&entry);
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(result.unwrap(), Value::Int(0));
+}
+
+#[test]
+fn test_args_returns_passed_strings_in_order_as_strings() {
+    // AC-02: порядок сохраняется, пустая строка и строки, похожие на флаги,
+    // не теряются и не интерпретируются; каждый элемент — string.
+    let options = RunOptions::new().with_args(["a", "b c", "--flag", ""]);
+    let result = sga::run_source_with_options("json_stringify(args());", options);
+    assert_eq!(
+        result.unwrap(),
+        Value::Str("[\"a\",\"b c\",\"--flag\",\"\"]".into())
+    );
+
+    let options = RunOptions::new().with_args(["5", "true"]);
+    let result = sga::run_source_with_options(
+        "json_stringify([type_of(args()[0]), type_of(args()[1])]);",
+        options,
+    );
+    assert_eq!(
+        result.unwrap(),
+        Value::Str("[\"string\",\"string\"]".into()),
+        "\"5\" и \"true\" должны остаться строками, а не превратиться в int/bool"
+    );
+}
+
+#[test]
+fn test_args_preserves_unicode_arguments() {
+    let options = RunOptions::new().with_args(["日本語 🦀", "привет"]);
+    let result = sga::run_source_with_options("args()[0];", options.clone());
+    assert_eq!(result.unwrap(), Value::Str("日本語 🦀".into()));
+    let result = sga::run_source_with_options("len(args()[1]);", options);
+    assert_eq!(
+        result.unwrap(),
+        Value::Int(6),
+        "len() считает символы, не байты"
+    );
+}
+
+#[test]
+fn test_run_source_file_with_options_passes_args() {
+    // AC-02 (файловый вариант запуска).
+    let dir = temp_test_dir("args_file_opts");
+    let entry = dir.join("main.sga");
+    write_test_file(&entry, "json_stringify(args());");
+    let options = RunOptions::new().with_args(["x", "y z"]);
+    let result = sga::run_source_file_with_options(&entry, options);
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(result.unwrap(), Value::Str("[\"x\",\"y z\"]".into()));
+}
+
+#[test]
+fn test_args_each_call_returns_independent_array() {
+    // AC-03: мутация результата одного вызова не видна следующему
+    // вызову `args()` (Value::Array — общий Rc<RefCell<..>>, поэтому
+    // отдавать один и тот же экземпляр было бы ошибкой).
+    let src = format!(
+        "{var_} a = args(); push(a, \"mutated\"); json_stringify([len(a), len(args())]);",
+        var_ = kw("VAR")
+    );
+    let options = RunOptions::new().with_args(["one", "two"]);
+    let result = sga::run_source_with_options(&src, options);
+    assert_eq!(result.unwrap(), Value::Str("[3,2]".into()));
+}
+
+#[test]
+fn test_args_is_available_inside_functions() {
+    // `args()` — вызов builtin, обрабатываемый VM в любом кадре, не
+    // только в главном блоке.
+    let src = format!(
+        "{fn_} count() {{ {return_} len(args()); }} count();",
+        fn_ = kw("FN"),
+        return_ = kw("RETURN")
+    );
+    let options = RunOptions::new().with_args(["a", "b"]);
+    let result = sga::run_source_with_options(&src, options);
+    assert_eq!(result.unwrap(), Value::Int(2));
+}
+
+#[test]
+fn test_args_index_out_of_range_without_arguments_is_runtime_error() {
+    // Типичная ошибка скрипта — прочитать `args()[0]`, когда аргумент не
+    // передали: это управляемая RuntimeError, не panic.
+    match run("args()[0];") {
+        Err(SgaError::Runtime(_)) => {}
+        other => panic!(
+            "ожидалась RuntimeError (индекс вне границ пустого массива), получено {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn test_variable_and_parameter_named_args_are_unaffected_by_builtin() {
+    // Обратная совместимость: имя `args` занято ТОЛЬКО как имя вызова
+    // `args(..)`. Переменная и параметр с таким именем работают как раньше.
+    let src = format!(
+        "{fn_} count(args) {{ {return_} len(args); }} {let_} args = [1, 2, 3]; count(args) + len(args);",
+        fn_ = kw("FN"),
+        return_ = kw("RETURN"),
+        let_ = kw("LET")
+    );
+    assert_eq!(run(&src).unwrap(), Value::Int(6));
+}
+
+#[test]
+fn test_args_with_arguments_is_semantic_error() {
+    // AC-04 (статическая часть): арность (0, 0) проверяется на этапе
+    // семантического анализа, до исполнения.
+    match run("args(1);") {
+        Err(SgaError::Semantic(msg)) => {
+            assert!(msg.contains("'args'"), "получено: {msg}");
+            assert!(msg.contains("ожидает 0"), "получено: {msg}");
+        }
+        other => panic!("ожидалась SemError для args(1), получено {:?}", other),
+    }
+}
+
+#[test]
+fn test_vm_args_call_with_arguments_via_handbuilt_bytecode_is_runtime_error() {
+    // AC-04 (рантайм-часть, defense-in-depth): VM можно запустить на
+    // вручную собранном байткоде в обход semantic — `Call("args", 1)`
+    // обязан дать RuntimeError, а не panic или молчаливое игнорирование.
+    let chunk = Chunk {
+        code: vec![
+            OpCode::PushConst(0),
+            OpCode::Call("args".to_string(), 1),
+            OpCode::Return(true),
+        ],
+        constants: vec![Value::Int(1)],
+    };
+    let program = CompiledProgram {
+        main: chunk,
+        functions: HashMap::new(),
+    };
+    let (mut machine, main) = Vm::new(program, None).expect("байткод должен пройти верификатор");
+    match machine.run(&main) {
+        Err(e) => assert!(e.to_string().contains("args()"), "получено: {e}"),
+        Ok(v) => panic!(
+            "ожидалась RuntimeError (args с аргументом), получено {:?}",
+            v
+        ),
+    }
+}
+
+#[test]
+fn test_vm_set_args_is_visible_to_args_builtin() {
+    // Уровень VM без lib.rs: `Vm::set_args` между `Vm::new` и `run`.
+    // `Vm::new(program, None)` при этом остаётся прежней сигнатуры (AC-07).
+    let chunk = Chunk {
+        code: vec![OpCode::Call("args".to_string(), 0), OpCode::Return(true)],
+        constants: vec![],
+    };
+    let program = CompiledProgram {
+        main: chunk,
+        functions: HashMap::new(),
+    };
+    let (mut machine, main) = Vm::new(program, None).expect("байткод должен пройти верификатор");
+    machine.set_args(vec!["first".to_string(), "second".to_string()]);
+    match machine.run(&main) {
+        Ok(Value::Array(items)) => {
+            let items = items.borrow();
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[0], Value::Str("first".into()));
+            assert_eq!(items[1], Value::Str("second".into()));
+        }
+        other => panic!("ожидался массив из двух строк, получено {:?}", other),
+    }
+}
+
+#[test]
+fn test_cli_run_passes_arguments_after_file_verbatim_to_program() {
+    // AC-01 (CLI) и AC-05: сквозной тест через НАСТОЯЩИЙ бинарник. Всё
+    // после пути файла — аргументы программы, дословно: пробелы внутри
+    // аргумента, пустая строка, то, что выглядит как флаги самого sga
+    // (`--version`, `-v`, `--help`), и `--`.
+    let dir = temp_test_dir("args_cli");
+    let entry = dir.join("main.sga");
+    write_test_file(
+        &entry,
+        &format!("{print_}(json_stringify(args()));", print_ = kw("PRINT")),
+    );
+    let bin = env!("CARGO_BIN_EXE_sga");
+
+    let without = std::process::Command::new(bin)
+        .arg("run")
+        .arg(&entry)
+        .output()
+        .unwrap();
+    let with = std::process::Command::new(bin)
+        .arg("run")
+        .arg(&entry)
+        .args(["a", "b c", "--flag", "--", "-v", "--version", "--help", ""])
+        .output()
+        .unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert!(
+        without.status.success(),
+        "stderr = {}",
+        String::from_utf8_lossy(&without.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&without.stdout).trim(), "[]");
+    assert!(
+        with.status.success(),
+        "stderr = {}",
+        String::from_utf8_lossy(&with.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&with.stdout).trim(),
+        "[\"a\",\"b c\",\"--flag\",\"--\",\"-v\",\"--version\",\"--help\",\"\"]"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_cli_run_with_non_utf8_argument_is_clear_error_not_panic() {
+    // AC-06: строки SGA — UTF-8, поэтому не-UTF-8 аргумент передать
+    // программе нельзя. Раньше `env::args()` в этом случае паниковал
+    // (код возврата 101); теперь — понятное сообщение и обычный код
+    // неуспеха 1.
+    use std::os::unix::ffi::OsStrExt;
+    let dir = temp_test_dir("args_non_utf8");
+    let entry = dir.join("main.sga");
+    write_test_file(&entry, "len(args());");
+    let bad = std::ffi::OsStr::from_bytes(b"\xff\xfe");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_sga"))
+        .arg("run")
+        .arg(&entry)
+        .arg(bad)
+        .output()
+        .unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr = {stderr}");
+    assert!(stderr.contains("UTF-8"), "получено: {stderr}");
+    assert!(!stderr.contains("panicked"), "получено: {stderr}");
+}
+
+// ===== std/io: read_line() / read_stdin() (T013, M006) =====
+//
+// Feature Contract — см. PROJECT_STATUS.md. `read_line()` — следующая
+// строка стандартного ввода без `\n`/`\r\n` (`nil` на EOF; пустая строка
+// отличима от EOF), `read_stdin()` — весь остаток ввода дословно. Ввод
+// задаётся через `RunOptions::with_stdin_bytes` (детерминированные тесты без
+// процесса); CLI подключает stdin ПРОЦЕССА — его проверяют сквозные тесты
+// через настоящий pipe в конце секции. Разбор формата ввода (границы
+// `\r\n`/EOF/UTF-8, ошибка читателя) дополнительно покрыт юнит-тестами в
+// `src/stdin.rs`.
+//
+// Значения наблюдаются через значение последнего выражения программы;
+// stdout — только в сквозных CLI-тестах.
+
+/// Исходник из шаблона: `@LET`, `@VAR`, … заменяются SGA-кодировкой
+/// соответствующих ключевых слов (`kw`) — так тесты читаются как обычные
+/// программы. Остальной текст шаблона остаётся как есть (в шаблонах нет
+/// строковых литералов, содержащих `@`).
+fn kw_src(template: &str) -> String {
+    let mut out = template.to_string();
+    for word in [
+        "LET", "VAR", "FN", "RETURN", "IF", "ELSE", "WHILE", "BREAK", "NIL", "PRINT", "TRUE",
+    ] {
+        out = out.replace(&format!("@{word}"), &kw(word));
+    }
+    out
+}
+
+/// Запускает программу с заданными байтами стандартного ввода.
+fn run_with_stdin(source: &str, input: impl Into<Vec<u8>>) -> Result<Value, SgaError> {
+    sga::run_source_with_options(source, RunOptions::new().with_stdin_bytes(input))
+}
+
+/// Запускает программу с произвольным читателем на месте stdin (путь
+/// «текст -> токены -> AST -> байткод -> `Vm::set_stdin` -> `run`» без
+/// `RunOptions`): нужен, чтобы подставить читатель с буфером в 1 байт.
+fn run_with_reader(
+    source: &str,
+    reader: impl std::io::BufRead + 'static,
+) -> Result<Value, SgaError> {
+    let tokens = lexer::Lexer::new(source)
+        .tokenize()
+        .map_err(|e| SgaError::Lex(e.to_string()))?;
+    let program = parser::Parser::new(tokens)
+        .parse_program()
+        .map_err(|e| SgaError::Parse(e.to_string()))?;
+    let compiled = codegen::compile(&program);
+    let (mut machine, main) =
+        Vm::new(compiled, None).map_err(|e| SgaError::Runtime(e.to_string()))?;
+    machine.set_stdin(reader);
+    machine
+        .run(&main)
+        .map_err(|e| SgaError::Runtime(e.to_string()))
+}
+
+fn string_value(text: &str) -> Value {
+    Value::Str(text.to_string())
+}
+
+/// Программа «читать до nil и сложить числа»: типичное использование.
+fn sum_lines_src() -> String {
+    kw_src(
+        "@VAR total = 0; \
+         @WHILE @TRUE { \
+             @LET line = read_line(); \
+             @IF line == @NIL { @BREAK; } \
+             total = total + to_int(line); \
+         } \
+         total;",
+    )
+}
+
+#[test]
+fn test_read_line_returns_lines_one_by_one_then_nil() {
+    // AC-01: два вызова сверх ввода — nil и снова nil (EOF «залипает»).
+    let src = "json_stringify([read_line(), read_line(), read_line(), read_line()]);";
+    assert_eq!(
+        run_with_stdin(src, "a\nb\n").unwrap(),
+        string_value("[\"a\",\"b\",null,null]")
+    );
+    // Последняя строка без завершающего перевода строки — всё равно строка.
+    assert_eq!(
+        run_with_stdin(src, "a\nb").unwrap(),
+        string_value("[\"a\",\"b\",null,null]")
+    );
+    // Пустой ввод: сразу EOF.
+    assert_eq!(
+        run_with_stdin(src, "").unwrap(),
+        string_value("[null,null,null,null]")
+    );
+}
+
+#[test]
+fn test_read_line_handles_crlf_and_distinguishes_empty_line_from_eof() {
+    // AC-02: \r\n и \n дают одно и то же; "" — настоящая пустая строка.
+    let src = "json_stringify([read_line(), read_line(), read_line(), read_line()]);";
+    let expected = string_value("[\"a\",\"\",\"b\",null]");
+    assert_eq!(run_with_stdin(src, "a\r\n\r\nb\n").unwrap(), expected);
+    assert_eq!(run_with_stdin(src, "a\n\nb\n").unwrap(), expected);
+
+    // Пустая строка не равна nil, а EOF не равен "".
+    let probe = kw_src("@LET line = read_line(); json_stringify([line == @NIL, line == \"\"]);");
+    assert_eq!(
+        run_with_stdin(&probe, "\n").unwrap(),
+        string_value("[false,true]")
+    );
+    assert_eq!(
+        run_with_stdin(&probe, "").unwrap(),
+        string_value("[true,false]")
+    );
+}
+
+#[test]
+fn test_read_line_keeps_lone_carriage_returns_as_data() {
+    // AC-02: отбрасывается ОДИН \r и только перед \n; остальные \r — данные.
+    assert_eq!(
+        run_with_stdin("read_line();", "a\rb\n").unwrap(),
+        string_value("a\rb")
+    );
+    assert_eq!(
+        run_with_stdin("read_line();", "a\r").unwrap(),
+        string_value("a\r"),
+        "\\r в самом конце ввода без \\n — данные, не перевод строки"
+    );
+    assert_eq!(
+        run_with_stdin("read_line();", "a\r\r\n").unwrap(),
+        string_value("a\r")
+    );
+}
+
+#[test]
+fn test_read_stdin_returns_the_remainder_after_read_line_verbatim() {
+    // AC-03: остаток дословно, включая \r\n; без read_line — весь ввод.
+    assert_eq!(
+        run_with_stdin("read_line(); read_stdin();", "first\r\nsecond\r\nthird").unwrap(),
+        string_value("second\r\nthird")
+    );
+    assert_eq!(
+        run_with_stdin("read_stdin();", "a\r\nb\n\nc\n").unwrap(),
+        string_value("a\r\nb\n\nc\n")
+    );
+    // Пустой ввод — пустая строка (не nil).
+    assert_eq!(
+        run_with_stdin("read_stdin();", "").unwrap(),
+        string_value("")
+    );
+}
+
+#[test]
+fn test_input_is_exhausted_after_read_stdin() {
+    // AC-03: после read_stdin() ввод исчерпан — read_line() даёт nil, повторный
+    // read_stdin() — "".
+    let src = "read_stdin(); json_stringify([read_line(), read_stdin(), read_line()]);";
+    assert_eq!(
+        run_with_stdin(src, "x\ny\n").unwrap(),
+        string_value("[null,\"\",null]")
+    );
+}
+
+#[test]
+fn test_read_line_and_read_stdin_share_one_stream() {
+    // Оба builtin'а работают над ОДНИМ потоком: прочитанное одним не
+    // видно другому.
+    let src = "json_stringify([read_line(), read_line(), read_stdin(), read_line()]);";
+    assert_eq!(
+        run_with_stdin(src, "1\n2\n3\n4").unwrap(),
+        string_value("[\"1\",\"2\",\"3\\n4\",null]")
+    );
+}
+
+#[test]
+fn test_read_line_invalid_utf8_is_runtime_error_not_panic_or_lossy() {
+    // AC-04: строки SGA — UTF-8; подстановка U+FFFD исказила бы данные молча.
+    match run_with_stdin("read_line();", b"ab\xffcd\n") {
+        Err(SgaError::Runtime(msg)) => {
+            assert!(msg.contains("read_line()"), "получено: {msg}");
+            assert!(msg.contains("UTF-8"), "получено: {msg}");
+            assert!(!msg.contains('\u{FFFD}'), "получено: {msg}");
+        }
+        other => panic!(
+            "ожидалась RuntimeError (не-UTF-8 ввод), получено {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn test_read_stdin_invalid_utf8_is_runtime_error_not_panic_or_lossy() {
+    // AC-04 для read_stdin: ошибка даже если невалидно только окончание.
+    match run_with_stdin("read_stdin();", b"fine\n\xff\xfe") {
+        Err(SgaError::Runtime(msg)) => {
+            assert!(msg.contains("read_stdin()"), "получено: {msg}");
+            assert!(msg.contains("UTF-8"), "получено: {msg}");
+        }
+        other => panic!(
+            "ожидалась RuntimeError (не-UTF-8 ввод), получено {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn test_invalid_utf8_only_fails_the_line_that_contains_it() {
+    // Декодирование ленивое: валидные строки до испорченной читаются, ошибка
+    // возникает именно при чтении испорченной.
+    assert_eq!(
+        run_with_stdin("read_line();", b"ok\n\xff\n").unwrap(),
+        string_value("ok")
+    );
+    match run_with_stdin("read_line(); read_line();", b"ok\n\xff\n") {
+        Err(SgaError::Runtime(_)) => {}
+        other => panic!(
+            "ожидалась RuntimeError на второй (испорченной) строке, получено {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn test_read_line_and_read_stdin_with_arguments_are_semantic_errors() {
+    // AC-05 (статическая часть): арность (0, 0) проверяется до исполнения.
+    for (call, quoted_name) in [
+        ("read_line(1);", "'read_line'"),
+        ("read_stdin(\"x\");", "'read_stdin'"),
+    ] {
+        match run(call) {
+            Err(SgaError::Semantic(msg)) => {
+                assert!(msg.contains(quoted_name), "получено: {msg}");
+                assert!(msg.contains("ожидает 0"), "получено: {msg}");
+            }
+            other => panic!("ожидалась SemError для {call}, получено {:?}", other),
+        }
+    }
+}
+
+#[test]
+fn test_vm_stdin_calls_with_arguments_via_handbuilt_bytecode_are_runtime_errors() {
+    // AC-05 (рантайм-часть, defense-in-depth): VM можно запустить на вручную
+    // собранном байткоде в обход semantic — вызов с аргументом обязан дать
+    // RuntimeError, а не panic и не молчаливое игнорирование.
+    for name in ["read_line", "read_stdin"] {
+        let chunk = Chunk {
+            code: vec![
+                OpCode::PushConst(0),
+                OpCode::Call(name.to_string(), 1),
+                OpCode::Return(true),
+            ],
+            constants: vec![Value::Int(1)],
+        };
+        let program = CompiledProgram {
+            main: chunk,
+            functions: HashMap::new(),
+        };
+        let (mut machine, main) =
+            Vm::new(program, None).expect("байткод должен пройти верификатор");
+        machine.set_stdin(std::io::Cursor::new(b"unused\n".to_vec()));
+        match machine.run(&main) {
+            Err(e) => assert!(
+                e.to_string().contains(&format!("{name}()")),
+                "получено: {e}"
+            ),
+            Ok(v) => panic!(
+                "ожидалась RuntimeError ({name} с аргументом), получено {:?}",
+                v
+            ),
+        }
+    }
+}
+
+#[test]
+fn test_stdin_is_empty_by_default() {
+    // AC-06 (а): `run_source`, `run_source_file` и `RunOptions::new()` —
+    // пустой ввод (программа не читает stdin процесса, пока её не попросили).
+    assert_eq!(run("read_line();").unwrap(), Value::Nil);
+    assert_eq!(run("read_stdin();").unwrap(), string_value(""));
+    assert_eq!(
+        sga::run_source_with_options("read_line();", RunOptions::new()).unwrap(),
+        Value::Nil
+    );
+
+    let dir = temp_test_dir("stdin_default_file");
+    let entry = dir.join("main.sga");
+    write_test_file(&entry, "json_stringify([read_line(), read_stdin()]);");
+    let result = sga::run_source_file(&entry);
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(result.unwrap(), string_value("[null,\"\"]"));
+}
+
+#[test]
+fn test_run_source_file_with_options_passes_stdin_bytes() {
+    // AC-06 (б), файловый вариант запуска.
+    let dir = temp_test_dir("stdin_file_opts");
+    let entry = dir.join("main.sga");
+    write_test_file(&entry, "json_stringify([read_line(), read_stdin()]);");
+    let options = RunOptions::new().with_stdin_bytes("one\ntwo\nthree\n");
+    let result = sga::run_source_file_with_options(&entry, options);
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(
+        result.unwrap(),
+        string_value("[\"one\",\"two\\nthree\\n\"]")
+    );
+}
+
+#[test]
+fn test_stdin_bytes_are_read_from_the_start_by_each_run() {
+    // AC-06 (в): состояние чтения не разделяется между запусками —
+    // `RunOptions` (и его клон) можно переиспользовать.
+    let options = RunOptions::new().with_stdin_bytes("one\ntwo\n");
+    let first = sga::run_source_with_options("read_line(); read_line();", options.clone());
+    let second = sga::run_source_with_options("read_line();", options);
+    assert_eq!(first.unwrap(), string_value("two"));
+    assert_eq!(
+        second.unwrap(),
+        string_value("one"),
+        "второй запуск обязан читать ввод с начала"
+    );
+}
+
+#[test]
+fn test_stdin_source_builder_last_call_wins_and_accepts_common_byte_types() {
+    // Повторный вызов заменяет источник; принимаются &str, String, &[u8],
+    // Vec<u8>, &[u8; N].
+    let options = RunOptions::new()
+        .with_stdin_bytes("first")
+        .with_stdin_bytes("second");
+    assert_eq!(
+        sga::run_source_with_options("read_stdin();", options).unwrap(),
+        string_value("second")
+    );
+
+    let variants = [
+        RunOptions::new().with_stdin_bytes("x"),
+        RunOptions::new().with_stdin_bytes(String::from("x")),
+        RunOptions::new().with_stdin_bytes(&b"x"[..]),
+        RunOptions::new().with_stdin_bytes(vec![b'x']),
+        RunOptions::new().with_stdin_bytes(b"x"),
+    ];
+    for options in variants {
+        assert_eq!(
+            sga::run_source_with_options("read_stdin();", options).unwrap(),
+            string_value("x")
+        );
+    }
+}
+
+#[test]
+fn test_stdin_and_args_options_are_independent() {
+    // Параметры запуска не затирают друг друга, в каком бы порядке ни
+    // задавались.
+    let src = "args()[0] + \":\" + read_line();";
+    let a = RunOptions::new()
+        .with_args(["--flag"])
+        .with_stdin_bytes("text\n");
+    let b = RunOptions::new()
+        .with_stdin_bytes("text\n")
+        .with_args(["--flag"]);
+    assert_eq!(
+        sga::run_source_with_options(src, a).unwrap(),
+        string_value("--flag:text")
+    );
+    assert_eq!(
+        sga::run_source_with_options(src, b).unwrap(),
+        string_value("--flag:text")
+    );
+}
+
+#[test]
+fn test_vm_set_stdin_is_visible_to_read_line_and_vm_new_signature_is_unchanged() {
+    // AC-06 (г): уровень VM без lib.rs — `Vm::set_stdin` между `Vm::new` и
+    // `run`; `Vm::new(program, None)` остаётся прежней сигнатуры.
+    let chunk = Chunk {
+        code: vec![
+            OpCode::Call("read_line".to_string(), 0),
+            OpCode::Return(true),
+        ],
+        constants: vec![],
+    };
+    let program = CompiledProgram {
+        main: chunk,
+        functions: HashMap::new(),
+    };
+    let (mut machine, main) = Vm::new(program, None).expect("байткод должен пройти верификатор");
+    machine.set_stdin(std::io::Cursor::new(b"from vm\nnext\n".to_vec()));
+    assert_eq!(machine.run(&main).unwrap(), string_value("from vm"));
+    // Позиция чтения принадлежит VM: повторный `run` продолжает с того же места.
+    assert_eq!(machine.run(&main).unwrap(), string_value("next"));
+    assert_eq!(machine.run(&main).unwrap(), Value::Nil);
+}
+
+#[test]
+fn test_vm_without_set_stdin_has_empty_input() {
+    let chunk = Chunk {
+        code: vec![
+            OpCode::Call("read_stdin".to_string(), 0),
+            OpCode::Return(true),
+        ],
+        constants: vec![],
+    };
+    let program = CompiledProgram {
+        main: chunk,
+        functions: HashMap::new(),
+    };
+    let (mut machine, main) = Vm::new(program, None).expect("байткод должен пройти верификатор");
+    assert_eq!(machine.run(&main).unwrap(), string_value(""));
+}
+
+#[test]
+fn test_unicode_input_is_read_without_distortion() {
+    // AC-07: кириллица, CJK и эмодзи; len() считает символы, не байты.
+    let text = "привет, 日本語 🦀";
+    assert_eq!(
+        run_with_stdin("read_line();", format!("{text}\n")).unwrap(),
+        string_value(text)
+    );
+    assert_eq!(
+        run_with_stdin("len(read_line());", format!("{text}\r\n")).unwrap(),
+        Value::Int(text.chars().count() as i64)
+    );
+    let two = format!("{text}\n{text}");
+    assert_eq!(
+        run_with_stdin("read_stdin();", two.clone()).unwrap(),
+        string_value(&two)
+    );
+}
+
+#[test]
+fn test_unicode_input_survives_a_reader_with_one_byte_buffer() {
+    // AC-07: граница внутреннего буфера читателя падает ВНУТРЬ каждого
+    // многобайтного символа — строка должна собраться и декодироваться целиком.
+    let text = "привет, 日本語 🦀";
+    let input = format!("{text}\r\n{text}\nхвост");
+    let src = "json_stringify([read_line() == read_line(), read_stdin()]);";
+    let reader = std::io::BufReader::with_capacity(1, std::io::Cursor::new(input.into_bytes()));
+    assert_eq!(
+        run_with_reader(src, reader).unwrap(),
+        string_value("[true,\"хвост\"]")
+    );
+}
+
+#[test]
+fn test_very_long_line_is_read_whole() {
+    // Строка в миллион символов без перевода строки читается целиком и за
+    // линейное время (read_until накапливает байты, а не перечитывает).
+    let long = "я".repeat(1_000_000);
+    assert_eq!(
+        run_with_stdin("len(read_line());", long.clone()).unwrap(),
+        Value::Int(1_000_000)
+    );
+    assert_eq!(
+        run_with_stdin("len(read_stdin());", long).unwrap(),
+        Value::Int(1_000_000)
+    );
+}
+
+#[test]
+fn test_discarded_stdin_calls_still_consume_input() {
+    // AC-09: оптимизатор не удаляет вызов с побочным эффектом, даже если его
+    // результат отброшен (`read_line();`) или присвоен неиспользуемой
+    // переменной.
+    let skip_header = kw_src("read_line(); @LET unused = read_line(); read_line();");
+    assert_eq!(
+        run_with_stdin(&skip_header, "h1\nh2\ndata\n").unwrap(),
+        string_value("data")
+    );
+    assert_eq!(
+        run_with_stdin("read_stdin(); read_line();", "a\nb\n").unwrap(),
+        Value::Nil,
+        "отброшенный read_stdin() обязан исчерпать ввод"
+    );
+}
+
+#[test]
+fn test_stdin_builtins_work_inside_functions_and_closures() {
+    // AC-10: читатель принадлежит VM, а не кадру — доступен в любом.
+    let in_function = kw_src("@FN next() { @RETURN read_line(); } next() + \"/\" + next();");
+    assert_eq!(
+        run_with_stdin(&in_function, "a\nb\n").unwrap(),
+        string_value("a/b")
+    );
+    let in_closure = kw_src(
+        "@LET f = @FN() { @RETURN read_line(); }; \
+         @LET g = @FN() { @RETURN read_stdin(); }; \
+         f() + \"|\" + g();",
+    );
+    assert_eq!(
+        run_with_stdin(&in_closure, "x\ny\nz").unwrap(),
+        string_value("x|y\nz")
+    );
+}
+
+#[test]
+fn test_reading_until_nil_sums_numbers_from_input() {
+    // AC-10: типичная программа — «читать до конца ввода».
+    assert_eq!(
+        run_with_stdin(&sum_lines_src(), "1\r\n2\n3\n40\n").unwrap(),
+        Value::Int(46)
+    );
+    assert_eq!(
+        run_with_stdin(&sum_lines_src(), "").unwrap(),
+        Value::Int(0),
+        "пустой ввод — цикл не выполняется ни разу"
+    );
+}
+
+#[test]
+fn test_reading_many_lines_is_correct() {
+    // 20 000 строк: порядок и полнота (сумма 1..=n), без потерь на границах
+    // внутренних буферов.
+    let n: i64 = 20_000;
+    let input: String = (1..=n).map(|i| format!("{i}\n")).collect();
+    assert_eq!(
+        run_with_stdin(&sum_lines_src(), input).unwrap(),
+        Value::Int(n * (n + 1) / 2)
+    );
+}
+
+#[test]
+fn test_variable_and_parameter_named_like_stdin_builtins_are_unaffected() {
+    // AC-11: имена заняты ТОЛЬКО как имена вызова `read_line(..)` /
+    // `read_stdin(..)`; переменная и параметр с таким именем работают как раньше.
+    let src = kw_src(
+        "@FN count(read_line) { @RETURN len(read_line); } \
+         @LET read_stdin = [1, 2, 3]; \
+         count(read_stdin) + len(read_stdin);",
+    );
+    assert_eq!(run(&src).unwrap(), Value::Int(6));
+}
+
+// ----- Сквозные тесты через НАСТОЯЩИЙ бинарник и pipe (AC-08) -----
+
+/// Ждёт завершения процесса не дольше `limit`. По истечении убивает его и
+/// возвращает `None` — тест должен упасть с понятным сообщением, а не
+/// зависнуть навсегда, если реализация вдруг начнёт ждать EOF.
+fn wait_exit_within(
+    child: &mut std::process::Child,
+    limit: std::time::Duration,
+) -> Option<std::process::ExitStatus> {
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return Some(status);
+        }
+        if started.elapsed() >= limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Запускает `sga run <entry> [args…]`, подаёт `input` в настоящий pipe на
+/// stdin и закрывает его. Запись идёт в отдельном потоке: иначе программа,
+/// печатающая много вывода, и тест, пишущий много ввода, могли бы заблокировать
+/// друг друга (оба pipe ограничены буфером ОС).
+fn cli_run_with_stdin(
+    entry: &std::path::Path,
+    args: &[&str],
+    input: Vec<u8>,
+) -> std::process::Output {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sga"))
+        .arg("run")
+        .arg(entry)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let writer = std::thread::spawn(move || {
+        // Ошибка записи (Broken pipe) допустима: программа могла завершиться,
+        // не дочитав ввод до конца.
+        let _ = stdin.write_all(&input);
+    });
+    let out = child.wait_with_output().unwrap();
+    writer.join().unwrap();
+    out
+}
+
+#[test]
+fn test_cli_run_reads_lines_from_piped_stdin() {
+    // AC-08 (а): построчное чтение из настоящего pipe; пустая строка и \r\n
+    // обрабатываются так же, как в библиотеке; программа видит конец ввода.
+    let dir = temp_test_dir("stdin_cli_lines");
+    let entry = dir.join("main.sga");
+    write_test_file(
+        &entry,
+        &kw_src(
+            "@VAR n = 0; \
+             @WHILE @TRUE { \
+                 @LET line = read_line(); \
+                 @IF line == @NIL { @BREAK; } \
+                 n = n + 1; \
+                 @PRINT(to_string(n) + \": \" + line); \
+             } \
+             @PRINT(\"всего\", n);",
+        ),
+    );
+    let out = cli_run_with_stdin(
+        &entry,
+        &[],
+        "первая\nвторая\r\n\nчетвёртая".as_bytes().to_vec(),
+    );
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        out.status.success(),
+        "stderr = {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1: первая\n2: вторая\n3: \n4: четвёртая\nвсего 4\n"
+    );
+}
+
+#[test]
+fn test_cli_run_read_stdin_gets_whole_input_verbatim() {
+    // read_stdin() через pipe: длина в символах (CRLF не нормализуется).
+    let dir = temp_test_dir("stdin_cli_all");
+    let entry = dir.join("main.sga");
+    write_test_file(
+        &entry,
+        &kw_src("@LET first = read_line(); @PRINT(first); @PRINT(len(read_stdin()));"),
+    );
+    // "привет" + CRLF уходит в read_line(); остаток "мир\r\nещё" = 3+2+3 = 8 символов.
+    let out = cli_run_with_stdin(&entry, &[], "привет\r\nмир\r\nещё".as_bytes().to_vec());
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        out.status.success(),
+        "stderr = {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "привет\n8\n");
+}
+
+#[test]
+fn test_cli_run_reads_large_piped_input_without_deadlock() {
+    // 50 000 строк (≈340 КБ) заведомо больше буфера pipe (64 КиБ): ввод
+    // идёт кусками, программа читает инкрементально, сумма сходится.
+    let n: i64 = 50_000;
+    let input: String = (1..=n).map(|i| format!("{i}\n")).collect();
+    let dir = temp_test_dir("stdin_cli_large");
+    let entry = dir.join("main.sga");
+    write_test_file(
+        &entry,
+        &kw_src(
+            "@VAR total = 0; \
+             @WHILE @TRUE { \
+                 @LET line = read_line(); \
+                 @IF line == @NIL { @BREAK; } \
+                 total = total + to_int(line); \
+             } \
+             @PRINT(total);",
+        ),
+    );
+    let out = cli_run_with_stdin(&entry, &[], input.into_bytes());
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        out.status.success(),
+        "stderr = {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        (n * (n + 1) / 2).to_string()
+    );
+}
+
+#[test]
+fn test_cli_run_read_line_does_not_wait_for_eof_on_open_pipe() {
+    // AC-08 (б): read_line() потребляет ОДНУ строку и возвращается. В pipe
+    // записана одна строка, но он НЕ закрыт: реализация, ждущая EOF (или
+    // зачитывающая весь stdin заранее), здесь зависла бы — тест убьёт её по
+    // тайм-ауту и упадёт с понятным сообщением.
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let dir = temp_test_dir("stdin_cli_lazy");
+    let entry = dir.join("main.sga");
+    write_test_file(&entry, &kw_src("@PRINT(\"got:\", read_line());"));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sga"))
+        .arg("run")
+        .arg(&entry)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all("первая\n".as_bytes()).unwrap();
+    stdin.flush().unwrap();
+    let status = wait_exit_within(&mut child, std::time::Duration::from_secs(20));
+    drop(stdin); // pipe закрывается только ПОСЛЕ проверки
+    std::fs::remove_dir_all(&dir).ok();
+    let status = status.expect(
+        "sga не завершился за 20 с при открытом pipe: read_line() ждёт EOF вместо одной строки",
+    );
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        status.success(),
+        "stderr = {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "got: первая");
+}
+
+#[test]
+fn test_cli_run_program_that_does_not_read_stdin_does_not_block_on_open_pipe() {
+    // AC-08 (в): stdin процесса не трогается, пока программа сама не вызовет
+    // read_line()/read_stdin(). Pipe открыт и пуст — программа обязана
+    // завершиться, а не ждать ввода.
+    use std::process::{Command, Stdio};
+    let dir = temp_test_dir("stdin_cli_untouched");
+    let entry = dir.join("main.sga");
+    write_test_file(&entry, &kw_src("@PRINT(\"ok\");"));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sga"))
+        .arg("run")
+        .arg(&entry)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.take().unwrap(); // держим открытым, ничего не пишем
+    let status = wait_exit_within(&mut child, std::time::Duration::from_secs(20));
+    drop(stdin);
+    std::fs::remove_dir_all(&dir).ok();
+    let status = status.expect(
+        "sga не завершился за 20 с: программа, не читающая stdin, ждёт ввода (stdin читается заранее?)",
+    );
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        status.success(),
+        "stderr = {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
+}
+
+#[test]
+fn test_cli_run_invalid_utf8_on_stdin_is_clear_error_not_panic() {
+    // AC-08 (г): первая строка валидна и печатается; вторая — нет: сообщение
+    // про UTF-8, обычный код неуспеха 1 (не 101 от panic).
+    let dir = temp_test_dir("stdin_cli_bad_utf8");
+    let entry = dir.join("main.sga");
+    write_test_file(
+        &entry,
+        &kw_src("@PRINT(read_line()); @PRINT(read_line()); @PRINT(\"недостижимо\");"),
+    );
+    let out = cli_run_with_stdin(&entry, &[], b"ok\n\xff\xfe\n".to_vec());
+    std::fs::remove_dir_all(&dir).ok();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr = {stderr}");
+    assert!(stderr.contains("read_line()"), "получено: {stderr}");
+    assert!(stderr.contains("UTF-8"), "получено: {stderr}");
+    assert!(!stderr.contains("panicked"), "получено: {stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+#[test]
+fn test_cli_run_with_null_or_empty_stdin_is_eof() {
+    // AC-08 (д): нулевое устройство и сразу закрытый pipe — это EOF, а не
+    // ошибка и не зависание.
+    use std::process::{Command, Stdio};
+    let dir = temp_test_dir("stdin_cli_eof");
+    let entry = dir.join("main.sga");
+    write_test_file(
+        &entry,
+        &kw_src("@PRINT(read_line()); @PRINT(len(read_stdin()));"),
+    );
+
+    let null_stdin = Command::new(env!("CARGO_BIN_EXE_sga"))
+        .arg("run")
+        .arg(&entry)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let empty_pipe = cli_run_with_stdin(&entry, &[], Vec::new());
+    std::fs::remove_dir_all(&dir).ok();
+
+    for (label, out) in [("null", null_stdin), ("empty pipe", empty_pipe)] {
+        assert!(
+            out.status.success(),
+            "{label}: stderr = {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "nil\n0\n",
+            "{label}: EOF"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_cli_run_with_closed_stdin_descriptor_is_eof() {
+    // AC-08 (д), unix: `<&-` закрывает дескриптор 0 совсем (не /dev/null).
+    // Стандартная библиотека Rust трактует EBADF на stdin как EOF — программа
+    // не должна падать.
+    let dir = temp_test_dir("stdin_cli_closed_fd");
+    let entry = dir.join("main.sga");
+    write_test_file(&entry, &kw_src("@PRINT(read_line());"));
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("exec \"$0\" run \"$1\" <&-")
+        .arg(env!("CARGO_BIN_EXE_sga"))
+        .arg(&entry)
+        .output()
+        .unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        out.status.success(),
+        "stderr = {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "nil\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_cli_run_stdin_io_error_is_runtime_error_not_panic() {
+    // Настоящая ошибка ввода-вывода читателя: stdin — каталог, read(2) даёт
+    // EISDIR. Ожидаем RuntimeError (код 1, сообщение про stdin), а не panic.
+    use std::process::{Command, Stdio};
+    let dir = temp_test_dir("stdin_cli_io_error");
+    let entry = dir.join("main.sga");
+    write_test_file(&entry, &kw_src("@PRINT(read_line());"));
+    let stdin_dir = std::fs::File::open(&dir).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_sga"))
+        .arg("run")
+        .arg(&entry)
+        .stdin(Stdio::from(stdin_dir))
+        .output()
+        .unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr = {stderr}");
+    assert!(stderr.contains("read_line()"), "получено: {stderr}");
+    assert!(stderr.contains("stdin"), "получено: {stderr}");
+    assert!(!stderr.contains("panicked"), "получено: {stderr}");
+}
+
+#[test]
+fn test_cli_run_passes_both_arguments_and_stdin() {
+    // args() (T012) и stdin (T013) работают вместе; аргументы после файла
+    // по-прежнему дословные, ввод идёт из pipe.
+    let dir = temp_test_dir("stdin_cli_args");
+    let entry = dir.join("main.sga");
+    write_test_file(&entry, &kw_src("@PRINT(args()[0], read_line());"));
+    let out = cli_run_with_stdin(&entry, &["--flag"], b"text\n".to_vec());
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        out.status.success(),
+        "stderr = {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "--flag text\n");
 }
