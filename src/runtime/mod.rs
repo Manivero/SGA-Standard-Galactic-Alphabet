@@ -329,6 +329,18 @@ pub fn is_builtin(name: &str) -> bool {
             // самого ввода — src/stdin.rs.
             | "read_line"
             | "read_stdin"
+            // T014 (M006): time_now_ms / time_monotonic_ms. Первая не
+            // требует состояния VM и реализована ниже, в call_builtin;
+            // вторая отсчитывает время от создания VM (Vm::started),
+            // поэтому перехватывается в Vm::call(). Чистые функции над
+            // инъектируемыми значениями времени — src/clock.rs.
+            | "time_now_ms"
+            | "time_monotonic_ms"
+            // T015 (M006): write_file — по той же причине, что read_file:
+            // нужны разрешение на запись (Vm::set_allow_write) и корень
+            // песочницы (Vm::sandbox_root). См. src/vm/mod.rs::call_write_file;
+            // проверка пути и сама запись — src/fs_sandbox.rs.
+            | "write_file"
     )
 }
 
@@ -666,20 +678,41 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> {
             None => Err("json_parse() ожидает 1 аргумент, передано 0".to_string()),
         },
 
-        // T009 (M003): read_file, T012 (M006): args и T013 (M006): read_line,
-        // read_stdin НЕ реализованы здесь — перехватываются раньше, в
+        // ── std/time (T014, M006) ───────────────────────────────────────
+        // Календарное время: миллисекунды с 1970-01-01T00:00:00Z по
+        // системным часам. Состояния VM не требует, поэтому реализовано
+        // здесь (в отличие от time_monotonic_ms — см. ветку unreachable!
+        // ниже). Проверка арности — defense-in-depth: статически её делает
+        // semantic::builtin_arity, а VM можно запустить на вручную
+        // собранном байткоде.
+        "time_now_ms" => {
+            if !args.is_empty() {
+                return Err(format!(
+                    "time_now_ms() не принимает аргументов, передано {}",
+                    args.len()
+                ));
+            }
+            crate::clock::unix_millis(std::time::SystemTime::now()).map(Value::Int)
+        }
+
+        // T009 (M003): read_file, T012 (M006): args, T013 (M006): read_line,
+        // read_stdin, T014 (M006): time_monotonic_ms и T015 (M006):
+        // write_file НЕ реализованы здесь — перехватываются раньше, в
         // Vm::call(), т.к. им нужно состояние VM (Vm::sandbox_root,
-        // Vm::args, Vm::stdin; см. is_builtin выше).
+        // Vm::args, Vm::stdin, Vm::started, Vm::allow_write; см. is_builtin
+        // выше).
         // Достижение этой ветки означает, что перехват в Vm::call() был
         // обойдён или удалён — явная паника с понятным сообщением лучше
         // молчаливого "неизвестная функция" ниже, которое ввело бы в
         // заблуждение (это известные builtin'ы, просто реализованные в
         // другом месте).
-        "read_file" | "args" | "read_line" | "read_stdin" => unreachable!(
-            "call_builtin(\"{}\", ...) не должен вызываться напрямую — \
-             ожидался перехват в Vm::call() (см. src/vm/mod.rs)",
-            name
-        ),
+        "read_file" | "args" | "read_line" | "read_stdin" | "time_monotonic_ms" | "write_file" => {
+            unreachable!(
+                "call_builtin(\"{}\", ...) не должен вызываться напрямую — \
+                 ожидался перехват в Vm::call() (см. src/vm/mod.rs)",
+                name
+            )
+        }
 
         _ => Err(format!("неизвестная встроенная функция '{}'", name)),
     }

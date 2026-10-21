@@ -3754,3 +3754,1539 @@ fn test_cli_run_passes_both_arguments_and_stdin() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "--flag text\n");
 }
+
+// ===== std/time: time_now_ms() / time_monotonic_ms() (T014, M006) =====
+//
+// `time_now_ms()` — миллисекунды с 1970-01-01T00:00:00Z по системным часам;
+// `time_monotonic_ms()` — миллисекунды от создания VM по монотонным часам.
+// Время недетерминировано, поэтому тесты проверяют СВОЙСТВА, а не точные
+// значения:
+// - `time_now_ms()` берётся в СКОБКУ из двух показаний системных часов, снятых
+//   самим тестом до и после запуска (допущение, присущее любому тесту
+//   календарного времени: часы не переводят прямо во время теста);
+// - `time_monotonic_ms()` сравнивается с `Instant` теста: значение не меньше 0 и
+//   не больше времени, реально прошедшего с запуска (строгая верхняя граница, без
+//   допуска); нижнюю границу задаёт `thread::sleep` (он не спит меньше заданного);
+// - программы с активным ожиданием по часам запускаются так, чтобы остановившиеся
+//   часы давали упавший тест, а не повисший набор (поток с таймаутом /
+//   `wait_exit_within`).
+// Чистая арифметика (эпоха Unix, округление вниз, предел `int`) покрыта
+// юнит-тестами в `src/clock.rs`.
+
+/// Миллисекунды с эпохи Unix по «сырым» показаниям системных часов —
+/// независимо от реализации `time_now_ms` (для скобки до/после запуска).
+fn system_millis() -> i64 {
+    let since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("системные часы должны показывать время после 1970-01-01");
+    i64::try_from(since_epoch.as_millis()).expect("время помещается в i64")
+}
+
+/// Целые миллисекунды, прошедшие с `since` по монотонным часам теста.
+fn millis_since(since: std::time::Instant) -> i64 {
+    i64::try_from(since.elapsed().as_millis()).expect("время помещается в i64")
+}
+
+fn expect_int(value: Value) -> i64 {
+    match value {
+        Value::Int(n) => n,
+        other => panic!("ожидался int, получено {:?}", other),
+    }
+}
+
+/// Запускает программу и проверяет, что её значение — `int` из скобки двух
+/// показаний системных часов, снятых до и после запуска.
+fn assert_program_yields_unix_millis_between_readings(source: &str) {
+    let before = system_millis();
+    let value = expect_int(run(source).unwrap());
+    let after = system_millis();
+    assert!(
+        (before..=after).contains(&value),
+        "{before} <= {value} <= {after} не выполнено для программы {source:?}"
+    );
+}
+
+/// Текст -> токены -> AST -> байткод (без semantic): путь, на котором `Vm`
+/// можно держать в руках между созданием и запуском.
+fn compile_source(source: &str) -> CompiledProgram {
+    let tokens = lexer::Lexer::new(source)
+        .tokenize()
+        .unwrap_or_else(|e| panic!("лексер: {e}"));
+    let program = parser::Parser::new(tokens)
+        .parse_program()
+        .unwrap_or_else(|e| panic!("парсер: {e}"));
+    codegen::compile(&program)
+}
+
+/// Запускает программу в отдельном потоке и ждёт её значение-`int` не дольше
+/// `limit`. Нужен программам с активным ожиданием по часам: если часы встанут,
+/// цикл не завершится никогда, и тест должен упасть с понятным сообщением, а не
+/// повесить весь набор. `Value` содержит `Rc` и через границу потока не
+/// пересылается — наружу уходит извлечённый `i64`.
+fn run_int_with_timeout(source: String, limit: std::time::Duration) -> i64 {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let outcome = match sga::run_source(&source) {
+            Ok(Value::Int(n)) => Ok(n),
+            other => Err(format!("{:?}", other)),
+        };
+        let _ = sender.send(outcome);
+    });
+    match receiver.recv_timeout(limit) {
+        Ok(Ok(n)) => n,
+        Ok(Err(found)) => panic!("программа не вернула int: {found}"),
+        Err(_) => {
+            panic!("программа не завершилась за {limit:?}: часы стоят (или идут слишком медленно)?")
+        }
+    }
+}
+
+#[test]
+fn test_time_now_ms_is_an_int_between_system_clock_readings() {
+    // AC-01.
+    assert_program_yields_unix_millis_between_readings("time_now_ms();");
+}
+
+#[test]
+fn test_time_now_ms_in_function_closure_and_expression_is_between_system_clock_readings() {
+    // AC-01: вызов внутри функции, замыкания и выражения.
+    assert_program_yields_unix_millis_between_readings(&kw_src(
+        "@FN stamp() { @RETURN time_now_ms(); } stamp();",
+    ));
+    assert_program_yields_unix_millis_between_readings(&kw_src(
+        "@LET f = @FN() { @RETURN time_now_ms(); }; f();",
+    ));
+    assert_program_yields_unix_millis_between_readings("time_now_ms() + 0;");
+}
+
+#[test]
+fn test_time_builtins_return_int() {
+    // AC-01/AC-02: тип результата — int (целые миллисекунды), не float.
+    for call in ["time_now_ms", "time_monotonic_ms"] {
+        assert_eq!(
+            run(&format!("type_of({call}());")).unwrap(),
+            Value::Str("int".to_string()),
+            "{call}()"
+        );
+    }
+}
+
+#[test]
+fn test_time_monotonic_ms_starts_near_zero_and_never_exceeds_elapsed_time() {
+    // AC-02: 0 <= v <= время, реально прошедшее с запуска. Верхняя граница
+    // строгая, без допуска: `Instant` теста снят ДО создания VM, а показание —
+    // внутри запуска, раньше, чем `elapsed()` после него. Сразу после старта
+    // значение мало (запас на нагруженную машину — минута).
+    let started = std::time::Instant::now();
+    let value = expect_int(run("time_monotonic_ms();").unwrap());
+    let elapsed = millis_since(started);
+    assert!(
+        (0..=elapsed).contains(&value),
+        "0 <= {value} <= {elapsed} не выполнено"
+    );
+    assert!(
+        value < 60_000,
+        "первый вызов сразу после старта: {value} мс"
+    );
+}
+
+#[test]
+fn test_time_monotonic_ms_in_function_and_closure_stays_within_elapsed_time() {
+    // AC-02: тот же контракт при вызове внутри функции и замыкания.
+    for src in [
+        kw_src("@FN elapsed() { @RETURN time_monotonic_ms(); } elapsed();"),
+        kw_src("@LET g = @FN() { @RETURN time_monotonic_ms(); }; g();"),
+    ] {
+        let started = std::time::Instant::now();
+        let value = expect_int(run(&src).unwrap());
+        let elapsed = millis_since(started);
+        assert!(
+            (0..=elapsed).contains(&value),
+            "0 <= {value} <= {elapsed} не выполнено"
+        );
+    }
+}
+
+#[test]
+fn test_time_monotonic_ms_is_non_decreasing_over_10000_calls() {
+    // AC-03: монотонность — считаем нарушения порядка между соседними
+    // показаниями; ожидаем ровно 0.
+    let src = kw_src(
+        "@VAR previous = time_monotonic_ms(); \
+         @VAR violations = 0; \
+         @VAR i = 0; \
+         @WHILE i < 10000 { \
+             @LET current = time_monotonic_ms(); \
+             @IF current < previous { violations = violations + 1; } \
+             previous = current; \
+             i = i + 1; \
+         } \
+         violations;",
+    );
+    assert_eq!(run(&src).unwrap(), Value::Int(0));
+}
+
+#[test]
+fn test_time_monotonic_ms_busy_wait_advances_with_real_time() {
+    // AC-03: ждём по часам, пока они не уйдут на 25 мс вперёд. Цикл завершается
+    // только если часы реально идут (константа или остановленные часы -> таймаут
+    // потока), а разность не может превысить время, реально прошедшее с запуска
+    // (часы не идут быстрее реальных; верхняя граница — `floor(t1) <= elapsed`,
+    // т.к. t0 >= 0). Заодно подтверждает, что оптимизатор не свернул вызовы в
+    // константу и не выкинул их из условия цикла.
+    let src = kw_src(
+        "@LET t0 = time_monotonic_ms(); \
+         @VAR t1 = t0; \
+         @WHILE t1 - t0 < 25 { t1 = time_monotonic_ms(); } \
+         t1 - t0;",
+    );
+    let started = std::time::Instant::now();
+    let diff = run_int_with_timeout(src, std::time::Duration::from_secs(30));
+    let elapsed = millis_since(started);
+    assert!(
+        (25..=elapsed).contains(&diff),
+        "25 <= {diff} <= {elapsed} не выполнено"
+    );
+}
+
+#[test]
+fn test_time_builtins_with_arguments_are_semantic_errors() {
+    // AC-04 (статическая часть): арность (0, 0) проверяется до исполнения.
+    for (call, quoted_name) in [
+        ("time_now_ms(1);", "'time_now_ms'"),
+        ("time_monotonic_ms(\"x\");", "'time_monotonic_ms'"),
+    ] {
+        match run(call) {
+            Err(SgaError::Semantic(msg)) => {
+                assert!(msg.contains(quoted_name), "получено: {msg}");
+                assert!(msg.contains("ожидает 0"), "получено: {msg}");
+            }
+            other => panic!("ожидалась SemError для {call}, получено {:?}", other),
+        }
+    }
+}
+
+#[test]
+fn test_vm_time_calls_with_arguments_via_handbuilt_bytecode_are_runtime_errors() {
+    // AC-04 (рантайм-часть, defense-in-depth): VM можно запустить на вручную
+    // собранном байткоде в обход semantic — вызов с аргументом обязан дать
+    // RuntimeError, а не panic и не молчаливое игнорирование.
+    for name in ["time_now_ms", "time_monotonic_ms"] {
+        let chunk = Chunk {
+            code: vec![
+                OpCode::PushConst(0),
+                OpCode::Call(name.to_string(), 1),
+                OpCode::Return(true),
+            ],
+            constants: vec![Value::Int(1)],
+        };
+        let program = CompiledProgram {
+            main: chunk,
+            functions: HashMap::new(),
+        };
+        let (mut machine, main) =
+            Vm::new(program, None).expect("байткод должен пройти верификатор");
+        match machine.run(&main) {
+            Err(e) => assert!(
+                e.to_string().contains(&format!("{name}()")),
+                "получено: {e}"
+            ),
+            Ok(v) => panic!(
+                "ожидалась RuntimeError ({name} с аргументом), получено {:?}",
+                v
+            ),
+        }
+    }
+}
+
+#[test]
+fn test_time_monotonic_ms_counts_from_vm_creation() {
+    // AC-06 (а): отсчёт — от `Vm::new`, а не от первого вызова: пауза между
+    // созданием VM и запуском обязана быть видна уже в первом показании.
+    // `thread::sleep` не спит меньше заданного, значит, значение >= 30.
+    let created = std::time::Instant::now();
+    let (mut machine, main) =
+        Vm::new(compile_source("time_monotonic_ms();"), None).expect("байткод валиден");
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let value = expect_int(machine.run(&main).unwrap());
+    let elapsed = millis_since(created);
+    assert!(
+        (30..=elapsed).contains(&value),
+        "30 <= {value} <= {elapsed} не выполнено"
+    );
+}
+
+#[test]
+fn test_time_monotonic_ms_is_not_reset_by_a_second_run_on_the_same_vm() {
+    // AC-06 (б): повторный `run` на той же VM продолжает отсчёт, а не
+    // начинает его заново (иначе второе показание было бы около 0).
+    let (mut machine, main) =
+        Vm::new(compile_source("time_monotonic_ms();"), None).expect("байткод валиден");
+    let first = expect_int(machine.run(&main).unwrap());
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let second = expect_int(machine.run(&main).unwrap());
+    assert!(
+        first + 20 <= second,
+        "{first} + 20 <= {second}: второй запуск не должен обнулять отсчёт"
+    );
+}
+
+#[test]
+fn test_discarded_time_calls_are_harmless() {
+    // Результат, который никуда не записан, не ломает программу и не оставляет
+    // мусор на стеке: значение последнего выражения — по-прежнему 7.
+    assert_eq!(
+        run("time_now_ms(); time_monotonic_ms(); 7;").unwrap(),
+        Value::Int(7)
+    );
+}
+
+#[test]
+fn test_time_builtins_work_with_int_annotations_and_arithmetic() {
+    // Результат — настоящий int: проходит аннотацию `: int` и участвует в
+    // арифметике и сравнениях.
+    // (`@AND` — ключевое слово AND; `kw_src` его не знает, подставляем сами.)
+    let src = kw_src(
+        "@LET t0: int = time_monotonic_ms(); \
+         @LET stamp: int = time_now_ms(); \
+         @LET t1: int = time_monotonic_ms(); \
+         @LET delta: int = t1 - t0; \
+         delta >= 0 @AND stamp > 0;",
+    )
+    .replace("@AND", &kw("AND"));
+    assert_eq!(run(&src).unwrap(), Value::Bool(true));
+}
+
+#[test]
+fn test_variable_named_like_a_time_builtin_is_unaffected() {
+    // AC-08: имена заняты ТОЛЬКО как имена вызова `time_now_ms(..)` /
+    // `time_monotonic_ms(..)`; переменная с таким именем работает как раньше.
+    let src = kw_src("@LET time_now_ms = 5; @VAR time_monotonic_ms = 1; time_monotonic_ms = time_monotonic_ms + time_now_ms; time_monotonic_ms;");
+    assert_eq!(run(&src).unwrap(), Value::Int(6));
+}
+
+#[test]
+fn test_parameter_named_like_a_time_builtin_is_unaffected() {
+    // AC-08: то же для параметра функции.
+    let src = kw_src(
+        "@FN keep(time_now_ms, time_monotonic_ms) { @RETURN time_now_ms + time_monotonic_ms; } \
+         keep(40, 2);",
+    );
+    assert_eq!(run(&src).unwrap(), Value::Int(42));
+}
+
+// ----- Сквозные тесты через НАСТОЯЩИЙ бинарник (AC-07) -----
+
+/// Запускает `sga run <entry>` с пустым stdin и возвращает весь вывод.
+fn cli_run_plain(entry: &std::path::Path) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_sga"))
+        .arg("run")
+        .arg(entry)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap()
+}
+
+/// Разбирает вывод программы, напечатавшей ровно одно целое число.
+fn printed_int(out: &std::process::Output) -> i64 {
+    assert!(
+        out.status.success(),
+        "stderr = {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.trim_end_matches('\n')
+        .parse::<i64>()
+        .unwrap_or_else(|e| panic!("stdout — не одно целое число ({e}): {text:?}"))
+}
+
+#[test]
+fn test_cli_run_prints_time_now_ms_between_system_clock_readings() {
+    // AC-07 (а): скобка по системным часам, снятая ВОКРУГ процесса — до запуска
+    // и после завершения.
+    let dir = temp_test_dir("time_cli_now");
+    let entry = dir.join("main.sga");
+    write_test_file(&entry, &kw_src("@PRINT(time_now_ms());"));
+    let before = system_millis();
+    let out = cli_run_plain(&entry);
+    let after = system_millis();
+    std::fs::remove_dir_all(&dir).ok();
+    let value = printed_int(&out);
+    assert!(
+        (before..=after).contains(&value),
+        "{before} <= {value} <= {after} не выполнено"
+    );
+}
+
+#[test]
+fn test_cli_run_time_monotonic_ms_does_not_exceed_the_process_lifetime() {
+    // AC-07 (б): 0 <= v <= время жизни процесса (от spawn до выхода, по
+    // `Instant` теста).
+    let dir = temp_test_dir("time_cli_monotonic");
+    let entry = dir.join("main.sga");
+    write_test_file(&entry, &kw_src("@PRINT(time_monotonic_ms());"));
+    let started = std::time::Instant::now();
+    let out = cli_run_plain(&entry);
+    let elapsed = millis_since(started);
+    std::fs::remove_dir_all(&dir).ok();
+    let value = printed_int(&out);
+    assert!(
+        (0..=elapsed).contains(&value),
+        "0 <= {value} <= {elapsed} не выполнено"
+    );
+}
+
+#[test]
+fn test_cli_run_time_monotonic_ms_measures_an_interval_around_a_busy_wait() {
+    // AC-07 (в): разность двух замеров вокруг активного ожидания печатается,
+    // не меньше 25 и не больше времени жизни процесса. Процесс ждётся через
+    // `wait_exit_within`: остановившиеся часы дадут упавший тест, а не зависший.
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let dir = temp_test_dir("time_cli_interval");
+    let entry = dir.join("main.sga");
+    write_test_file(
+        &entry,
+        &kw_src(
+            "@LET t0 = time_monotonic_ms(); \
+             @VAR t1 = t0; \
+             @WHILE t1 - t0 < 25 { t1 = time_monotonic_ms(); } \
+             @PRINT(t1 - t0);",
+        ),
+    );
+    let started = std::time::Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sga"))
+        .arg("run")
+        .arg(&entry)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let status = wait_exit_within(&mut child, std::time::Duration::from_secs(30));
+    let elapsed = millis_since(started);
+    std::fs::remove_dir_all(&dir).ok();
+    let status = status.expect("процесс не завершился за 30 с: часы стоят?");
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(status.success(), "stderr = {stderr}");
+    let diff: i64 = stdout
+        .trim_end_matches('\n')
+        .parse()
+        .unwrap_or_else(|e| panic!("stdout — не одно целое число ({e}): {stdout:?}"));
+    assert!(
+        (25..=elapsed).contains(&diff),
+        "25 <= {diff} <= {elapsed} не выполнено"
+    );
+}
+
+// ===== T015 (M006): write_file(path, content) — запись файлов с явным разрешением =====
+//
+// Feature Contract — PROJECT_STATUS.md (T015). `write_file` — единственный
+// builtin, меняющий файловую систему, поэтому по умолчанию запись ЗАПРЕЩЕНА:
+// её разрешает только `sga run --allow-write` (в библиотеке —
+// `RunOptions::with_allow_write`). Путь — относительный, строго внутри
+// каталога входного файла (тот же корень, что у IMPORT и read_file).
+//
+// Сама проверка пути живёт в src/fs_sandbox.rs (там свои юнит-тесты); здесь —
+// сквозные тесты: библиотека (`run_source_file_with_options`), вручную
+// собранный байткод и НАСТОЯЩИЙ бинарник `sga`. Всё — на реальных каталогах
+// диска; каждый тест получает свой временный каталог, который удаляется при
+// выходе из теста (`WfDir`), в том числе при падении assert'а.
+//
+// Блок включает и регрессионные тесты ошибки, найденной при аудите T015:
+// при запуске `sga run main.sga` (имя файла без каталога) корень песочницы был
+// ПУСТЫМ, и `read_file("../x")`, `IMPORT "../x.sga"` выходили за каталог
+// программы. Эти тесты запускают бинарник с `current_dir`, потому что
+// относительный путь входного файла нельзя проверить из процесса теста, не
+// меняя его общий текущий каталог.
+
+/// Временный каталог теста (через `temp_test_dir`), удаляемый при выходе —
+/// в том числе при панике assert'а.
+struct WfDir(std::path::PathBuf);
+
+impl WfDir {
+    fn new(name: &str) -> Self {
+        WfDir(temp_test_dir(name))
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+
+    fn join(&self, relative: &str) -> std::path::PathBuf {
+        self.0.join(relative)
+    }
+}
+
+impl Drop for WfDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Раскладка «проект внутри внешнего каталога»: `outer/proj/` — корень
+/// песочницы (там лежит `main.sga`), `outer/` — то, что снаружи корня.
+fn wf_outer_and_proj(name: &str) -> (WfDir, std::path::PathBuf) {
+    let outer = WfDir::new(name);
+    let proj = outer.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    (outer, proj)
+}
+
+/// Строковый литерал SGA с текстом `text` (экранируются `\` и `"`).
+fn sga_lit(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Исходник `write_file(path, content);` с литералами.
+fn wf_write_src(path: &str, content: &str) -> String {
+    format!("write_file({}, {});", sga_lit(path), sga_lit(content))
+}
+
+/// Исходник `PRINT(read_file(path));`.
+fn wf_print_read_src(path: &str) -> String {
+    format!("{}(read_file({}));", kw("PRINT"), sga_lit(path))
+}
+
+/// Пишет `source` в `main.sga` каталога `dir` и запускает его как входной файл
+/// с разрешением на запись `allow_write`.
+fn wf_run(dir: &std::path::Path, source: &str, allow_write: bool) -> Result<Value, SgaError> {
+    let entry = dir.join("main.sga");
+    write_test_file(&entry, source);
+    sga::run_source_file_with_options(&entry, RunOptions::new().with_allow_write(allow_write))
+}
+
+/// Ожидает RuntimeError и возвращает его текст.
+fn wf_expect_runtime_error(result: Result<Value, SgaError>) -> String {
+    match result {
+        Err(SgaError::Runtime(msg)) => msg,
+        other => panic!("ожидалась RuntimeError, получено {:?}", other),
+    }
+}
+
+/// Имена записей каталога `dir`, отсортированные.
+fn wf_listing(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+fn wf_read(path: &std::path::Path) -> String {
+    std::fs::read_to_string(path).unwrap()
+}
+
+/// Запускает настоящий бинарник: `sga run <run_args…>` с пустым stdin;
+/// `cwd` — текущий каталог процесса (если задан).
+fn wf_cli(cwd: Option<&std::path::Path>, run_args: &[&str]) -> std::process::Output {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_sga"));
+    command
+        .arg("run")
+        .args(run_args)
+        .stdin(std::process::Stdio::null());
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    command.output().unwrap()
+}
+
+fn wf_stdout(out: &std::process::Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn wf_stderr(out: &std::process::Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+fn wf_path_str(path: &std::path::Path) -> &str {
+    path.to_str().expect("путь теста должен быть UTF-8")
+}
+
+// ----- AC-01: без разрешения запись невозможна -----
+
+#[test]
+fn test_write_file_is_forbidden_by_default_and_names_both_ways_to_allow_it() {
+    // AC-01: RuntimeError, объясняющая, как выдать разрешение (CLI и
+    // библиотека); файл не создаётся.
+    let dir = WfDir::new("wf_default_forbidden");
+    let entry = dir.join("main.sga");
+    write_test_file(&entry, &wf_write_src("out.txt", "x"));
+    let msg = wf_expect_runtime_error(sga::run_source_file(&entry));
+    assert!(msg.contains("--allow-write"), "получено: {msg}");
+    assert!(msg.contains("with_allow_write"), "получено: {msg}");
+    assert!(msg.contains("запрещена"), "получено: {msg}");
+    assert_eq!(wf_listing(dir.path()), vec!["main.sga"]);
+}
+
+#[test]
+fn test_write_file_explicit_false_forbids_and_the_last_builder_call_wins() {
+    // AC-01: `with_allow_write(false)` — тоже запрет; при нескольких вызовах
+    // побеждает последний.
+    let dir = WfDir::new("wf_false_wins");
+    let entry = dir.join("main.sga");
+    write_test_file(&entry, &wf_write_src("out.txt", "x"));
+    for options in [
+        RunOptions::new().with_allow_write(false),
+        RunOptions::new()
+            .with_allow_write(true)
+            .with_allow_write(false),
+    ] {
+        let msg = wf_expect_runtime_error(sga::run_source_file_with_options(&entry, options));
+        assert!(msg.contains("запрещена"), "получено: {msg}");
+    }
+    assert_eq!(wf_listing(dir.path()), vec!["main.sga"]);
+    sga::run_source_file_with_options(
+        &entry,
+        RunOptions::new()
+            .with_allow_write(false)
+            .with_allow_write(true),
+    )
+    .unwrap();
+    assert_eq!(wf_read(&dir.join("out.txt")), "x");
+}
+
+#[test]
+fn test_write_file_without_permission_leaves_an_existing_file_untouched() {
+    // AC-01: запрещена и перезапись, не только создание.
+    let dir = WfDir::new("wf_no_overwrite");
+    std::fs::write(dir.join("out.txt"), "old content").unwrap();
+    let entry = dir.join("main.sga");
+    write_test_file(&entry, &wf_write_src("out.txt", "new"));
+    assert!(sga::run_source_file(&entry).is_err());
+    assert_eq!(wf_read(&dir.join("out.txt")), "old content");
+}
+
+#[test]
+fn test_write_file_permission_check_comes_before_any_path_check() {
+    // AC-01: без разрешения ответ не зависит от пути — по тексту ошибки
+    // программа не может выяснить, что лежит на диске (есть ли каталог, выходит
+    // ли путь за корень, что за цель).
+    let (outer, proj) = wf_outer_and_proj("wf_permission_first");
+    std::fs::create_dir(outer.join("existing_dir")).unwrap();
+    let absolute = outer.join("abs.txt");
+    let paths = [
+        "out.txt",
+        "../outside.txt",
+        "../existing_dir/x.txt",
+        "no_such_dir/x.txt",
+        wf_path_str(&absolute),
+        "",
+        "sub/",
+    ];
+    for path in paths {
+        let msg = wf_expect_runtime_error(wf_run(&proj, &wf_write_src(path, "x"), false));
+        assert!(
+            msg.contains("запрещена") && msg.contains("--allow-write"),
+            "{path:?}: {msg}"
+        );
+        for leak in [
+            "выходит за пределы",
+            "не существует",
+            "абсолютные пути",
+            "не является",
+            "путь пуст",
+            "каталог",
+        ] {
+            assert!(
+                !msg.contains(leak),
+                "{path:?}: сообщение без разрешения раскрывает проверку пути ({leak}): {msg}"
+            );
+        }
+    }
+    assert_eq!(wf_listing(&proj), vec!["main.sga"]);
+    assert_eq!(wf_listing(outer.path()), vec!["existing_dir", "proj"]);
+}
+
+// ----- AC-02: с разрешением запись создаёт и перезаписывает файл целиком -----
+
+#[test]
+fn test_write_file_creates_a_file_with_the_exact_content_and_returns_nil() {
+    // AC-02
+    let dir = WfDir::new("wf_create");
+    let src = kw_src("@LET result = write_file(\"out.txt\", \"hello\"); result;");
+    assert_eq!(wf_run(dir.path(), &src, true).unwrap(), Value::Nil);
+    assert_eq!(std::fs::read(dir.join("out.txt")).unwrap(), b"hello");
+}
+
+#[test]
+fn test_write_file_overwrites_the_whole_file_and_leaves_no_tail() {
+    // AC-02: более короткое содержимое не оставляет «хвоста» старого.
+    let dir = WfDir::new("wf_overwrite");
+    std::fs::write(
+        dir.join("out.txt"),
+        "a very long previous content that must vanish completely",
+    )
+    .unwrap();
+    wf_run(dir.path(), &wf_write_src("out.txt", "short"), true).unwrap();
+    assert_eq!(std::fs::read(dir.join("out.txt")).unwrap(), b"short");
+}
+
+#[test]
+fn test_write_file_writes_bytes_verbatim_and_adds_no_newline() {
+    // AC-02: байты строки UTF-8 — дословно; escape-последовательности SGA
+    // (`\n`, `\t`, `\"`, `\\`) превращаются в обычные символы, ничего не
+    // дописывается.
+    let dir = WfDir::new("wf_verbatim");
+    let cases: [(&str, &[u8]); 5] = [
+        ("no newline added", b"no newline added"),
+        ("Привет, мир! ✓ 😀", "Привет, мир! ✓ 😀".as_bytes()),
+        ("line1\\nline2\\n", b"line1\nline2\n"),
+        ("tab\\there", b"tab\there"),
+        ("quote\\\"inside\\\\", b"quote\"inside\\"),
+    ];
+    for (index, (literal, expected)) in cases.iter().enumerate() {
+        let file = format!("case{index}.txt");
+        let src = format!("write_file(\"{file}\", \"{literal}\");");
+        wf_run(dir.path(), &src, true).unwrap();
+        assert_eq!(
+            std::fs::read(dir.join(&file)).unwrap(),
+            *expected,
+            "{literal}"
+        );
+    }
+}
+
+#[test]
+fn test_write_file_empty_content_creates_or_truncates_to_an_empty_file() {
+    // AC-02
+    let dir = WfDir::new("wf_empty");
+    std::fs::write(dir.join("old.txt"), "not empty").unwrap();
+    let src = "write_file(\"new.txt\", \"\"); write_file(\"old.txt\", \"\");";
+    wf_run(dir.path(), src, true).unwrap();
+    assert_eq!(std::fs::metadata(dir.join("new.txt")).unwrap().len(), 0);
+    assert_eq!(std::fs::metadata(dir.join("old.txt")).unwrap().len(), 0);
+}
+
+#[test]
+fn test_write_file_writes_one_mebibyte_exactly() {
+    // AC-02: большой объём; строка получается 20 удвоениями.
+    let dir = WfDir::new("wf_big");
+    let src = kw_src(
+        "@VAR text = \"x\"; @VAR i = 0; \
+         @WHILE i < 20 { text = text + text; i = i + 1; } \
+         write_file(\"big.txt\", text);",
+    );
+    wf_run(dir.path(), &src, true).unwrap();
+    let bytes = std::fs::read(dir.join("big.txt")).unwrap();
+    assert_eq!(bytes.len(), 1 << 20);
+    assert!(bytes.iter().all(|&b| b == b'x'));
+}
+
+#[test]
+fn test_write_file_into_a_subdirectory_and_through_an_inner_dotdot() {
+    // AC-02: существующий подкаталог; `sub/../x` остаётся внутри корня.
+    let dir = WfDir::new("wf_subdir");
+    std::fs::create_dir(dir.join("sub")).unwrap();
+    let src = "write_file(\"sub/inner.txt\", \"a\"); write_file(\"sub/../outer.txt\", \"b\");";
+    wf_run(dir.path(), src, true).unwrap();
+    assert_eq!(wf_read(&dir.join("sub/inner.txt")), "a");
+    assert_eq!(wf_read(&dir.join("outer.txt")), "b");
+    assert!(!dir.join("sub/outer.txt").exists());
+}
+
+#[test]
+fn test_write_file_then_read_file_round_trips_inside_one_program() {
+    // AC-02: записанное сразу видно read_file, повторная запись — тоже.
+    let dir = WfDir::new("wf_round_trip");
+    let src = kw_src(
+        "write_file(\"a.txt\", \"first\"); \
+         @LET one = read_file(\"a.txt\"); \
+         write_file(\"a.txt\", one + \" and second\"); \
+         read_file(\"a.txt\");",
+    );
+    assert_eq!(
+        wf_run(dir.path(), &src, true).unwrap(),
+        Value::Str("first and second".into())
+    );
+}
+
+#[test]
+fn test_write_file_works_inside_functions_closures_and_loops() {
+    // AC-02: состояние (разрешение, корень) принадлежит VM, а не кадру.
+    let dir = WfDir::new("wf_frames");
+    let src = kw_src(
+        "@FN save(name, text) { write_file(name, text); } \
+         @LET saver = @FN(text) { write_file(\"closure.txt\", text); }; \
+         save(\"function.txt\", \"from fn\"); \
+         saver(\"from closure\"); \
+         @VAR i = 0; \
+         @WHILE i < 3 { \
+             write_file(\"f\" + to_string(i) + \".txt\", to_string(i * 10)); \
+             i = i + 1; \
+         }",
+    );
+    wf_run(dir.path(), &src, true).unwrap();
+    assert_eq!(wf_read(&dir.join("function.txt")), "from fn");
+    assert_eq!(wf_read(&dir.join("closure.txt")), "from closure");
+    for i in 0..3 {
+        assert_eq!(
+            wf_read(&dir.join(&format!("f{i}.txt"))),
+            (i * 10).to_string()
+        );
+    }
+}
+
+#[test]
+fn test_write_file_copies_awkward_but_valid_utf8_exactly() {
+    // AC-02: CR, NUL, DEL, BOM, пустые строки. Лексер SGA не умеет `\r` и `\0`,
+    // поэтому такое содержимое приходит из файла через read_file и уходит
+    // обратно через write_file.
+    let dir = WfDir::new("wf_copy");
+    let original = "crlf\r\nlone cr\rnul\0del\u{7f}bom\u{feff}end ✓\n\n";
+    std::fs::write(dir.join("src.bin"), original).unwrap();
+    let src = "write_file(\"dst.bin\", read_file(\"src.bin\"));";
+    wf_run(dir.path(), src, true).unwrap();
+    assert_eq!(
+        std::fs::read(dir.join("dst.bin")).unwrap(),
+        original.as_bytes()
+    );
+}
+
+#[test]
+fn test_write_file_permission_covers_imported_modules_and_writes_into_the_entry_directory() {
+    // AC-02: разрешение — на всю программу, включая импортированный код; корень
+    // — каталог входного файла.
+    let dir = WfDir::new("wf_import");
+    write_test_file(
+        &dir.join("lib.sga"),
+        &kw_src("@FN save() { write_file(\"from_lib.txt\", \"lib\"); }"),
+    );
+    let main = format!("{} \"lib.sga\"; save();", kw("IMPORT"));
+    let msg = wf_expect_runtime_error(wf_run(dir.path(), &main, false));
+    assert!(msg.contains("запрещена"), "получено: {msg}");
+    assert!(!dir.join("from_lib.txt").exists());
+    wf_run(dir.path(), &main, true).unwrap();
+    assert_eq!(wf_read(&dir.join("from_lib.txt")), "lib");
+}
+
+#[test]
+fn test_write_file_from_a_package_dependency_writes_relative_to_the_entry_directory() {
+    // AC-02: пакет лежит ВНЕ каталога проекта, но его код пишет в каталог
+    // входного файла программы, а не в каталог пакета.
+    let root = WfDir::new("wf_pkg");
+    let project = root.join("project");
+    write_test_file(
+        &project.join("sga.toml"),
+        "[dependencies]\nmylib = { path = \"../mylib\" }\n",
+    );
+    write_test_file(
+        &root.join("mylib").join("saver.sga"),
+        &kw_src("@FN save() { write_file(\"from_pkg.txt\", \"pkg\"); }"),
+    );
+    let entry = project.join("main.sga");
+    write_test_file(
+        &entry,
+        &format!("{} \"pkg:mylib/saver.sga\"; save();", kw("IMPORT")),
+    );
+    sga::run_source_file_with_options(&entry, RunOptions::new().with_allow_write(true)).unwrap();
+    assert_eq!(wf_read(&project.join("from_pkg.txt")), "pkg");
+    assert!(!root.join("mylib").join("from_pkg.txt").exists());
+}
+
+#[test]
+fn test_write_file_permission_covers_every_file_in_the_directory_including_the_manifest() {
+    // Документированное свойство (docs/SECURITY.md): разрешение на запись
+    // относится ко всему каталогу входного файла — в том числе к sga.toml и к
+    // самой программе. Тест фиксирует это, чтобы любое изменение правила было
+    // осознанным.
+    let dir = WfDir::new("wf_whole_directory");
+    write_test_file(&dir.join("sga.toml"), "[dependencies]\n");
+    wf_run(
+        dir.path(),
+        "write_file(\"sga.toml\", \"# rewritten\\n\");",
+        true,
+    )
+    .unwrap();
+    assert_eq!(wf_read(&dir.join("sga.toml")), "# rewritten\n");
+}
+
+// ----- AC-03: абсолютные пути -----
+
+#[test]
+fn test_write_file_absolute_path_is_rejected_even_when_it_points_into_the_root() {
+    // AC-03: безусловно, до обращения к файловой системе.
+    let (outer, proj) = wf_outer_and_proj("wf_absolute");
+    std::fs::write(outer.join("victim.txt"), "keep").unwrap();
+    for target in [
+        outer.join("victim.txt"),
+        proj.join("inside.txt"),
+        outer.join("new.txt"),
+    ] {
+        let src = wf_write_src(wf_path_str(&target), "pwned");
+        let msg = wf_expect_runtime_error(wf_run(&proj, &src, true));
+        assert!(msg.contains("абсолютн"), "получено: {msg}");
+    }
+    assert_eq!(wf_read(&outer.join("victim.txt")), "keep");
+    assert!(!proj.join("inside.txt").exists());
+    assert!(!outer.join("new.txt").exists());
+}
+
+// ----- AC-04: выход за корень через `..` -----
+
+#[test]
+fn test_write_file_parent_escape_is_rejected() {
+    // AC-04
+    let (outer, proj) = wf_outer_and_proj("wf_dotdot");
+    std::fs::create_dir(proj.join("sub")).unwrap();
+    std::fs::write(outer.join("victim.txt"), "keep").unwrap();
+    // Уникальное имя для выхода на два уровня — в общий временный каталог.
+    let far = format!("sga_wf_escape_{}.txt", std::process::id());
+    let far_path = format!("../../{far}");
+    let far_nested = format!("sub/../../../{far}");
+    for path in [
+        "../victim.txt",
+        "../new.txt",
+        "./../new.txt",
+        "sub/../../new.txt",
+        "sub/../../victim.txt",
+        far_path.as_str(),
+        far_nested.as_str(),
+    ] {
+        let msg = wf_expect_runtime_error(wf_run(&proj, &wf_write_src(path, "pwned"), true));
+        assert!(msg.contains("выходит за пределы"), "{path}: {msg}");
+    }
+    assert_eq!(wf_read(&outer.join("victim.txt")), "keep");
+    assert_eq!(wf_listing(outer.path()), vec!["proj", "victim.txt"]);
+    assert_eq!(wf_listing(&proj), vec!["main.sga", "sub"]);
+    assert!(!std::env::temp_dir().join(&far).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_write_file_dotdot_after_a_symlink_to_an_outside_directory_is_rejected() {
+    // AC-04: `link/../x.txt` лексически — `x.txt` в корне, но ОС разрешает `..`
+    // физически: родитель каталога `elsewhere` — это `outer`, то есть вне корня.
+    let (outer, proj) = wf_outer_and_proj("wf_link_dotdot");
+    std::fs::create_dir(outer.join("elsewhere")).unwrap();
+    std::os::unix::fs::symlink("../elsewhere", proj.join("link")).unwrap();
+    let msg = wf_expect_runtime_error(wf_run(&proj, &wf_write_src("link/../x.txt", "pwned"), true));
+    assert!(msg.contains("выходит за пределы"), "получено: {msg}");
+    assert!(!outer.join("x.txt").exists());
+    assert!(!proj.join("x.txt").exists());
+}
+
+// ----- AC-05: каталоги-symlink -----
+
+#[cfg(unix)]
+#[test]
+fn test_write_file_through_a_directory_symlink_pointing_outside_is_rejected() {
+    // AC-05
+    let (outer, proj) = wf_outer_and_proj("wf_dirlink_outside");
+    std::fs::create_dir(outer.join("elsewhere")).unwrap();
+    std::os::unix::fs::symlink("../elsewhere", proj.join("out_link")).unwrap();
+    let msg = wf_expect_runtime_error(wf_run(
+        &proj,
+        &wf_write_src("out_link/x.txt", "pwned"),
+        true,
+    ));
+    assert!(msg.contains("выходит за пределы"), "получено: {msg}");
+    assert!(wf_listing(&outer.join("elsewhere")).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_write_file_through_a_directory_symlink_pointing_inside_is_allowed() {
+    // AC-05
+    let dir = WfDir::new("wf_dirlink_inside");
+    std::fs::create_dir(dir.join("real")).unwrap();
+    std::os::unix::fs::symlink("real", dir.join("alias")).unwrap();
+    wf_run(dir.path(), &wf_write_src("alias/x.txt", "ok"), true).unwrap();
+    assert_eq!(wf_read(&dir.join("real/x.txt")), "ok");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_write_file_resolves_dotdot_after_an_inside_symlink_physically() {
+    // AC-05: `link` -> `a/b`; `link/../x.txt` — это `a/x.txt` (физический
+    // родитель `b`), а не `x.txt` в корне.
+    let dir = WfDir::new("wf_dirlink_dotdot_inside");
+    std::fs::create_dir_all(dir.join("a/b")).unwrap();
+    std::os::unix::fs::symlink("a/b", dir.join("link")).unwrap();
+    wf_run(dir.path(), &wf_write_src("link/../x.txt", "phys"), true).unwrap();
+    assert_eq!(wf_read(&dir.join("a/x.txt")), "phys");
+    assert!(!dir.join("x.txt").exists());
+}
+
+// ----- AC-06: цель — symlink -----
+
+#[cfg(unix)]
+#[test]
+fn test_write_file_to_a_symlink_target_is_rejected_whatever_it_points_to() {
+    // AC-06: внутрь корня, наружу и висячая ссылка; цель ссылки не меняется.
+    let (outer, proj) = wf_outer_and_proj("wf_filelink");
+    std::fs::write(proj.join("inside_target.txt"), "inside").unwrap();
+    std::fs::write(outer.join("outside_target.txt"), "outside").unwrap();
+    std::os::unix::fs::symlink("inside_target.txt", proj.join("to_inside.txt")).unwrap();
+    std::os::unix::fs::symlink("../outside_target.txt", proj.join("to_outside.txt")).unwrap();
+    std::os::unix::fs::symlink("../dangling_target.txt", proj.join("dangling.txt")).unwrap();
+    for name in ["to_inside.txt", "to_outside.txt", "dangling.txt"] {
+        let msg = wf_expect_runtime_error(wf_run(&proj, &wf_write_src(name, "pwned"), true));
+        assert!(msg.contains("символическ"), "{name}: {msg}");
+        assert!(
+            std::fs::symlink_metadata(proj.join(name))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "{name} перестала быть ссылкой"
+        );
+    }
+    assert_eq!(wf_read(&proj.join("inside_target.txt")), "inside");
+    assert_eq!(wf_read(&outer.join("outside_target.txt")), "outside");
+    assert!(!outer.join("dangling_target.txt").exists());
+}
+
+// ----- AC-07: типы аргументов -----
+
+#[test]
+fn test_write_file_non_string_arguments_are_runtime_errors_with_and_without_permission() {
+    // AC-07: проверка типов идёт раньше проверки разрешения и не зависит от него.
+    let dir = WfDir::new("wf_types");
+    let programs = [
+        ("write_file(1, \"x\");", "первым"),
+        ("write_file(1.5, \"x\");", "первым"),
+        ("write_file(@NIL, \"x\");", "первым"),
+        ("write_file([\"a.txt\"], \"x\");", "первым"),
+        ("write_file(1, 2);", "первым"),
+        ("write_file(\"a.txt\", 5);", "вторым"),
+        ("write_file(\"a.txt\", @TRUE);", "вторым"),
+        ("write_file(\"a.txt\", [1, 2]);", "вторым"),
+        ("write_file(\"a.txt\", @NIL);", "вторым"),
+    ];
+    for allow in [false, true] {
+        for (template, which) in programs {
+            let msg = wf_expect_runtime_error(wf_run(dir.path(), &kw_src(template), allow));
+            assert!(msg.contains("ожидает string"), "{template}: {msg}");
+            assert!(msg.contains(which), "{template}: {msg}");
+        }
+    }
+    assert_eq!(wf_listing(dir.path()), vec!["main.sga"]);
+}
+
+// ----- AC-08: арность, байткод, контекст -----
+
+#[test]
+fn test_write_file_wrong_arity_is_a_semantic_error() {
+    // AC-08: ошибка компиляции — до запуска, с разрешением и без.
+    for src in [
+        "write_file();",
+        "write_file(\"a.txt\");",
+        "write_file(\"a.txt\", \"b\", \"c\");",
+    ] {
+        for options in [RunOptions::new(), RunOptions::new().with_allow_write(true)] {
+            match sga::run_source_with_options(src, options) {
+                Err(SgaError::Semantic(msg)) => {
+                    assert!(msg.contains("write_file"), "{src}: {msg}")
+                }
+                other => panic!("ожидалась SemanticError для {src}, получено {:?}", other),
+            }
+        }
+    }
+}
+
+#[test]
+fn test_vm_write_file_with_wrong_arity_via_handbuilt_bytecode_is_a_runtime_error() {
+    // AC-08 (defense-in-depth): VM можно запустить на вручную собранном байткоде
+    // в обход semantic; даже при разрешении и файловом контексте — RuntimeError.
+    let dir = WfDir::new("wf_vm_arity");
+    for argc in [0usize, 1, 3] {
+        let mut code = vec![OpCode::PushConst(0); argc];
+        code.push(OpCode::Call("write_file".to_string(), argc));
+        code.push(OpCode::Return(true));
+        let program = CompiledProgram {
+            main: Chunk {
+                code,
+                constants: vec![Value::Str("a.txt".to_string())],
+            },
+            functions: HashMap::new(),
+        };
+        let (mut machine, main) = Vm::new(program, Some(dir.path().to_path_buf()))
+            .expect("байткод должен пройти верификатор");
+        machine.set_allow_write(true);
+        match machine.run(&main) {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("write_file()") && msg.contains("2 аргумента"),
+                    "argc = {argc}: {msg}"
+                );
+            }
+            Ok(v) => panic!("ожидалась RuntimeError при argc = {argc}, получено {:?}", v),
+        }
+    }
+    assert!(wf_listing(dir.path()).is_empty());
+}
+
+#[test]
+fn test_vm_is_read_only_by_default_and_set_allow_write_toggles_writing_inside_the_root() {
+    // AC-01/AC-08: `Vm::new(program, Some(root))` без `set_allow_write` — запись
+    // запрещена; `set_allow_write(true)` разрешает, `false` запрещает снова.
+    let dir = WfDir::new("wf_vm_toggle");
+    let program = compile_source(&wf_write_src("out.txt", "via vm"));
+    let (mut machine, main) = Vm::new(program, Some(dir.path().to_path_buf())).unwrap();
+    assert!(machine.run(&main).is_err());
+    assert!(!dir.join("out.txt").exists());
+    machine.set_allow_write(true);
+    machine.run(&main).unwrap();
+    assert_eq!(wf_read(&dir.join("out.txt")), "via vm");
+    std::fs::write(dir.join("out.txt"), "untouched").unwrap();
+    machine.set_allow_write(false);
+    assert!(machine.run(&main).is_err());
+    assert_eq!(wf_read(&dir.join("out.txt")), "untouched");
+}
+
+#[test]
+fn test_write_file_without_a_file_context_fails_even_with_permission() {
+    // AC-08: `run_source` (и `Vm::new(.., None)`) не знает корня песочницы —
+    // писать некуда, и разрешение этого не меняет.
+    let name = "__sga_t015_no_file_context__.txt";
+    assert!(!std::path::Path::new(name).exists());
+    let src = wf_write_src(name, "x");
+    let msg = wf_expect_runtime_error(sga::run_source_with_options(
+        &src,
+        RunOptions::new().with_allow_write(true),
+    ));
+    assert!(msg.contains("без файлового контекста"), "получено: {msg}");
+    let (mut machine, main) = Vm::new(compile_source(&src), None).unwrap();
+    machine.set_allow_write(true);
+    let msg = machine.run(&main).unwrap_err().to_string();
+    assert!(msg.contains("без файлового контекста"), "получено: {msg}");
+    assert!(!std::path::Path::new(name).exists());
+}
+
+#[test]
+fn test_variable_and_parameter_named_write_file_are_unaffected_by_the_builtin() {
+    // AC-08: имя `write_file` как переменная/параметр работает как раньше.
+    let variable = kw_src("@LET write_file = 5; write_file + 1;");
+    assert_eq!(run(&variable).unwrap(), Value::Int(6));
+    let parameter = kw_src("@FN keep(write_file) { @RETURN write_file * 2; } keep(21);");
+    assert_eq!(run(&parameter).unwrap(), Value::Int(42));
+}
+
+// ----- AC-09: прочие отказы -----
+
+#[test]
+fn test_write_file_missing_parent_directory_is_an_error_and_nothing_is_created() {
+    // AC-09: каталоги не создаются.
+    let dir = WfDir::new("wf_missing_parent");
+    for path in ["nope/x.txt", "a/b/c/x.txt"] {
+        let msg = wf_expect_runtime_error(wf_run(dir.path(), &wf_write_src(path, "x"), true));
+        assert!(msg.contains("не существует"), "{path}: {msg}");
+    }
+    assert_eq!(wf_listing(dir.path()), vec!["main.sga"]);
+}
+
+#[test]
+fn test_write_file_to_a_directory_is_an_error_and_the_directory_stays_intact() {
+    // AC-09
+    let dir = WfDir::new("wf_target_directory");
+    std::fs::create_dir(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("sub/keep.txt"), "keep").unwrap();
+    let msg = wf_expect_runtime_error(wf_run(dir.path(), &wf_write_src("sub", "x"), true));
+    assert!(msg.contains("каталог"), "получено: {msg}");
+    assert!(dir.join("sub").is_dir());
+    assert_eq!(wf_read(&dir.join("sub/keep.txt")), "keep");
+}
+
+#[test]
+fn test_write_file_paths_that_do_not_name_a_file_are_errors() {
+    // AC-09: пустой путь, завершающий разделитель, `.`, `..`, NUL.
+    let dir = WfDir::new("wf_bad_paths");
+    std::fs::create_dir(dir.join("sub")).unwrap();
+    // `newdir/` и подобные — не файл и тогда, когда такого каталога ещё нет:
+    // иначе завершающий разделитель молча превратился бы в файл `newdir`.
+    for path in [
+        "",
+        "sub/",
+        "sub//",
+        ".",
+        "..",
+        "sub/.",
+        "sub/..",
+        "./",
+        "../",
+        "newdir/",
+        "newdir//",
+        "newdir/.",
+        "sub/newdir/",
+    ] {
+        wf_expect_runtime_error(wf_run(dir.path(), &wf_write_src(path, "x"), true));
+    }
+    let with_nul = "write_file(\"a\u{0}b.txt\", \"x\");";
+    let msg = wf_expect_runtime_error(wf_run(dir.path(), with_nul, true));
+    assert!(msg.contains("нулев"), "получено: {msg}");
+    assert_eq!(wf_listing(dir.path()), vec!["main.sga", "sub"]);
+}
+
+#[test]
+fn test_write_file_with_a_300_character_name_is_a_clear_error_not_a_panic() {
+    // AC-09: слишком длинное имя — ошибка ОС, превращённая в RuntimeError.
+    let dir = WfDir::new("wf_long_name");
+    let path = format!("{}.txt", "n".repeat(300));
+    let msg = wf_expect_runtime_error(wf_run(dir.path(), &wf_write_src(&path, "x"), true));
+    assert!(msg.contains("write_file("), "получено: {msg}");
+    assert_eq!(wf_listing(dir.path()), vec!["main.sga"]);
+}
+
+// ----- AC-10: сквозные тесты через НАСТОЯЩИЙ бинарник -----
+
+#[test]
+fn test_cli_allow_write_before_the_file_creates_the_file_next_to_the_program() {
+    // AC-10 (а): абсолютный путь входного файла.
+    let dir = WfDir::new("wf_cli_flag");
+    let entry = dir.join("main.sga");
+    write_test_file(&entry, &wf_write_src("out.txt", "from cli"));
+    let out = wf_cli(None, &["--allow-write", wf_path_str(&entry)]);
+    assert!(out.status.success(), "stderr = {}", wf_stderr(&out));
+    assert_eq!(wf_read(&dir.join("out.txt")), "from cli");
+}
+
+#[test]
+fn test_cli_without_the_flag_refuses_to_write_and_says_how_to_allow_it() {
+    // AC-10 (б)
+    let dir = WfDir::new("wf_cli_no_flag");
+    let entry = dir.join("main.sga");
+    write_test_file(&entry, &wf_write_src("out.txt", "x"));
+    let out = wf_cli(None, &[wf_path_str(&entry)]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        wf_stderr(&out).contains("--allow-write"),
+        "{}",
+        wf_stderr(&out)
+    );
+    assert!(!dir.join("out.txt").exists());
+}
+
+#[test]
+fn test_cli_allow_write_after_the_file_is_a_program_argument_and_grants_nothing() {
+    // AC-10 (в): флаг ПОСЛЕ пути — аргумент программы (`args()`), а не разрешение.
+    let dir = WfDir::new("wf_cli_flag_after");
+    let entry = dir.join("main.sga");
+    write_test_file(
+        &entry,
+        &kw_src("@PRINT(args()); write_file(\"out.txt\", \"x\");"),
+    );
+    let out = wf_cli(None, &[wf_path_str(&entry), "--allow-write"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        wf_stdout(&out).contains("--allow-write"),
+        "{}",
+        wf_stdout(&out)
+    );
+    assert!(wf_stderr(&out).contains("запрещена"), "{}", wf_stderr(&out));
+    assert!(!dir.join("out.txt").exists());
+    // Флаг и до, и после: разрешение есть, а второй флаг всё равно дошёл до args().
+    let out = wf_cli(
+        None,
+        &["--allow-write", wf_path_str(&entry), "--allow-write"],
+    );
+    assert!(out.status.success(), "stderr = {}", wf_stderr(&out));
+    assert!(
+        wf_stdout(&out).contains("--allow-write"),
+        "{}",
+        wf_stdout(&out)
+    );
+    assert_eq!(wf_read(&dir.join("out.txt")), "x");
+}
+
+#[test]
+fn test_cli_unknown_flag_before_the_file_is_an_error_and_nothing_runs() {
+    // AC-10 (г): опечатка во флаге не должна молча превращаться в запуск.
+    let dir = WfDir::new("wf_cli_unknown_flag");
+    let entry = dir.join("main.sga");
+    write_test_file(
+        &entry,
+        &kw_src("@PRINT(\"ran\"); write_file(\"out.txt\", \"x\");"),
+    );
+    for flag in ["--bogus", "--allow-writes", "--allow-write=1", "-w"] {
+        let out = wf_cli(None, &[flag, wf_path_str(&entry)]);
+        assert_eq!(out.status.code(), Some(1), "{flag}");
+        assert!(
+            wf_stderr(&out).contains(flag),
+            "{flag}: {}",
+            wf_stderr(&out)
+        );
+        assert!(
+            wf_stdout(&out).is_empty(),
+            "{flag}: программа не должна запускаться"
+        );
+    }
+    assert!(!dir.join("out.txt").exists());
+}
+
+#[test]
+fn test_cli_double_dash_ends_the_flags() {
+    // AC-10 (д): `--` завершает флаги — файл запускается БЕЗ разрешения записи;
+    // имя файла, похожее на флаг, пишется через `--` или `./`.
+    let dir = WfDir::new("wf_cli_double_dash");
+    write_test_file(&dir.join("main.sga"), &kw_src("@PRINT(\"ran\");"));
+    let out = wf_cli(None, &["--", wf_path_str(&dir.join("main.sga"))]);
+    assert!(out.status.success(), "stderr = {}", wf_stderr(&out));
+    assert_eq!(wf_stdout(&out), "ran\n");
+
+    write_test_file(&dir.join("-weird.sga"), &kw_src("@PRINT(\"weird ran\");"));
+    for args in [["--", "-weird.sga"], ["--allow-write", "./-weird.sga"]] {
+        let out = wf_cli(Some(dir.path()), &args);
+        assert!(out.status.success(), "{args:?}: {}", wf_stderr(&out));
+        assert_eq!(wf_stdout(&out), "weird ran\n", "{args:?}");
+    }
+    let out = wf_cli(Some(dir.path()), &["-weird.sga"]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = wf_stderr(&out);
+    assert!(
+        stderr.contains("'-weird.sga'") && stderr.contains("./-weird.sga"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn test_cli_run_without_a_file_prints_the_usage() {
+    // AC-10 (д): только флаги или ничего — использование, код 1.
+    for args in [
+        vec![],
+        vec!["--allow-write"],
+        vec!["--"],
+        vec!["--allow-write", "--"],
+    ] {
+        let out = wf_cli(None, &args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        let stderr = wf_stderr(&out);
+        assert!(
+            stderr.contains("использование: sga run [--allow-write] [--] <файл.sga>"),
+            "{args:?}: {stderr}"
+        );
+        assert!(wf_stdout(&out).is_empty(), "{args:?}");
+    }
+    // Общая справка тоже рассказывает про флаг.
+    let help = std::process::Command::new(env!("CARGO_BIN_EXE_sga"))
+        .output()
+        .unwrap();
+    assert_eq!(help.status.code(), Some(1));
+    let text = wf_stderr(&help);
+    assert!(
+        text.contains("--allow-write") && text.contains("write_file"),
+        "{text}"
+    );
+}
+
+#[test]
+fn test_cli_bare_and_dot_slash_entry_names_confine_writes_to_the_program_directory() {
+    // AC-10 (е): `sga run main.sga` и `sga run ./main.sga` из каталога программы.
+    let (outer, proj) = wf_outer_and_proj("wf_cli_bare_write");
+    std::fs::write(outer.join("victim.txt"), "keep").unwrap();
+    std::fs::create_dir(proj.join("sub")).unwrap();
+    for entry_arg in ["main.sga", "./main.sga"] {
+        write_test_file(&proj.join("main.sga"), &wf_write_src("inside.txt", "ok"));
+        let out = wf_cli(Some(&proj), &["--allow-write", entry_arg]);
+        assert!(out.status.success(), "{entry_arg}: {}", wf_stderr(&out));
+        assert_eq!(wf_read(&proj.join("inside.txt")), "ok");
+        std::fs::remove_file(proj.join("inside.txt")).unwrap();
+
+        for path in [
+            "../victim.txt",
+            "../new.txt",
+            "sub/../../new.txt",
+            "../proj/../new.txt",
+        ] {
+            write_test_file(&proj.join("main.sga"), &wf_write_src(path, "pwned"));
+            let out = wf_cli(Some(&proj), &["--allow-write", entry_arg]);
+            assert_eq!(out.status.code(), Some(1), "{entry_arg} {path}");
+            assert!(
+                wf_stderr(&out).contains("выходит за пределы"),
+                "{entry_arg} {path}: {}",
+                wf_stderr(&out)
+            );
+        }
+        assert_eq!(wf_read(&outer.join("victim.txt")), "keep", "{entry_arg}");
+        assert!(!outer.join("new.txt").exists(), "{entry_arg}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_cli_bare_entry_name_rejects_writes_through_a_symlink_to_an_outside_directory() {
+    // AC-10 (е): symlink наружу при запуске по голому имени файла.
+    let (outer, proj) = wf_outer_and_proj("wf_cli_bare_symlink");
+    std::fs::create_dir(outer.join("elsewhere")).unwrap();
+    std::os::unix::fs::symlink("../elsewhere", proj.join("link")).unwrap();
+    for entry_arg in ["main.sga", "./main.sga"] {
+        write_test_file(&proj.join("main.sga"), &wf_write_src("link/x.txt", "pwned"));
+        let out = wf_cli(Some(&proj), &["--allow-write", entry_arg]);
+        assert_eq!(out.status.code(), Some(1), "{entry_arg}");
+        assert!(
+            wf_stderr(&out).contains("выходит за пределы"),
+            "{entry_arg}: {}",
+            wf_stderr(&out)
+        );
+        assert!(
+            wf_listing(&outer.join("elsewhere")).is_empty(),
+            "{entry_arg}"
+        );
+    }
+}
+
+#[test]
+fn test_cli_write_file_example_runs_with_the_flag_and_is_refused_without_it() {
+    // AC-12: examples/write_file.sga выполняется (копия во временном каталоге,
+    // чтобы тест не оставлял следов в examples/data/).
+    let dir = WfDir::new("wf_example");
+    std::fs::create_dir(dir.join("data")).unwrap();
+    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("write_file.sga");
+    let entry = dir.join("write_file.sga");
+    std::fs::copy(&example, &entry).unwrap();
+
+    let denied = wf_cli(None, &[wf_path_str(&entry)]);
+    assert_eq!(denied.status.code(), Some(1));
+    assert!(
+        wf_stderr(&denied).contains("--allow-write"),
+        "{}",
+        wf_stderr(&denied)
+    );
+    assert!(!dir.join("data/written_by_example.txt").exists());
+
+    let out = wf_cli(None, &["--allow-write", wf_path_str(&entry)]);
+    assert!(out.status.success(), "stderr = {}", wf_stderr(&out));
+    let stdout = wf_stdout(&out);
+    assert!(stdout.contains("первая запись"), "{stdout}");
+    assert!(stdout.contains("вторая"), "{stdout}");
+    assert_eq!(
+        wf_read(&dir.join("data/written_by_example.txt")),
+        "вторая\n"
+    );
+}
+
+// ----- AC-11: корень песочницы при запуске по голому имени файла (регрессия) -----
+
+/// Способы указать один и тот же входной файл `main.sga` каталога `proj`:
+/// (аргумент командной строки, текущий каталог процесса). Первые два — голое имя
+/// и `./`-имя (корень песочницы раньше был пустым), остальные — абсолютный и
+/// «каталог/имя» (работали и раньше; фиксируем, что не сломались).
+fn wf_entry_variants(
+    outer: &std::path::Path,
+    proj: &std::path::Path,
+) -> Vec<(String, Option<std::path::PathBuf>)> {
+    vec![
+        ("main.sga".to_string(), Some(proj.to_path_buf())),
+        ("./main.sga".to_string(), Some(proj.to_path_buf())),
+        (wf_path_str(&proj.join("main.sga")).to_string(), None),
+        ("proj/main.sga".to_string(), Some(outer.to_path_buf())),
+    ]
+}
+
+#[test]
+fn test_cli_read_file_cannot_escape_the_program_directory_for_any_entry_spelling() {
+    // AC-11: до исправления `sga run main.sga` читал `../secret.txt`.
+    let (outer, proj) = wf_outer_and_proj("wf_root_read");
+    std::fs::write(outer.join("secret.txt"), "TOP SECRET").unwrap();
+    std::fs::write(proj.join("inside.txt"), "inside ok").unwrap();
+    std::fs::create_dir(proj.join("sub")).unwrap();
+    for (entry_arg, cwd) in wf_entry_variants(outer.path(), &proj) {
+        for path in ["../secret.txt", "sub/../../secret.txt"] {
+            write_test_file(&proj.join("main.sga"), &wf_print_read_src(path));
+            let out = wf_cli(cwd.as_deref(), &[entry_arg.as_str()]);
+            assert_eq!(out.status.code(), Some(1), "{entry_arg} {path}");
+            assert!(
+                wf_stderr(&out).contains("выходит за пределы"),
+                "{entry_arg} {path}: {}",
+                wf_stderr(&out)
+            );
+            assert!(
+                !wf_stdout(&out).contains("TOP SECRET"),
+                "{entry_arg} {path}"
+            );
+            assert!(
+                !wf_stderr(&out).contains("TOP SECRET"),
+                "{entry_arg} {path}"
+            );
+        }
+        for path in ["inside.txt", "sub/../inside.txt"] {
+            write_test_file(&proj.join("main.sga"), &wf_print_read_src(path));
+            let out = wf_cli(cwd.as_deref(), &[entry_arg.as_str()]);
+            assert!(
+                out.status.success(),
+                "{entry_arg} {path}: {}",
+                wf_stderr(&out)
+            );
+            assert_eq!(wf_stdout(&out), "inside ok\n", "{entry_arg} {path}");
+        }
+    }
+}
+
+#[test]
+fn test_cli_import_cannot_escape_the_program_directory_for_any_entry_spelling() {
+    // AC-11: то же для IMPORT (раньше `IMPORT "../x.sga"` при голом имени
+    // входного файла выполнял чужой код).
+    let (outer, proj) = wf_outer_and_proj("wf_root_import");
+    write_test_file(
+        &outer.join("lib_outside.sga"),
+        &kw_src("@PRINT(\"OUTSIDE LIB RAN\");"),
+    );
+    write_test_file(
+        &proj.join("sub").join("lib.sga"),
+        &kw_src("@PRINT(\"inside lib ran\");"),
+    );
+    for (entry_arg, cwd) in wf_entry_variants(outer.path(), &proj) {
+        write_test_file(
+            &proj.join("main.sga"),
+            &format!("{} \"../lib_outside.sga\";", kw("IMPORT")),
+        );
+        let out = wf_cli(cwd.as_deref(), &[entry_arg.as_str()]);
+        assert_eq!(out.status.code(), Some(1), "{entry_arg}");
+        assert!(
+            wf_stderr(&out).contains("выходит за пределы"),
+            "{entry_arg}: {}",
+            wf_stderr(&out)
+        );
+        assert!(!wf_stdout(&out).contains("OUTSIDE LIB RAN"), "{entry_arg}");
+
+        write_test_file(
+            &proj.join("main.sga"),
+            &format!("{} \"sub/lib.sga\";", kw("IMPORT")),
+        );
+        let out = wf_cli(cwd.as_deref(), &[entry_arg.as_str()]);
+        assert!(out.status.success(), "{entry_arg}: {}", wf_stderr(&out));
+        assert_eq!(wf_stdout(&out), "inside lib ran\n", "{entry_arg}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_cli_read_file_through_a_symlink_to_an_outside_directory_is_rejected_for_any_entry_spelling()
+{
+    // AC-11: каталог-symlink наружу при чтении (раньше при голом имени файла
+    // проходил: пустой корень сравнивался лексически).
+    let (outer, proj) = wf_outer_and_proj("wf_root_symlink");
+    std::fs::create_dir(outer.join("elsewhere")).unwrap();
+    std::fs::write(outer.join("elsewhere/secret.txt"), "TOP SECRET").unwrap();
+    std::os::unix::fs::symlink("../elsewhere", proj.join("link")).unwrap();
+    for (entry_arg, cwd) in wf_entry_variants(outer.path(), &proj) {
+        write_test_file(
+            &proj.join("main.sga"),
+            &wf_print_read_src("link/secret.txt"),
+        );
+        let out = wf_cli(cwd.as_deref(), &[entry_arg.as_str()]);
+        assert_eq!(out.status.code(), Some(1), "{entry_arg}");
+        assert!(
+            wf_stderr(&out).contains("выходит за пределы"),
+            "{entry_arg}: {}",
+            wf_stderr(&out)
+        );
+        assert!(!wf_stdout(&out).contains("TOP SECRET"), "{entry_arg}");
+    }
+}

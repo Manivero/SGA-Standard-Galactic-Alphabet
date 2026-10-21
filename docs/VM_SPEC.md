@@ -130,7 +130,7 @@ struct FunctionDef {
 
 ## Builtin-функции (`src/runtime/mod.rs`)
 
-29 функций — вызываются через `Call`, перехватываются `Vm::call()` до
+32 функции — вызываются через `Call`, перехватываются `Vm::call()` до
 поиска пользовательской функции:
 - **Коллекции/общие:** `len`, `push`, `keys`, `range`, `to_string`,
   `to_int`, `to_float`, `type_of`
@@ -145,9 +145,9 @@ struct FunctionDef {
   объект при парсинге становится `Array` из 2-элементных `[ключ,
   значение]` — у SGA v0.1 нет generic map-типа. `Closure` не
   сериализуется (`RuntimeError`).
-- **std/io (T009, M003):** `read_file(path) -> string` — один из четырёх
-  builtin'ов из 29 (остальные — `args`, T012, и `read_line`/`read_stdin`,
-  T013), реализованных НЕ в
+- **std/io (T009, M003):** `read_file(path) -> string` — один из шести
+  builtin'ов из 32 (остальные — `args`, T012, `read_line`/`read_stdin`,
+  T013, `time_monotonic_ms`, T014, и `write_file`, T015), реализованных НЕ в
   `runtime::call_builtin`, а перехватываемых напрямую в `Vm::call()`
   (нужен доступ к состоянию VM — здесь `Vm::sandbox_root`, которого нет у
   свободной функции `call_builtin`;
@@ -155,8 +155,8 @@ struct FunctionDef {
   — нужно codegen'у для статического `OpCode::Call`). Sandboxed:
   переиспользует confinement-границу `IMPORT`
   (`module_resolver::is_within_root`/`compute_confinement_root`), см.
-  `docs/SECURITY.md`. Только чтение; `run_source` (без файлового пути)
-  → `RuntimeError` при вызове.
+  `docs/SECURITY.md`. Только чтение (запись — `write_file`, ниже); `run_source`
+  (без файлового пути) → `RuntimeError` при вызове.
 - **std/process (T012, M006):** `args() -> array` — аргументы командной
   строки программы как массив `string` в порядке передачи, БЕЗ пути к
   самой программе (пустой массив, если аргументов нет). Арность (0, 0)
@@ -193,6 +193,52 @@ struct FunctionDef {
   (`read_line`/`read_all` над `&mut dyn BufRead`, 14 unit-тестов). Источник
   ввода — `RunOptions` (`with_stdin_bytes`, `with_process_stdin`; по
   умолчанию пустой ввод); CLI `sga run` подключает stdin процесса.
+- **std/time — время (T014, M006):** `time_now_ms() -> int` и
+  `time_monotonic_ms() -> int`. Арность (0, 0) у обоих
+  (`semantic::builtin_arity`). `time_now_ms()` — миллисекунды с
+  1970-01-01T00:00:00Z (эпоха Unix, UTC) по `SystemTime`: состояния VM не
+  требует, реализован в `runtime::call_builtin`; следует за системными
+  часами (может скакнуть при их переводе). `time_monotonic_ms()` —
+  миллисекунды, прошедшие с создания VM, по `Instant`: не убывает и не
+  зависит от перевода системных часов; нужен момент старта, поэтому
+  перехват в `Vm::call()` (`call_time_monotonic_ms`; поле
+  `Vm::started: Instant` фиксируется в `Vm::new` и НЕ сбрасывается `run` —
+  повторный `run` на той же VM продолжает отсчёт); в `call_builtin` стоит
+  `unreachable!`, как у `read_file`/`args`/`read_line`/`read_stdin`. Оба
+  результата — `int` (целые миллисекунды, округление вниз); время до
+  1970-01-01 и значение за пределом `int` (i64) — `RuntimeError` (без
+  усечения и panic), «`now` раньше `start`» у монотонных часов
+  сатурируется в 0. Арифметика — `src/clock.rs`: чистые функции над
+  инъектируемыми `SystemTime`/`Instant` (`unix_millis`, `elapsed_millis`;
+  11 unit-тестов без ожидания реального времени). Разрешений и флагов CLI
+  нет. Оптимизатор вызовы не вычисляет и не удаляет. Часы настоящие и не
+  подменяются встраивающим кодом (TD-014).
+- **std/io — запись файла (T015, M006):** `write_file(path, content) -> nil`.
+  Оба аргумента — `string`. Арность (2, 2) проверяет
+  `semantic::builtin_arity`; в рантайме — перехват в `Vm::call()`
+  (`call_write_file`: нужны `Vm::sandbox_root` и `Vm::allow_write`), в
+  `call_builtin` стоит `unreachable!`, как у остальных builtin'ов с
+  состоянием VM. Запись запрещена по умолчанию: `Vm::allow_write = false`,
+  включается `Vm::set_allow_write(true)` между `Vm::new` и `Vm::run`
+  (сигнатура `Vm::new(program, sandbox_root)` не менялась); источник
+  разрешения — `RunOptions::with_allow_write(true)` и флаг CLI
+  `sga run --allow-write <файл>` (только ДО пути файла). Порядок проверок:
+  арность (compile-time) → оба аргумента `string` → разрешение → файловый
+  контекст (`sandbox_root`; без него — `RuntimeError` даже при разрешении) →
+  правила пути (`src/fs_sandbox.rs::resolve_write_target`) → запись
+  (`write_target`). Путь относителен корню песочницы (каталог входного
+  файла). Правила пути: пустой путь, NUL, абсолютный путь и путь на каталог
+  (хвостовой разделитель, `.`, `..`) отклоняются; родительский каталог
+  обязан существовать (каталоги не создаются) и после `canonicalize` лежать
+  внутри канонизированного корня (`..` и symlink'и разрешаются физически);
+  цель — обычный файл (перезаписывается целиком: `truncate`) или новый файл
+  (`create_new`); symlink (даже висячий), каталог, fifo/сокет/устройство в
+  роли цели отклоняются. Содержимое записывается как байты UTF-8
+  дословно: перевод строки не добавляется и не нормализуется; пустая строка
+  даёт пустой файл. Результат — `nil`. Запись не атомарна и не вызывает
+  `fsync`; пределы (гонки TOCTOU, жёсткие ссылки, нет лимита размера) — в
+  `docs/SECURITY.md` и TD-016. Оптимизатор вызов не вычисляет и не удаляет
+  (побочный эффект).
 
 `len`/`keys` также понимают `Value::Struct` (не только `Array`/`Str`).
 Полный список и сигнатуры — `src/runtime/mod.rs::call_builtin`/

@@ -90,14 +90,28 @@ impl ModuleLoader for FsLoader {
 /// использовать РОВНО ТУ ЖЕ границу без дублирования этой логики —
 /// дублирование security-критичного кода рискует со временем разойтись
 /// и стать источником обхода песочницы. `resolve_imports` ниже сама
-/// вызывает эту функцию — единственный источник истины для обоих
-/// потребителей.
+/// вызывает эту функцию — единственный источник истины для всех
+/// потребителей (`IMPORT`, `pkg:`, `read_file`, `write_file`).
+///
+/// Корень НИКОГДА не пустой (T015, M006). Если файл лежит в текущем
+/// каталоге (`main.sga`, `./main.sga`, `a/../main.sga`), каталог входного
+/// файла лексически сворачивается в пустой путь — а пустой корень
+/// ломает границу целиком: `canonicalize("")` не удаётся (проверка теряет
+/// защиту от symlink), и в лексическом fallback'е `is_within_root`
+/// пустой путь является префиксом ЛЮБОГО пути, то есть `..` выходил за
+/// каталог программы. Поэтому пустой результат заменяется на `.`
+/// (текущий каталог — именно он и есть каталог входного файла).
 pub fn compute_confinement_root(entry_path: &Path) -> PathBuf {
     let entry_dir = entry_path
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    lexically_normalize(&entry_dir)
+    let normalized = lexically_normalize(&entry_dir);
+    if normalized.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        normalized
+    }
 }
 
 /// Резолвит все `IMPORT` в `program`, который был распарсен из файла
@@ -225,6 +239,21 @@ fn lexically_normalize(path: &Path) -> PathBuf {
 /// недоступна (путь ещё не существует на диске — в частности, ВСЕГДА
 /// верно для in-memory `ModuleLoader` в тестах), используется
 /// лексический fallback.
+///
+/// Лексический fallback сравнивает АБСОЛЮТНЫЕ пути (T015, M006):
+/// относительные `candidate`/`root` предварительно приводятся к
+/// абсолютным по текущему каталогу процесса. Раньше сравнивались
+/// относительные пути как есть, и корень `""`/`.` (после
+/// `lexically_normalize` — пустой путь) был префиксом всего, включая
+/// `../secret`. Если текущий каталог недоступен, относительные пути
+/// сравнить не с чем — результат «не внутри» (отказ, а не допуск).
+///
+/// Ограничение: для НЕСУЩЕСТВУЮЩЕГО `candidate` fallback не раскрывает
+/// symlink'и в уже существующих компонентах пути. Для чтения и `IMPORT`
+/// это безвредно (несуществующий файл всё равно не прочитать), но для
+/// проверки пути ЗАПИСИ функция не годится — для неё есть
+/// `fs_sandbox::resolve_write_target`.
+///
 /// НЕ приватная: переиспользуется `Vm::call_read_file` (T009, M002/M003
 /// — `read_file`) для той же проверки confinement, без дублирования
 /// логики. См. doc-комментарий выше для полного объяснения семантики.
@@ -234,7 +263,31 @@ pub fn is_within_root(candidate: &Path, root: &Path) -> bool {
         std::fs::canonicalize(root),
     ) {
         (Ok(c), Ok(r)) => c.starts_with(r),
-        _ => lexically_normalize(candidate).starts_with(lexically_normalize(root)),
+        _ => lexically_within_root(candidate, root, std::env::current_dir().ok().as_deref()),
+    }
+}
+
+/// Лексическая часть [`is_within_root`] (без обращения к ФС): `candidate`
+/// внутри `root`, если их АБСОЛЮТНЫЕ нормализованные формы связаны отношением
+/// префикса. `cwd` — текущий каталог процесса (`None`, если он недоступен):
+/// от него зависят только относительные пути; для них без `cwd` результат —
+/// «не внутри» (отказ, а не допуск). `cwd` вынесен в параметр, чтобы эту
+/// ветку можно было проверить, не меняя общий текущий каталог процесса тестов.
+fn lexically_within_root(candidate: &Path, root: &Path, cwd: Option<&Path>) -> bool {
+    match (absolutize(candidate, cwd), absolutize(root, cwd)) {
+        (Some(c), Some(r)) => lexically_normalize(&c).starts_with(lexically_normalize(&r)),
+        _ => false,
+    }
+}
+
+/// Относительный путь -> абсолютный по каталогу `cwd` (лексически, без
+/// обращения к ФС); абсолютный возвращается как есть. `None`, если путь
+/// относительный, а `cwd` неизвестен.
+fn absolutize(path: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
+    if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else {
+        cwd.map(|cwd| cwd.join(path))
     }
 }
 
@@ -447,4 +500,201 @@ fn resolve_program<L: ModuleLoader>(
         }
     }
     Ok(out)
+}
+
+// ----- Unit-тесты корня песочницы (T015, M006) -----
+//
+// Эти тесты — про ОТНОСИТЕЛЬНЫЕ пути: именно такой корень получается при
+// запуске `sga run main.sga` / `./main.sga`, и именно его не покрывали прежние
+// тесты (они строили абсолютные пути из `temp_dir()`). Сквозные сценарии с
+// настоящим бинарником и `current_dir` — в `tests/integration_test.rs`
+// (T015, AC-10/AC-11); здесь, в одном процессе, текущий каталог не меняется.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Все записи «корень — текущий каталог», которые могут встретиться на
+    /// практике: `.` (вывод `compute_confinement_root`), пустой путь (вручную
+    /// собранная `Vm::new(program, Some(PathBuf::new()))`) и `./`.
+    const CURRENT_DIR_ROOTS: [&str; 3] = [".", "", "./"];
+
+    #[test]
+    fn confinement_root_of_a_file_in_the_current_directory_is_dot_not_empty() {
+        for entry in ["main.sga", "./main.sga", "a/../main.sga", "./a/../main.sga"] {
+            assert_eq!(
+                compute_confinement_root(Path::new(entry)),
+                PathBuf::from("."),
+                "entry = {entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn confinement_root_of_a_path_without_a_parent_is_dot() {
+        assert_eq!(compute_confinement_root(Path::new("")), PathBuf::from("."));
+    }
+
+    #[test]
+    fn confinement_root_of_a_file_in_another_directory_is_that_directory() {
+        assert_eq!(
+            compute_confinement_root(Path::new("proj/main.sga")),
+            PathBuf::from("proj")
+        );
+        assert_eq!(
+            compute_confinement_root(Path::new("./proj/main.sga")),
+            PathBuf::from("proj")
+        );
+        assert_eq!(
+            compute_confinement_root(Path::new("../main.sga")),
+            PathBuf::from("..")
+        );
+        if cfg!(unix) {
+            assert_eq!(
+                compute_confinement_root(Path::new("/abs/proj/main.sga")),
+                PathBuf::from("/abs/proj")
+            );
+        }
+    }
+
+    #[test]
+    fn parent_escape_is_outside_the_current_directory_for_existing_and_missing_candidates() {
+        for root in CURRENT_DIR_ROOTS {
+            let root = Path::new(root);
+            // `..` существует всегда; остальных путей нет ни в одном каталоге.
+            for candidate in [
+                "..",
+                "../__sga_no_such_file__.sga",
+                "../../__sga_no_such_file__.sga",
+                "sub/../../__sga_no_such_file__.sga",
+            ] {
+                assert!(
+                    !is_within_root(Path::new(candidate), root),
+                    "root = {root:?}, candidate = {candidate:?} принят, а лежит вне корня"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn files_below_the_current_directory_are_inside_for_existing_and_missing_candidates() {
+        for root in CURRENT_DIR_ROOTS {
+            let root = Path::new(root);
+            // Cargo.toml существует в корне пакета (cwd тестов); остальные пути
+            // — виртуальные: проверяют лексический fallback.
+            for candidate in [
+                "Cargo.toml",
+                "./Cargo.toml",
+                "src/__sga_no_such_file__.sga",
+                "sub/../__sga_no_such_file__.sga",
+                "__sga_no_such_file__.sga",
+            ] {
+                assert!(
+                    is_within_root(Path::new(candidate), root),
+                    "root = {root:?}, candidate = {candidate:?} отклонён, а лежит внутри корня"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_absolute_path_above_the_current_directory_is_outside() {
+        let cwd = std::env::current_dir().expect("текущий каталог недоступен");
+        if let Some(parent) = cwd.parent() {
+            for root in CURRENT_DIR_ROOTS {
+                assert!(
+                    !is_within_root(parent, Path::new(root)),
+                    "root = {root:?}: родитель текущего каталога принят"
+                );
+                assert!(
+                    !is_within_root(&parent.join("__sga_no_such_file__.sga"), Path::new(root)),
+                    "root = {root:?}: несуществующий файл рядом с текущим каталогом принят"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_named_relative_root_confines_to_that_directory() {
+        let root = Path::new("src");
+        assert!(is_within_root(Path::new("src/lib.rs"), root));
+        assert!(is_within_root(
+            Path::new("src/__sga_no_such_file__.sga"),
+            root
+        ));
+        assert!(is_within_root(Path::new("src/sub/../lib.rs"), root));
+        // Существующий файл рядом с `src` и несуществующий путь через `..`.
+        assert!(!is_within_root(Path::new("src/../Cargo.toml"), root));
+        assert!(!is_within_root(
+            Path::new("src/../__sga_no_such_file__"),
+            root
+        ));
+        assert!(!is_within_root(Path::new("../src/lib.rs"), root));
+    }
+
+    /// Абсолютный каталог «процесса» для проверки лексической ветки: тесты не
+    /// трогают настоящий текущий каталог.
+    fn fake_cwd() -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from("C:\\work\\proj")
+        } else {
+            PathBuf::from("/work/proj")
+        }
+    }
+
+    #[test]
+    fn lexical_check_resolves_relative_paths_against_the_given_current_directory() {
+        let cwd = fake_cwd();
+        for root in CURRENT_DIR_ROOTS {
+            let root = Path::new(root);
+            for inside in ["x", "sub/x", "sub/../x", "./x"] {
+                assert!(
+                    lexically_within_root(Path::new(inside), root, Some(&cwd)),
+                    "root = {root:?}, candidate = {inside:?} отклонён"
+                );
+            }
+            for outside in ["..", "../x", "sub/../../x", "../proj/../x"] {
+                assert!(
+                    !lexically_within_root(Path::new(outside), root, Some(&cwd)),
+                    "root = {root:?}, candidate = {outside:?} принят"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lexical_check_fails_closed_for_relative_paths_when_the_current_directory_is_unknown() {
+        // Сравнивать относительный путь не с чем — отказ, а не допуск (даже для
+        // пути, который выглядит «внутренним»).
+        for root in CURRENT_DIR_ROOTS {
+            for candidate in ["x", "sub/x", "../x"] {
+                assert!(
+                    !lexically_within_root(Path::new(candidate), Path::new(root), None),
+                    "root = {root:?}, candidate = {candidate:?} принят без текущего каталога"
+                );
+            }
+        }
+        // Относительный корень при абсолютном кандидате — тоже отказ.
+        let cwd = fake_cwd();
+        assert!(!lexically_within_root(&cwd.join("x"), Path::new("."), None));
+        // Относительный кандидат при абсолютном корне — тоже.
+        assert!(!lexically_within_root(Path::new("x"), &cwd, None));
+    }
+
+    #[test]
+    fn lexical_check_of_absolute_paths_does_not_need_the_current_directory() {
+        let root = fake_cwd();
+        assert!(lexically_within_root(
+            &root.join("a").join("x"),
+            &root,
+            None
+        ));
+        assert!(lexically_within_root(&root, &root, None));
+        let sibling = root.parent().unwrap().join("other").join("x");
+        assert!(!lexically_within_root(&sibling, &root, None));
+        assert!(!lexically_within_root(
+            &root.join("..").join("x"),
+            &root,
+            None
+        ));
+    }
 }

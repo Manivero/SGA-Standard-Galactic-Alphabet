@@ -9,7 +9,9 @@
 //! MIGRATION_REPORT.md.
 
 pub mod ast;
+mod clock;
 pub mod codegen;
+mod fs_sandbox;
 pub mod json;
 pub mod lexer;
 pub mod manifest;
@@ -129,21 +131,21 @@ enum StdinSource {
 /// (M006): всё, что окружение передаёт программе «снаружи». Для запуска
 /// с параметрами — `run_source_with_options` / `run_source_file_with_options`;
 /// `run_source` / `run_source_file` запускают с параметрами по умолчанию
-/// (без аргументов, с пустым вводом).
+/// (без аргументов, с пустым вводом, без разрешения записи).
 ///
 /// Строится цепочкой builder-методов (`RunOptions::new().with_args(..)`).
-/// Поля приватны намеренно: следующие задачи M006 добавляют сюда новые
-/// параметры (разрешение записи — T015), и это не должно ломать
-/// существующих вызывающих.
+/// Поля приватны намеренно: новые параметры (stdin — T013, разрешение
+/// записи — T015) добавляются без поломки существующих вызывающих.
 #[derive(Debug, Clone, Default)]
 pub struct RunOptions {
     args: Vec<String>,
     stdin: StdinSource,
+    allow_write: bool,
 }
 
 impl RunOptions {
-    /// Параметры по умолчанию: программа запускается без аргументов и с
-    /// пустым стандартным вводом.
+    /// Параметры по умолчанию: программа запускается без аргументов, с
+    /// пустым стандартным вводом и БЕЗ разрешения записи файлов.
     pub fn new() -> Self {
         Self::default()
     }
@@ -184,6 +186,25 @@ impl RunOptions {
         self.stdin = StdinSource::Process;
         self
     }
+
+    /// Разрешает программе запись файлов — builtin `write_file` (T015,
+    /// M006). По умолчанию запись ЗАПРЕЩЕНА: без этого разрешения
+    /// `write_file` завершается `RuntimeError` с подсказкой. CLI выдаёт его
+    /// флагом `sga run --allow-write <файл>`; других источников разрешения
+    /// нет — ни манифест `sga.toml`, ни сама программа, ни импортированные
+    /// модули выдать или расширить его не могут (импорты и пакеты входят в
+    /// программу целиком, так что разрешение распространяется на них).
+    ///
+    /// Разрешение даёт запись ТОЛЬКО внутри каталога входного файла
+    /// (`run_source_file*`; тот же корень, что у `IMPORT` и `read_file`);
+    /// у `run_source*` без файла корня нет, и запись невозможна даже с
+    /// разрешением. Права распространяются на ЛЮБОЙ файл каталога программы,
+    /// включая её собственный исходник и `sga.toml`. Повторный вызов заменяет
+    /// ранее заданное значение.
+    pub fn with_allow_write(mut self, allow: bool) -> Self {
+        self.allow_write = allow;
+        self
+    }
 }
 
 /// Полный конвейер для исходного текста БЕЗ файлового контекста:
@@ -198,9 +219,9 @@ impl RunOptions {
 /// относительно которой резолвятся относительные пути импортов.
 ///
 /// Запускает программу с параметрами по умолчанию (`RunOptions::new()`:
-/// без аргументов — `args()` вернёт пустой массив — и с пустым вводом —
-/// `read_line()` сразу даст `nil`); для передачи параметров —
-/// `run_source_with_options`.
+/// без аргументов — `args()` вернёт пустой массив —, с пустым вводом —
+/// `read_line()` сразу даст `nil` — и без разрешения записи); для передачи
+/// параметров — `run_source_with_options`.
 pub fn run_source(source: &str) -> Result<Value, SgaError> {
     run_source_with_options(source, RunOptions::default())
 }
@@ -220,7 +241,8 @@ pub fn run_source_with_options(source: &str, options: RunOptions) -> Result<Valu
 /// `module_resolver` для полного описания семантики и ограничений).
 ///
 /// Запускает программу с параметрами по умолчанию (без аргументов, с пустым
-/// вводом); для передачи параметров — `run_source_file_with_options`.
+/// вводом, без разрешения записи); для передачи параметров —
+/// `run_source_file_with_options`.
 pub fn run_source_file(path: &Path) -> Result<Value, SgaError> {
     run_source_file_with_options(path, RunOptions::default())
 }
@@ -277,6 +299,7 @@ fn run_resolved_program(
     let (mut machine, main_chunk) =
         vm::Vm::new(compiled, sandbox_root).map_err(|e| SgaError::Runtime(e.to_string()))?;
     machine.set_args(options.args);
+    machine.set_allow_write(options.allow_write);
     match options.stdin {
         StdinSource::Empty => machine.set_stdin(std::io::empty()),
         StdinSource::Bytes(bytes) => machine.set_stdin(std::io::Cursor::new(bytes)),

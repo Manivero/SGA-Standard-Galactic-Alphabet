@@ -20,6 +20,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::BufRead;
 use std::rc::Rc;
+use std::time::Instant;
 
 #[derive(Debug)]
 pub struct RuntimeError(pub String);
@@ -125,12 +126,13 @@ pub struct Vm {
     /// полноценная модель прав доступа — см. docs/ROADMAP.md).
     call_depth: usize,
     max_call_depth: usize,
-    /// Confinement-граница для `read_file` (T009, M003) — `None`, если
-    /// программа запущена через `run_source` (нет файлового пути, не с
-    /// чем сравнивать), `Some(root)` при запуске через `run_source_file`
-    /// (`root` — тот же каталог, что confinement-граница `IMPORT`, см.
-    /// `module_resolver::compute_confinement_root`). Единственный
-    /// потребитель — `call_read_file` ниже.
+    /// Confinement-граница для `read_file` (T009, M003) и `write_file`
+    /// (T015, M006) — `None`, если программа запущена через `run_source`
+    /// (нет файлового пути, не с чем сравнивать), `Some(root)` при запуске
+    /// через `run_source_file` (`root` — тот же каталог, что
+    /// confinement-граница `IMPORT`, см.
+    /// `module_resolver::compute_confinement_root`). Потребители —
+    /// `call_read_file` и `call_write_file` ниже.
     sandbox_root: Option<std::path::PathBuf>,
     /// Аргументы командной строки программы (T012, M006) — то, что
     /// возвращает `args()`. Пусто по умолчанию; заполняется через
@@ -142,6 +144,16 @@ pub struct Vm {
     /// вызовами builtin'ов и (при повторном `run` на той же VM) между
     /// запусками. Разбор ввода — `crate::stdin`.
     stdin: Box<dyn BufRead>,
+    /// Момент создания VM (T014, M006) — точка отсчёта `time_monotonic_ms()`.
+    /// Фиксируется в `Vm::new` и НЕ сбрасывается ни `run`, ни `set_*`: при
+    /// повторном `run` на той же VM отсчёт продолжается. `Instant` монотонен
+    /// и не зависит от перевода системных часов.
+    started: Instant,
+    /// Разрешение на запись файлов (T015, M006) — без него `write_file`
+    /// завершается `RuntimeError`. По умолчанию `false`; включается через
+    /// `set_allow_write` ДО `run`. Единственный потребитель —
+    /// `call_write_file`.
+    allow_write: bool,
 }
 
 impl Vm {
@@ -158,7 +170,7 @@ impl Vm {
     /// через `run_source` (нет файлового контекста), `Some(root)` при
     /// запуске через `run_source_file` — та же confinement-граница, что
     /// `IMPORT` (см. `module_resolver::compute_confinement_root`).
-    /// Единственный потребитель — `read_file`.
+    /// Потребители — `read_file` и (T015) `write_file`.
     pub fn new(
         program: CompiledProgram,
         sandbox_root: Option<std::path::PathBuf>,
@@ -172,6 +184,8 @@ impl Vm {
                 sandbox_root,
                 args: Vec::new(),
                 stdin: Box::new(std::io::empty()),
+                started: Instant::now(),
+                allow_write: false,
             },
             program.main,
         ))
@@ -196,6 +210,16 @@ impl Vm {
     /// же места при повторном — позиция чтения принадлежит VM.
     pub fn set_stdin(&mut self, input: impl BufRead + 'static) {
         self.stdin = Box::new(input);
+    }
+
+    /// Разрешает или запрещает программе запись файлов (T015, M006) —
+    /// builtin `write_file`. По умолчанию запись ЗАПРЕЩЕНА. Вызывается между
+    /// `Vm::new` и `run`; отдельный сеттер по той же причине, что `set_args`:
+    /// сигнатура `Vm::new(program, sandbox_root)` остаётся стабильной.
+    /// Разрешение действует только внутри `sandbox_root`; без него (VM
+    /// создана с `None`) запись невозможна даже при разрешении.
+    pub fn set_allow_write(&mut self, allow: bool) {
+        self.allow_write = allow;
     }
 
     pub fn run(&mut self, chunk: &Chunk) -> RResult<Value> {
@@ -578,12 +602,18 @@ impl Vm {
         // read_file (T009, M003) — self.sandbox_root, см. call_read_file;
         // args (T012, M006) — self.args, см. call_args;
         // read_line / read_stdin (T013, M006) — self.stdin, см.
-        // call_read_line / call_read_stdin.
+        // call_read_line / call_read_stdin;
+        // time_monotonic_ms (T014, M006) — self.started, см.
+        // call_time_monotonic_ms;
+        // write_file (T015, M006) — self.allow_write и self.sandbox_root, см.
+        // call_write_file.
         match name {
             "read_file" => return self.call_read_file(args),
             "args" => return self.call_args(args),
             "read_line" => return self.call_read_line(args),
             "read_stdin" => return self.call_read_stdin(args),
+            "time_monotonic_ms" => return self.call_time_monotonic_ms(args),
+            "write_file" => return self.call_write_file(args),
             _ => {}
         }
         if is_builtin(name) {
@@ -747,6 +777,94 @@ impl Vm {
         crate::stdin::read_all(&mut *self.stdin)
             .map(Value::Str)
             .map_err(|e| rt_err(format!("read_stdin(): {}", e)))
+    }
+
+    /// Реализация `time_monotonic_ms()` (T014, M006, `std/time`) — целые
+    /// миллисекунды, прошедшие с создания VM (`Vm::new`), по монотонным часам
+    /// (`Instant`): значение не убывает и не зависит от перевода системных
+    /// часов, поэтому подходит для замера интервалов (разность двух вызовов).
+    /// НЕ в `runtime::call_builtin`, т.к. нужен `self.started` (см.
+    /// `call_read_file` — тот же приём). Календарное время —
+    /// `time_now_ms()` (там же, в `runtime::call_builtin`).
+    ///
+    /// Арифметика (округление вниз, сатурация, предел `int`) — в
+    /// `crate::clock::elapsed_millis` (там же юнит-тесты). Проверка арности —
+    /// defense-in-depth (статически её делает `semantic::builtin_arity`): VM
+    /// можно запустить на вручную собранном байткоде в обход semantic.
+    fn call_time_monotonic_ms(&self, args: Vec<Value>) -> RResult<Value> {
+        if !args.is_empty() {
+            return Err(rt_err(format!(
+                "time_monotonic_ms() не принимает аргументов, передано {}",
+                args.len()
+            )));
+        }
+        crate::clock::elapsed_millis(self.started, Instant::now())
+            .map(Value::Int)
+            .map_err(|e| rt_err(format!("time_monotonic_ms(): {}", e)))
+    }
+
+    /// Реализация `write_file(path, content)` (T015, M006, `std/io`) —
+    /// запись строки в файл ТОЛЬКО при явном разрешении (`set_allow_write`).
+    /// НЕ в `runtime::call_builtin`, т.к. нужны `self.allow_write` и
+    /// `self.sandbox_root` (см. `call_read_file` — тот же приём).
+    ///
+    /// SECURITY: порядок проверок фиксирован и покрыт тестами —
+    /// арность → оба аргумента `string` → РАЗРЕШЕНИЕ → файловый контекст →
+    /// правила пути (`fs_sandbox::resolve_write_target`) → запись. Разрешение
+    /// проверяется ДО любого обращения к файловой системе, поэтому без него
+    /// ни одна проверка пути (и ни одно сообщение о её результате) не
+    /// раскрывает программе сведения о файлах. Разрешение даёт CLI-флаг
+    /// `--allow-write` (в библиотеке — `RunOptions::with_allow_write`); сама
+    /// программа, манифест и окружение его выдать не могут.
+    ///
+    /// Арность проверяется и здесь — это defense-in-depth (статически её
+    /// делает `semantic::builtin_arity`): VM можно запустить на вручную
+    /// собранном байткоде в обход semantic.
+    fn call_write_file(&self, args: Vec<Value>) -> RResult<Value> {
+        if args.len() != 2 {
+            return Err(rt_err(format!(
+                "write_file() ожидает 2 аргумента (путь, содержимое), передано {}",
+                args.len()
+            )));
+        }
+        let path_str = match &args[0] {
+            Value::Str(s) => s.as_str(),
+            v => {
+                return Err(rt_err(format!(
+                    "write_file() ожидает string первым аргументом (путь), получено {}",
+                    v.type_display_name()
+                )))
+            }
+        };
+        let content = match &args[1] {
+            Value::Str(s) => s.as_str(),
+            v => {
+                return Err(rt_err(format!(
+                    "write_file() ожидает string вторым аргументом (содержимое), получено {}",
+                    v.type_display_name()
+                )))
+            }
+        };
+        if !self.allow_write {
+            return Err(rt_err(format!(
+                "write_file(\"{}\"): запись файлов запрещена — программа запущена без \
+                 разрешения на запись; разрешите её явно: `sga run --allow-write <файл>` \
+                 (в библиотеке — RunOptions::with_allow_write(true))",
+                path_str
+            )));
+        }
+        let root = self.sandbox_root.as_ref().ok_or_else(|| {
+            rt_err(
+                "write_file() недоступен: программа запущена без файлового контекста \
+                 (через run_source, а не run_source_file) — запись не может быть \
+                 ограничена песочницей без известного корня каталога",
+            )
+        })?;
+        let target = crate::fs_sandbox::resolve_write_target(root, path_str)
+            .map_err(|e| rt_err(format!("write_file(\"{}\"): {}", path_str, e)))?;
+        crate::fs_sandbox::write_target(&target, content)
+            .map_err(|e| rt_err(format!("write_file(\"{}\"): {}", path_str, e)))?;
+        Ok(Value::Nil)
     }
 
     /// Вызывает значение `callee` (ожидается `Value::Closure`) с

@@ -43,15 +43,13 @@ fn main() -> ExitCode {
     }
 
     match args[1].as_str() {
-        "run" => {
-            if args.len() < 3 {
-                eprintln!("использование: sga run <файл.sga> [аргументы...]");
-                return ExitCode::FAILURE;
+        "run" => match parse_run_args(&args[2..]) {
+            Ok(invocation) => cmd_run(&invocation),
+            Err(msg) => {
+                eprintln!("{}", msg);
+                ExitCode::FAILURE
             }
-            // Всё после пути файла — аргументы ПРОГРАММЫ (builtin `args()`),
-            // дословно, в т.ч. то, что выглядит как флаг (`--help`, `-v`).
-            cmd_run(&args[2], &args[3..])
-        }
+        },
         "build" => {
             eprintln!("'sga build' (нативная компиляция через LLVM) пока не реализована.");
             eprintln!(
@@ -95,12 +93,15 @@ fn print_usage() {
     eprintln!("использование: sga <команда> [аргументы]");
     eprintln!();
     eprintln!("команды:");
-    eprintln!("  run <файл.sga> [аргументы...]");
+    eprintln!("  run [--allow-write] [--] <файл.sga> [аргументы...]");
     eprintln!("                    скомпилировать и выполнить файл на встроенной VM;");
     eprintln!("                    всё после файла передаётся программе (builtin args()),");
     eprintln!(
-        "                    стандартный ввод процесса — builtin'ам read_line()/read_stdin()"
+        "                    стандартный ввод процесса — builtin'ам read_line()/read_stdin();"
     );
+    eprintln!("                    флаги — только ДО файла: --allow-write разрешает программе");
+    eprintln!("                    запись файлов (write_file) внутри каталога входного файла,");
+    eprintln!("                    без него запись запрещена; -- завершает список флагов");
     eprintln!(
         "                    (поддерживает IMPORT \"путь.sga\"; — см. docs/COMPILER_SPEC.md)"
     );
@@ -112,13 +113,78 @@ fn print_usage() {
     eprintln!("  version           показать версию компилятора");
 }
 
-fn cmd_run(path: &str, program_args: &[String]) -> ExitCode {
+/// Использование `sga run` — единственный источник текста для всех сообщений
+/// об ошибке разбора.
+const RUN_USAGE: &str = "использование: sga run [--allow-write] [--] <файл.sga> [аргументы...]";
+
+/// Разобранный вызов `sga run` (T015, M006).
+#[derive(Debug, PartialEq, Eq)]
+struct RunInvocation {
+    /// Был флаг `--allow-write` (только до пути файла): программе разрешена
+    /// запись файлов (`write_file`). Больше НИЧТО это разрешение не выдаёт.
+    allow_write: bool,
+    /// Путь входного файла.
+    path: String,
+    /// Всё после пути файла — аргументы ПРОГРАММЫ (builtin `args()`),
+    /// дословно, в т.ч. то, что выглядит как флаг (`--help`, `-v`,
+    /// `--allow-write`).
+    program_args: Vec<String>,
+}
+
+/// Разбирает аргументы после `sga run` (`rest` = всё после слова `run`).
+///
+/// Флаги самого `sga` допустимы ТОЛЬКО до пути файла: `--allow-write`, и `--`,
+/// завершающий список флагов. Первый аргумент, не являющийся флагом, — путь
+/// файла, всё после него — аргументы программы без разбора. Поэтому
+/// `sga run prog.sga --allow-write` НЕ даёт программе права записи: флаг
+/// получает сама программа через `args()`. Любой другой аргумент, начинающийся
+/// с `-` (кроме одиночного `-`, который считается путём), до пути файла —
+/// ошибка, а не молчаливо принятый путь: опечатка во флаге не должна
+/// превращаться в запуск без разрешения, которого пользователь ждал.
+fn parse_run_args(rest: &[String]) -> Result<RunInvocation, String> {
+    let mut allow_write = false;
+    let mut index = 0;
+    while let Some(arg) = rest.get(index) {
+        match arg.as_str() {
+            "--" => {
+                index += 1;
+                break;
+            }
+            "--allow-write" => {
+                allow_write = true;
+                index += 1;
+            }
+            flag if flag.starts_with('-') && flag != "-" => {
+                return Err(format!(
+                    "неизвестный флаг '{}' команды run: до пути файла допустимы только \
+                     --allow-write и --; если это путь файла, начинающийся с '-', \
+                     напишите './{}' или поставьте перед ним '--'\n{}",
+                    flag, flag, RUN_USAGE
+                ));
+            }
+            _ => break,
+        }
+    }
+    match rest.get(index) {
+        Some(path) => Ok(RunInvocation {
+            allow_write,
+            path: path.clone(),
+            program_args: rest[index + 1..].to_vec(),
+        }),
+        None => Err(RUN_USAGE.to_string()),
+    }
+}
+
+fn cmd_run(invocation: &RunInvocation) -> ExitCode {
     // Стандартный ввод процесса отдаётся программе целиком, но читается
     // лениво — только когда она вызывает read_line()/read_stdin() (T013).
+    // Запись файлов разрешена, только если пользователь явно передал
+    // `--allow-write` (T015); по умолчанию — запрещена.
     let options = RunOptions::new()
-        .with_args(program_args.iter().cloned())
+        .with_args(invocation.program_args.iter().cloned())
+        .with_allow_write(invocation.allow_write)
         .with_process_stdin();
-    match sga::run_source_file_with_options(Path::new(path), options) {
+    match sga::run_source_file_with_options(Path::new(&invocation.path), options) {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{}", e);
@@ -186,4 +252,131 @@ fn encode_hello_world() -> String {
         "{} message = \"Hello, SGA!\";\n{}(message);\n",
         let_kw, print_kw
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn invocation(allow_write: bool, path: &str, program_args: &[&str]) -> RunInvocation {
+        RunInvocation {
+            allow_write,
+            path: path.to_string(),
+            program_args: v(program_args),
+        }
+    }
+
+    #[test]
+    fn a_path_alone_runs_without_write_permission_and_without_program_args() {
+        assert_eq!(
+            parse_run_args(&v(&["main.sga"])),
+            Ok(invocation(false, "main.sga", &[]))
+        );
+    }
+
+    #[test]
+    fn allow_write_before_the_path_grants_the_permission() {
+        assert_eq!(
+            parse_run_args(&v(&["--allow-write", "main.sga"])),
+            Ok(invocation(true, "main.sga", &[]))
+        );
+        assert_eq!(
+            parse_run_args(&v(&["--allow-write", "--allow-write", "main.sga", "x"])),
+            Ok(invocation(true, "main.sga", &["x"]))
+        );
+    }
+
+    #[test]
+    fn allow_write_after_the_path_belongs_to_the_program_and_grants_nothing() {
+        assert_eq!(
+            parse_run_args(&v(&["main.sga", "--allow-write"])),
+            Ok(invocation(false, "main.sga", &["--allow-write"]))
+        );
+        assert_eq!(
+            parse_run_args(&v(&["--allow-write", "main.sga", "--allow-write"])),
+            Ok(invocation(true, "main.sga", &["--allow-write"]))
+        );
+        assert_eq!(
+            parse_run_args(&v(&["main.sga", "a", "--allow-write", "b"])),
+            Ok(invocation(false, "main.sga", &["a", "--allow-write", "b"]))
+        );
+    }
+
+    #[test]
+    fn program_arguments_are_passed_verbatim() {
+        assert_eq!(
+            parse_run_args(&v(&["main.sga", "--help", "-v", "--", "", "-", "--x=1"])),
+            Ok(invocation(
+                false,
+                "main.sga",
+                &["--help", "-v", "--", "", "-", "--x=1"]
+            ))
+        );
+    }
+
+    #[test]
+    fn double_dash_ends_the_flags_and_the_next_argument_is_the_path() {
+        assert_eq!(
+            parse_run_args(&v(&["--", "-weird.sga", "a"])),
+            Ok(invocation(false, "-weird.sga", &["a"]))
+        );
+        assert_eq!(
+            parse_run_args(&v(&["--allow-write", "--", "-weird.sga"])),
+            Ok(invocation(true, "-weird.sga", &[]))
+        );
+        // После `--` флагов больше нет: `--allow-write` здесь — путь файла.
+        assert_eq!(
+            parse_run_args(&v(&["--", "--allow-write", "main.sga"])),
+            Ok(invocation(false, "--allow-write", &["main.sga"]))
+        );
+    }
+
+    #[test]
+    fn a_lone_dash_and_an_explicit_relative_path_are_paths() {
+        assert_eq!(parse_run_args(&v(&["-"])), Ok(invocation(false, "-", &[])));
+        assert_eq!(
+            parse_run_args(&v(&["./-weird.sga"])),
+            Ok(invocation(false, "./-weird.sga", &[]))
+        );
+    }
+
+    #[test]
+    fn an_unknown_flag_before_the_path_is_an_error_with_a_hint() {
+        for bad in [
+            "--allow-writes",
+            "--allow-write=1",
+            "-w",
+            "--help",
+            "-weird.sga",
+        ] {
+            let err = parse_run_args(&v(&[bad, "main.sga"])).unwrap_err();
+            assert!(err.contains(&format!("'{}'", bad)), "{bad}: {err}");
+            assert!(err.contains("./"), "нет подсказки про './': {err}");
+            assert!(err.contains("--"), "{err}");
+            assert!(err.contains(RUN_USAGE), "нет строки использования: {err}");
+        }
+        // Неизвестный флаг после допустимого — тоже ошибка.
+        assert!(parse_run_args(&v(&["--allow-write", "--bogus", "main.sga"])).is_err());
+    }
+
+    #[test]
+    fn flags_without_a_path_print_the_usage() {
+        for rest in [
+            v(&[]),
+            v(&["--allow-write"]),
+            v(&["--"]),
+            v(&["--allow-write", "--"]),
+        ] {
+            assert_eq!(
+                parse_run_args(&rest),
+                Err(RUN_USAGE.to_string()),
+                "аргументы: {:?}",
+                rest
+            );
+        }
+    }
 }

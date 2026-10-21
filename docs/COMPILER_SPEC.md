@@ -44,16 +44,20 @@ Vm::run(&chunk)        — стековый интерпретатор байт�
 такой программе — явная ошибка (нет базовой директории для резолвинга
 путей). `sga::run_source_file(path)` — полный конвейер с
 `module_resolver`, см. `src/lib.rs`. Обе функции запускают программу с
-параметрами по умолчанию; параметры запуска (T012/T013, M006: аргументы
-командной строки для `args()` и источник стандартного ввода для
-`read_line()`/`read_stdin()`) передаются через
+параметрами по умолчанию; параметры запуска (T012/T013/T015, M006: аргументы
+командной строки для `args()`, источник стандартного ввода для
+`read_line()`/`read_stdin()` и разрешение записи для `write_file()`)
+передаются через
 `sga::run_source_with_options(text, RunOptions)` и
 `sga::run_source_file_with_options(path, RunOptions)`. `RunOptions` —
 builder (`RunOptions::new().with_args(..)`, `.with_stdin_bytes(..)`,
-`.with_process_stdin()`); параметры попадают в VM через `Vm::set_args` и
-`Vm::set_stdin` между `Vm::new` и `Vm::run`. По умолчанию ввод ПУСТ:
-стандартный ввод процесса библиотека не трогает, пока его явно не
-подключили (`with_process_stdin()`, так делает CLI).
+`.with_process_stdin()`, `.with_allow_write(bool)`); параметры попадают в VM
+через `Vm::set_args`, `Vm::set_stdin` и `Vm::set_allow_write` между `Vm::new`
+и `Vm::run`. По умолчанию ввод ПУСТ и запись ЗАПРЕЩЕНА: стандартный ввод
+процесса библиотека не трогает, пока его явно не подключили
+(`with_process_stdin()`, так делает CLI), а `write_file` не пишет, пока запись
+явно не разрешили (`with_allow_write(true)`; в CLI — флаг
+`sga run --allow-write <файл>`, только ДО пути файла).
 
 ## Lexer (`src/lexer/mod.rs`)
 
@@ -224,6 +228,19 @@ Constant folding (арифметика/сравнения/`AND`/`OR`/унарн�
 trait (`FsLoader`) — для тестов используется in-memory реализация без
 обращения к реальной файловой системе (`tests/module_resolver_test.rs`).
 
+Граница песочницы — каталог входного файла: `compute_confinement_root(entry)`
+— единственный источник корня для `IMPORT`, `pkg:`, `read_file` и
+`write_file`. Корень НИКОГДА не бывает пустым: для файла в текущем каталоге
+(`sga run main.sga`, `./main.sga`) `Path::parent()` даёт пустой путь, и он
+заменяется на `.` (до T015 пустой корень принимал любой относительный путь,
+включая `../x`, — см. `docs/SECURITY.md`). `is_within_root(candidate, root)`
+канонизирует оба пути, если оба существуют, и иначе откатывается на
+лексическую проверку, которая сначала приводит оба пути к абсолютным по
+текущему каталогу и отказывает, если текущий каталог недоступен. Лексический
+fallback не раскрывает symlink'и в ещё не существующих путях: для чтения и
+`IMPORT` это безвредно (файла нет — читать нечего), а запись проверяет
+физический родительский каталог цели сама (`src/fs_sandbox.rs`, TD-015).
+
 ### `pkg:`-импорты и `sga.toml` (T011, M005, 2026-10-10)
 
 `IMPORT "pkg:имя/путь/к/файлу.sga"` — отдельная ветка `Stmt::Import` в
@@ -247,8 +264,8 @@ trait (`FsLoader`) — для тестов используется in-memory р
 
 ## Тесты
 
-`tests/integration_test.rs` (184 теста) + `tests/module_resolver_test.rs`
-(12 тестов) + 26 unit-тестов лексера + 4 unit-теста json + 17 unit-тестов optimizer + 17 unit-тестов manifest + 14 unit-тестов stdin (`src/lexer/mod.rs`, `src/json.rs`, `src/optimizer.rs`, `src/manifest.rs`, `src/stdin.rs`) — через публичный API `sga::run_source()`/`run_source_file()`,
+`tests/integration_test.rs` (247 тестов) + `tests/module_resolver_test.rs`
+(12 тестов) + 26 unit-тестов лексера + 4 unit-теста json + 17 unit-тестов optimizer + 17 unit-тестов manifest + 14 unit-тестов stdin + 11 unit-тестов clock + 10 unit-тестов module_resolver + 20 unit-тестов fs_sandbox + 8 unit-тестов CLI (`src/lexer/mod.rs`, `src/json.rs`, `src/optimizer.rs`, `src/manifest.rs`, `src/stdin.rs`, `src/clock.rs`, `src/module_resolver.rs`, `src/fs_sandbox.rs`, `src/main.rs`) — через публичный API `sga::run_source()`/`run_source_file()`,
 проверяющих как успешные программы (арифметика, рекурсия, циклы, массивы,
 типизированный и смешанный typed/untyped код, `MUT`-параметры, замыкания,
 IIFE, цепочки вызовов, импорты, диамант-импорты), так и обязательные

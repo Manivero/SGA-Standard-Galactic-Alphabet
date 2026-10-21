@@ -687,6 +687,11 @@ fn builtin_arity(name: &str) -> Option<(usize, usize)> {
         // T013 (M006): read_line() / read_stdin() — без аргументов.
         "read_line" => Some((0, 0)),
         "read_stdin" => Some((0, 0)),
+        // T014 (M006): time_now_ms() / time_monotonic_ms() — без аргументов.
+        "time_now_ms" => Some((0, 0)),
+        "time_monotonic_ms" => Some((0, 0)),
+        // T015 (M006): write_file(path, content) — ровно 2 аргумента.
+        "write_file" => Some((2, 2)),
         _ => None,
     }
 }
