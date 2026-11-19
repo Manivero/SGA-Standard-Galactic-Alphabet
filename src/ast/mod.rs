@@ -13,6 +13,82 @@
 //! src/sga_alphabet.rs — это полный 26-буквенный алфавит, а не таблица
 //! на 26 фиксированных ключевых слов, поэтому MUT и IMPORT — это два
 //! независимых "слова", а не одна и та же кодовая позиция).
+//!
+//! ПОЗИЦИИ (T017, M007): каждый `Expr` и `Stmt` (а также `MatchArm` и `Param`)
+//! несёт `Span` — диапазон токенов, из которых он построен. Прежние enum'ы
+//! `Expr`/`Stmt` стали `ExprKind`/`StmtKind`; структуры `Expr { kind, span }` и
+//! `Stmt { kind, span }` — то, чем узлы теперь являются. Равенство узлов
+//! (`PartialEq`) СТРУКТУРНОЕ: `span` в нём не участвует. `Debug` `span` тоже не
+//! показывает: вывод `sga fmt` (`{:#?}` по дереву) остаётся байт-в-байт прежним,
+//! а `Debug` и `Eq` согласованы (то, что выглядит одинаково, и равно). Позиции
+//! читают явно, через `.span`.
+
+use crate::lexer::token::TokenSpan;
+
+/// Диапазон исходного текста узла AST: индексы токенов `first..=last` в таблице
+/// токенов, из которой построен узел (`tokens[first]` — первый токен узла,
+/// `tokens[last]` — последний).
+///
+/// Это индексы, а не позиции в тексте: так диапазон занимает 8 байт (узлы
+/// `Expr`/`Stmt` возвращаются парсером по значению, и каждый лишний байт
+/// умножается на глубину рекурсии — см. `MAX_PARSE_DEPTH` в `parser`), а парсеру
+/// не нужна таблица границ токенов. Позиции (строка/колонка начала первого токена
+/// и конца последнего) даёт `Span::resolve` по таблице `TokenSpan`, которую строит
+/// `Lexer::tokenize_with_spans` — ТОЙ ЖЕ самой последовательности токенов.
+///
+/// `Span::NONE` — «позиции нет»: синтезированный узел, узел из файла, разобранного
+/// `Parser::detached` (импортируемые модули: их индексы относились бы к другой
+/// таблице токенов).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    /// Индекс первого токена узла.
+    pub first: u32,
+    /// Индекс последнего токена узла (включительно).
+    pub last: u32,
+}
+
+impl Span {
+    /// «Позиции нет» (см. описание типа).
+    pub const NONE: Span = Span {
+        first: u32::MAX,
+        last: u32::MAX,
+    };
+
+    /// Диапазон токенов `first..=last`. Индексы, не помещающиеся в `u32` (больше
+    /// четырёх миллиардов токенов), прижимаются к `u32::MAX - 1`, чтобы не
+    /// совпасть с `NONE`.
+    pub fn new(first: usize, last: usize) -> Span {
+        let clamp =
+            |index: usize| u32::try_from(index).map_or(u32::MAX - 1, |i| i.min(u32::MAX - 1));
+        Span {
+            first: clamp(first),
+            last: clamp(last),
+        }
+    }
+
+    /// Это `Span::NONE`?
+    pub fn is_none(self) -> bool {
+        self == Span::NONE
+    }
+
+    /// Позиции в тексте: от начала токена `first` до конца токена `last` по
+    /// таблице границ токенов (1-based, колонки в символах, конец исключающий).
+    /// `None` — для `Span::NONE`, при `first > last` и если индекс выходит за
+    /// таблицу (таблица от другого текста).
+    pub fn resolve(self, table: &[TokenSpan]) -> Option<TokenSpan> {
+        if self.is_none() || self.first > self.last {
+            return None;
+        }
+        let first = table.get(self.first as usize)?;
+        let last = table.get(self.last as usize)?;
+        Some(TokenSpan {
+            line: first.line,
+            col: first.col,
+            end_line: last.end_line,
+            end_col: last.end_col,
+        })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum BinOp {
@@ -72,15 +148,72 @@ pub enum TypeAnnotation {
 /// (`Stmt::FnDecl`) — параметры анонимных функций/замыканий
 /// (`Expr::Lambda`) всегда mutable=true, захват происходит по значению,
 /// см. `runtime::ClosureValue`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone)]
 pub struct Param {
     pub name: String,
     pub ty: Option<TypeAnnotation>,
     pub mutable: bool,
+    /// `[MUT] имя [: тип]` целиком (T017).
+    pub span: Span,
+}
+
+/// Равенство структурное: `span` не сравнивается (см. шапку модуля).
+impl PartialEq for Param {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.ty == other.ty && self.mutable == other.mutable
+    }
+}
+
+/// `Debug` без `span` (см. шапку модуля).
+impl std::fmt::Debug for Param {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Param")
+            .field("name", &self.name)
+            .field("ty", &self.ty)
+            .field("mutable", &self.mutable)
+            .finish()
+    }
+}
+
+/// Выражение: вариант (`kind`) и диапазон токенов, из которых оно построено
+/// (T017). Равенство структурное — `span` не сравнивается.
+#[derive(Clone)]
+pub struct Expr {
+    pub kind: ExprKind,
+    pub span: Span,
+}
+
+impl Expr {
+    pub fn new(kind: ExprKind, span: Span) -> Expr {
+        Expr { kind, span }
+    }
+
+    /// Узел без позиции (`Span::NONE`): собранный вручную (тесты) или
+    /// синтезированный.
+    pub fn unspanned(kind: ExprKind) -> Expr {
+        Expr {
+            kind,
+            span: Span::NONE,
+        }
+    }
+}
+
+impl PartialEq for Expr {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+    }
+}
+
+/// `Debug` прозрачен: печатает только `kind`, как печатал прежний enum `Expr`
+/// (см. шапку модуля).
+impl std::fmt::Debug for Expr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.kind, f)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Expr {
+pub enum ExprKind {
     Int(i64),
     Float(f64),
     Str(String),
@@ -199,15 +332,71 @@ pub enum Pattern {
     Bind(String),
 }
 
-/// Один пункт `MATCH`: `паттерн -> тело`.
-#[derive(Debug, Clone, PartialEq)]
+/// Один пункт `MATCH`: `паттерн -> тело`. `span` — от начала паттерна до конца
+/// тела (T017); в равенстве не участвует.
+#[derive(Clone)]
 pub struct MatchArm {
     pub pattern: Pattern,
     pub body: Expr,
+    pub span: Span,
+}
+
+impl PartialEq for MatchArm {
+    fn eq(&self, other: &Self) -> bool {
+        self.pattern == other.pattern && self.body == other.body
+    }
+}
+
+/// `Debug` без `span` (см. шапку модуля).
+impl std::fmt::Debug for MatchArm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MatchArm")
+            .field("pattern", &self.pattern)
+            .field("body", &self.body)
+            .finish()
+    }
+}
+
+/// Оператор: вариант (`kind`) и диапазон токенов, из которых он построен
+/// (T017), включая необязательную `;` в конце. Равенство структурное — `span`
+/// не сравнивается.
+#[derive(Clone)]
+pub struct Stmt {
+    pub kind: StmtKind,
+    pub span: Span,
+}
+
+impl Stmt {
+    pub fn new(kind: StmtKind, span: Span) -> Stmt {
+        Stmt { kind, span }
+    }
+
+    /// Узел без позиции (`Span::NONE`): собранный вручную (тесты) или
+    /// синтезированный.
+    pub fn unspanned(kind: StmtKind) -> Stmt {
+        Stmt {
+            kind,
+            span: Span::NONE,
+        }
+    }
+}
+
+impl PartialEq for Stmt {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+    }
+}
+
+/// `Debug` прозрачен: печатает только `kind`, как печатал прежний enum `Stmt`
+/// (см. шапку модуля).
+impl std::fmt::Debug for Stmt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.kind, f)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Stmt {
+pub enum StmtKind {
     /// let/var/const name [: type] = expr  (is_mutable, is_const)
     VarDecl {
         name: String,
@@ -264,3 +453,653 @@ pub enum Stmt {
 }
 
 pub type Program = Vec<Stmt>;
+
+/// Глубина поддерева `stmt` больше `limit`?
+///
+/// Глубина считает и операторы, и выражения: корень — 1, каждый вложенный
+/// `Stmt`/`Expr` — на единицу глубже своего родителя (`MatchArm` отдельным
+/// уровнем не считается). Обход ИТЕРАТИВНЫЙ (явный стек в куче): функция
+/// предназначена для проверки ДО рекурсивных проходов (`semantic`,
+/// `typechecker`), которым глубокое дерево стоит неограниченного стека, поэтому
+/// сама на глубоком дереве упасть не может. Парсер не ограничивает глубину AST:
+/// левоассоциативные цепочки (`1+1+…+1`) и постфиксы (`a[0][0]…`) он строит
+/// циклом, и `MAX_PARSE_DEPTH` их не видит.
+///
+/// Все варианты `ExprKind` и `StmtKind` перечислены явно (без `_`): новый вариант
+/// не скомпилируется, пока не будет учтён здесь.
+pub fn exceeds_depth(stmt: &Stmt, limit: usize) -> bool {
+    enum Node<'a> {
+        Stmt(&'a Stmt),
+        Expr(&'a Expr),
+    }
+    let mut work = vec![(Node::Stmt(stmt), 1_usize)];
+    while let Some((node, depth)) = work.pop() {
+        if depth > limit {
+            return true;
+        }
+        let below = depth + 1;
+        match node {
+            Node::Stmt(stmt) => match &stmt.kind {
+                StmtKind::VarDecl { value, .. } => work.push((Node::Expr(value), below)),
+                StmtKind::ExprStmt(expr) => work.push((Node::Expr(expr), below)),
+                StmtKind::Print(args) => {
+                    work.extend(args.iter().map(|arg| (Node::Expr(arg), below)))
+                }
+                StmtKind::If {
+                    cond,
+                    then_branch,
+                    else_branch,
+                } => {
+                    work.push((Node::Expr(cond), below));
+                    work.extend(then_branch.iter().map(|s| (Node::Stmt(s), below)));
+                    if let Some(else_branch) = else_branch {
+                        work.extend(else_branch.iter().map(|s| (Node::Stmt(s), below)));
+                    }
+                }
+                StmtKind::While { cond, body } => {
+                    work.push((Node::Expr(cond), below));
+                    work.extend(body.iter().map(|s| (Node::Stmt(s), below)));
+                }
+                StmtKind::ForIn {
+                    start, end, body, ..
+                } => {
+                    work.push((Node::Expr(start), below));
+                    work.push((Node::Expr(end), below));
+                    work.extend(body.iter().map(|s| (Node::Stmt(s), below)));
+                }
+                StmtKind::FnDecl { body, .. } => {
+                    work.extend(body.iter().map(|s| (Node::Stmt(s), below)))
+                }
+                StmtKind::Return(value) => {
+                    if let Some(value) = value {
+                        work.push((Node::Expr(value), below));
+                    }
+                }
+                StmtKind::Block(stmts) => work.extend(stmts.iter().map(|s| (Node::Stmt(s), below))),
+                StmtKind::Break
+                | StmtKind::Continue
+                | StmtKind::Import(_)
+                | StmtKind::StructDecl { .. } => {}
+            },
+            Node::Expr(expr) => match &expr.kind {
+                ExprKind::Int(_)
+                | ExprKind::Float(_)
+                | ExprKind::Str(_)
+                | ExprKind::Bool(_)
+                | ExprKind::Nil
+                | ExprKind::Ident(_) => {}
+                ExprKind::Array(items) => work.extend(items.iter().map(|e| (Node::Expr(e), below))),
+                ExprKind::Index(target, index) => {
+                    work.push((Node::Expr(target), below));
+                    work.push((Node::Expr(index), below));
+                }
+                ExprKind::Unary(_, operand) => work.push((Node::Expr(operand), below)),
+                ExprKind::Binary(_, left, right) => {
+                    work.push((Node::Expr(left), below));
+                    work.push((Node::Expr(right), below));
+                }
+                ExprKind::Call(_, args) => work.extend(args.iter().map(|e| (Node::Expr(e), below))),
+                ExprKind::CallExpr(callee, args) => {
+                    work.push((Node::Expr(callee), below));
+                    work.extend(args.iter().map(|e| (Node::Expr(e), below)));
+                }
+                ExprKind::Assign(_, value) => work.push((Node::Expr(value), below)),
+                ExprKind::IndexAssign(target, index, value) => {
+                    work.push((Node::Expr(target), below));
+                    work.push((Node::Expr(index), below));
+                    work.push((Node::Expr(value), below));
+                }
+                ExprKind::Lambda { body, .. } => {
+                    work.extend(body.iter().map(|s| (Node::Stmt(s), below)))
+                }
+                ExprKind::StructLit { fields, .. } => {
+                    work.extend(fields.iter().map(|(_, e)| (Node::Expr(e), below)))
+                }
+                ExprKind::FieldAccess(object, _) => work.push((Node::Expr(object), below)),
+                ExprKind::FieldAssign(object, _, value) => {
+                    work.push((Node::Expr(object), below));
+                    work.push((Node::Expr(value), below));
+                }
+                ExprKind::MethodCall(object, _, args) => {
+                    work.push((Node::Expr(object), below));
+                    work.extend(args.iter().map(|e| (Node::Expr(e), below)));
+                }
+                ExprKind::Match(scrutinee, arms) => {
+                    work.push((Node::Expr(scrutinee), below));
+                    work.extend(arms.iter().map(|arm| (Node::Expr(&arm.body), below)));
+                }
+            },
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn int(n: i64) -> Expr {
+        Expr::unspanned(ExprKind::Int(n))
+    }
+
+    fn ex(kind: ExprKind) -> Expr {
+        Expr::unspanned(kind)
+    }
+
+    fn st(kind: StmtKind) -> Stmt {
+        Stmt::unspanned(kind)
+    }
+
+    fn boxed(expr: Expr) -> Box<Expr> {
+        Box::new(expr)
+    }
+
+    fn token(line: usize, col: usize, end_line: usize, end_col: usize) -> TokenSpan {
+        TokenSpan {
+            line,
+            col,
+            end_line,
+            end_col,
+        }
+    }
+
+    // ── Span ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn none_is_none_and_real_ranges_are_not() {
+        assert!(Span::NONE.is_none());
+        assert!(!Span::new(0, 0).is_none());
+        assert!(!Span::new(3, 7).is_none());
+        assert_eq!(Span::new(3, 7), Span { first: 3, last: 7 });
+    }
+
+    #[test]
+    fn new_clamps_indexes_that_do_not_fit_and_never_produces_none() {
+        let huge = Span::new(usize::MAX, usize::MAX);
+        assert!(!huge.is_none());
+        assert_eq!(huge.first, u32::MAX - 1);
+        assert_eq!(huge.last, u32::MAX - 1);
+        // u32::MAX сам по себе тоже зарезервирован под NONE
+        assert!(!Span::new(u32::MAX as usize, 0).is_none());
+        assert_eq!(Span::new(u32::MAX as usize, 0).first, u32::MAX - 1);
+    }
+
+    #[test]
+    fn resolve_joins_the_start_of_the_first_and_the_end_of_the_last_token() {
+        let table = [
+            token(1, 1, 1, 4),
+            token(1, 5, 1, 6),
+            token(2, 3, 3, 8),
+            token(3, 8, 3, 8),
+        ];
+        assert_eq!(Span::new(0, 1).resolve(&table), Some(token(1, 1, 1, 6)));
+        assert_eq!(Span::new(1, 2).resolve(&table), Some(token(1, 5, 3, 8)));
+        assert_eq!(Span::new(0, 3).resolve(&table), Some(token(1, 1, 3, 8)));
+    }
+
+    #[test]
+    fn resolve_of_a_single_token_is_that_token() {
+        let table = [token(1, 1, 1, 4), token(2, 2, 2, 9)];
+        assert_eq!(Span::new(1, 1).resolve(&table), Some(table[1]));
+    }
+
+    #[test]
+    fn resolve_is_none_for_none_reversed_and_out_of_table_ranges() {
+        let table = [token(1, 1, 1, 2), token(1, 3, 1, 4)];
+        assert_eq!(Span::NONE.resolve(&table), None);
+        assert_eq!(Span::new(1, 0).resolve(&table), None);
+        assert_eq!(Span::new(0, 2).resolve(&table), None);
+        assert_eq!(Span::new(2, 2).resolve(&table), None);
+        assert_eq!(Span::new(0, 0).resolve(&[]), None);
+    }
+
+    // ── равенство узлов ─────────────────────────────────────────────────
+
+    #[test]
+    fn node_equality_is_structural_and_ignores_spans() {
+        let here = Expr::new(ExprKind::Int(1), Span::new(0, 0));
+        let there = Expr::new(ExprKind::Int(1), Span::new(5, 9));
+        assert_eq!(here, there);
+        assert_ne!(here, int(2));
+        assert_ne!(here.span, there.span);
+
+        let nested_a = ex(ExprKind::Binary(
+            BinOp::Add,
+            boxed(Expr::new(ExprKind::Int(1), Span::new(0, 0))),
+            boxed(Expr::new(ExprKind::Int(2), Span::new(2, 2))),
+        ));
+        let nested_b = ex(ExprKind::Binary(
+            BinOp::Add,
+            boxed(int(1)),
+            boxed(Expr::new(ExprKind::Int(2), Span::new(9, 9))),
+        ));
+        assert_eq!(nested_a, nested_b);
+        let different_op = ex(ExprKind::Binary(BinOp::Sub, boxed(int(1)), boxed(int(2))));
+        assert_ne!(nested_a, different_op);
+    }
+
+    #[test]
+    fn statement_arm_and_param_equality_ignore_spans_too() {
+        let a = Stmt::new(StmtKind::Break, Span::new(1, 2));
+        let b = Stmt::new(StmtKind::Break, Span::new(7, 8));
+        assert_eq!(a, b);
+        assert_ne!(a, st(StmtKind::Continue));
+
+        let arm = |span| MatchArm {
+            pattern: Pattern::Wildcard,
+            body: int(1),
+            span,
+        };
+        assert_eq!(arm(Span::new(0, 3)), arm(Span::NONE));
+        let other_body = MatchArm {
+            pattern: Pattern::Wildcard,
+            body: int(2),
+            span: Span::NONE,
+        };
+        assert_ne!(arm(Span::NONE), other_body);
+
+        let param = |span| Param {
+            name: "x".into(),
+            ty: None,
+            mutable: false,
+            span,
+        };
+        assert_eq!(param(Span::new(0, 0)), param(Span::new(4, 4)));
+        let mutable = Param {
+            mutable: true,
+            ..param(Span::NONE)
+        };
+        assert_ne!(param(Span::NONE), mutable);
+    }
+
+    // ── Debug не показывает позиции (вывод `sga fmt` прежний) ───────────
+
+    #[test]
+    fn debug_output_is_the_one_of_the_old_enums_and_hides_spans() {
+        let stmt = Stmt::new(
+            StmtKind::ExprStmt(Expr::new(ExprKind::Int(1), Span::new(2, 2))),
+            Span::new(2, 3),
+        );
+        // ровно то, что печатал прежний `Stmt::ExprStmt(Expr::Int(1))`
+        assert_eq!(
+            format!("{stmt:#?}"),
+            "ExprStmt(\n    Int(\n        1,\n    ),\n)"
+        );
+        assert_eq!(format!("{stmt:?}"), "ExprStmt(Int(1))");
+        assert!(!format!("{stmt:#?}").contains("span"));
+    }
+
+    #[test]
+    fn debug_of_params_and_arms_hides_spans_and_keeps_field_order() {
+        let param = Param {
+            name: "x".into(),
+            ty: Some(TypeAnnotation::Int),
+            mutable: true,
+            span: Span::new(1, 4),
+        };
+        assert_eq!(
+            format!("{param:?}"),
+            "Param { name: \"x\", ty: Some(Int), mutable: true }"
+        );
+        let arm = MatchArm {
+            pattern: Pattern::Wildcard,
+            body: int(7),
+            span: Span::new(0, 9),
+        };
+        assert_eq!(
+            format!("{arm:?}"),
+            "MatchArm { pattern: Wildcard, body: Int(7) }"
+        );
+        let decl = st(StmtKind::FnDecl {
+            name: "f".into(),
+            params: vec![param],
+            body: vec![],
+            return_ty: None,
+        });
+        assert_eq!(
+            format!("{decl:?}"),
+            "FnDecl { name: \"f\", params: [Param { name: \"x\", ty: Some(Int), mutable: true }], body: [], return_ty: None }"
+        );
+    }
+
+    // ── exceeds_depth: КАЖДАЯ дочерняя позиция каждого варианта обходится ─
+
+    /// Выражение, вложенное `levels` раз через `wrap` вокруг литерала.
+    fn expr_chain(levels: usize, wrap: &dyn Fn(Expr) -> Expr) -> Expr {
+        let mut expr = int(0);
+        for _ in 0..levels {
+            expr = wrap(expr);
+        }
+        expr
+    }
+
+    fn stmt_chain(levels: usize, wrap: &dyn Fn(Stmt) -> Stmt) -> Stmt {
+        let mut stmt = st(StmtKind::Break);
+        for _ in 0..levels {
+            stmt = wrap(stmt);
+        }
+        stmt
+    }
+
+    /// Способ поместить выражение в родительское выражение / оператор (таблицы
+    /// теста глубины перебирают все дочерние позиции).
+    type ExprWrapper = Box<dyn Fn(Expr) -> Expr>;
+    type ExprParent = Box<dyn Fn(Expr) -> Stmt>;
+    type StmtWrapper = Box<dyn Fn(Stmt) -> Stmt>;
+
+    /// Дерево глубины ровно `depth` проходит предел `depth` и не проходит
+    /// предел `depth - 1`.
+    fn assert_depth(stmt: &Stmt, depth: usize, what: &str) {
+        assert!(
+            !exceeds_depth(stmt, depth),
+            "{what}: глубина {depth} в пределе"
+        );
+        assert!(
+            exceeds_depth(stmt, depth - 1),
+            "{what}: глубина {depth} не замечена (дочерняя позиция не обойдена?)"
+        );
+    }
+
+    #[test]
+    fn depth_is_counted_through_every_expression_child_position() {
+        let wrappers: Vec<(&str, ExprWrapper)> = vec![
+            ("Array", Box::new(|e| ex(ExprKind::Array(vec![int(0), e])))),
+            (
+                "Index.target",
+                Box::new(|e| ex(ExprKind::Index(boxed(e), boxed(int(0))))),
+            ),
+            (
+                "Index.index",
+                Box::new(|e| ex(ExprKind::Index(boxed(int(0)), boxed(e)))),
+            ),
+            (
+                "Unary",
+                Box::new(|e| ex(ExprKind::Unary(UnOp::Neg, boxed(e)))),
+            ),
+            (
+                "Binary.left",
+                Box::new(|e| ex(ExprKind::Binary(BinOp::Add, boxed(e), boxed(int(0))))),
+            ),
+            (
+                "Binary.right",
+                Box::new(|e| ex(ExprKind::Binary(BinOp::Add, boxed(int(0)), boxed(e)))),
+            ),
+            (
+                "Call.args",
+                Box::new(|e| ex(ExprKind::Call("f".into(), vec![int(0), e]))),
+            ),
+            (
+                "CallExpr.callee",
+                Box::new(|e| ex(ExprKind::CallExpr(boxed(e), vec![]))),
+            ),
+            (
+                "CallExpr.args",
+                Box::new(|e| ex(ExprKind::CallExpr(boxed(int(0)), vec![e]))),
+            ),
+            (
+                "Assign",
+                Box::new(|e| ex(ExprKind::Assign("a".into(), boxed(e)))),
+            ),
+            (
+                "IndexAssign.target",
+                Box::new(|e| {
+                    ex(ExprKind::IndexAssign(
+                        boxed(e),
+                        boxed(int(0)),
+                        boxed(int(0)),
+                    ))
+                }),
+            ),
+            (
+                "IndexAssign.index",
+                Box::new(|e| {
+                    ex(ExprKind::IndexAssign(
+                        boxed(int(0)),
+                        boxed(e),
+                        boxed(int(0)),
+                    ))
+                }),
+            ),
+            (
+                "IndexAssign.value",
+                Box::new(|e| {
+                    ex(ExprKind::IndexAssign(
+                        boxed(int(0)),
+                        boxed(int(0)),
+                        boxed(e),
+                    ))
+                }),
+            ),
+            (
+                "Lambda.body",
+                Box::new(|e| {
+                    ex(ExprKind::Lambda {
+                        params: vec![],
+                        body: vec![st(StmtKind::ExprStmt(e))],
+                    })
+                }),
+            ),
+            (
+                "StructLit.field",
+                Box::new(|e| {
+                    ex(ExprKind::StructLit {
+                        type_name: "P".into(),
+                        fields: vec![("x".into(), e)],
+                    })
+                }),
+            ),
+            (
+                "FieldAccess",
+                Box::new(|e| ex(ExprKind::FieldAccess(boxed(e), "x".into()))),
+            ),
+            (
+                "FieldAssign.object",
+                Box::new(|e| ex(ExprKind::FieldAssign(boxed(e), "x".into(), boxed(int(0))))),
+            ),
+            (
+                "FieldAssign.value",
+                Box::new(|e| ex(ExprKind::FieldAssign(boxed(int(0)), "x".into(), boxed(e)))),
+            ),
+            (
+                "MethodCall.object",
+                Box::new(|e| ex(ExprKind::MethodCall(boxed(e), "m".into(), vec![]))),
+            ),
+            (
+                "MethodCall.args",
+                Box::new(|e| ex(ExprKind::MethodCall(boxed(int(0)), "m".into(), vec![e]))),
+            ),
+            (
+                "Match.scrutinee",
+                Box::new(|e| ex(ExprKind::Match(boxed(e), vec![]))),
+            ),
+            (
+                "Match.arm body",
+                Box::new(|e| {
+                    ex(ExprKind::Match(
+                        boxed(int(0)),
+                        vec![MatchArm {
+                            pattern: Pattern::Wildcard,
+                            body: e,
+                            span: Span::NONE,
+                        }],
+                    ))
+                }),
+            ),
+        ];
+        for (name, wrap) in &wrappers {
+            let levels = 25;
+            let root = st(StmtKind::ExprStmt(expr_chain(levels, wrap.as_ref())));
+            // Тело замыкания — список ОПЕРАТОРОВ, поэтому каждый уровень
+            // `Lambda.body` стоит два уровня глубины: само замыкание и
+            // оператор-выражение внутри него. Остальные обёртки — по одному.
+            let per_level = if *name == "Lambda.body" { 2 } else { 1 };
+            // ExprStmt (1) + `levels` обёрток + литерал
+            assert_depth(&root, levels * per_level + 2, name);
+        }
+    }
+
+    #[test]
+    fn depth_is_counted_through_every_statement_child_position() {
+        let expr_parents: Vec<(&str, ExprParent)> = vec![
+            (
+                "VarDecl.value",
+                Box::new(|e| {
+                    st(StmtKind::VarDecl {
+                        name: "x".into(),
+                        value: e,
+                        mutable: false,
+                        ty: None,
+                    })
+                }),
+            ),
+            ("ExprStmt", Box::new(|e| st(StmtKind::ExprStmt(e)))),
+            ("Print", Box::new(|e| st(StmtKind::Print(vec![int(0), e])))),
+            (
+                "If.cond",
+                Box::new(|e| {
+                    st(StmtKind::If {
+                        cond: e,
+                        then_branch: vec![],
+                        else_branch: None,
+                    })
+                }),
+            ),
+            (
+                "While.cond",
+                Box::new(|e| {
+                    st(StmtKind::While {
+                        cond: e,
+                        body: vec![],
+                    })
+                }),
+            ),
+            (
+                "ForIn.start",
+                Box::new(|e| {
+                    st(StmtKind::ForIn {
+                        var: "i".into(),
+                        start: e,
+                        end: int(0),
+                        body: vec![],
+                    })
+                }),
+            ),
+            (
+                "ForIn.end",
+                Box::new(|e| {
+                    st(StmtKind::ForIn {
+                        var: "i".into(),
+                        start: int(0),
+                        end: e,
+                        body: vec![],
+                    })
+                }),
+            ),
+            ("Return", Box::new(|e| st(StmtKind::Return(Some(e))))),
+        ];
+        for (name, parent) in &expr_parents {
+            let chain = expr_chain(25, &|e| ex(ExprKind::Unary(UnOp::Neg, boxed(e))));
+            // оператор (1) + 25 унарных + литерал
+            assert_depth(&parent(chain), 27, name);
+        }
+
+        let stmt_wrappers: Vec<(&str, StmtWrapper)> = vec![
+            (
+                "If.then",
+                Box::new(|s| {
+                    st(StmtKind::If {
+                        cond: int(0),
+                        then_branch: vec![s],
+                        else_branch: None,
+                    })
+                }),
+            ),
+            (
+                "If.else",
+                Box::new(|s| {
+                    st(StmtKind::If {
+                        cond: int(0),
+                        then_branch: vec![],
+                        else_branch: Some(vec![s]),
+                    })
+                }),
+            ),
+            (
+                "While.body",
+                Box::new(|s| {
+                    st(StmtKind::While {
+                        cond: int(0),
+                        body: vec![s],
+                    })
+                }),
+            ),
+            (
+                "ForIn.body",
+                Box::new(|s| {
+                    st(StmtKind::ForIn {
+                        var: "i".into(),
+                        start: int(0),
+                        end: int(1),
+                        body: vec![s],
+                    })
+                }),
+            ),
+            (
+                "FnDecl.body",
+                Box::new(|s| {
+                    st(StmtKind::FnDecl {
+                        name: "f".into(),
+                        params: vec![],
+                        body: vec![s],
+                        return_ty: None,
+                    })
+                }),
+            ),
+            ("Block", Box::new(|s| st(StmtKind::Block(vec![s])))),
+        ];
+        for (name, wrap) in &stmt_wrappers {
+            // 25 обёрток + `BREAK`
+            assert_depth(&stmt_chain(25, wrap.as_ref()), 26, name);
+        }
+    }
+
+    #[test]
+    fn leaves_and_siblings_do_not_add_depth() {
+        // широкое, но неглубокое дерево: 10 000 братьев на одном уровне
+        let wide = st(StmtKind::Print(vec![int(0); 10_000]));
+        assert_depth(&wide, 2, "широкий PRINT");
+        for leaf in [
+            st(StmtKind::Break),
+            st(StmtKind::Continue),
+            st(StmtKind::Import("m.sga".into())),
+            st(StmtKind::StructDecl {
+                name: "P".into(),
+                fields: vec![],
+            }),
+            st(StmtKind::Return(None)),
+        ] {
+            assert!(!exceeds_depth(&leaf, 1), "{leaf:?}");
+            assert!(exceeds_depth(&leaf, 0), "{leaf:?}");
+        }
+    }
+
+    #[test]
+    fn a_very_deep_tree_is_measured_without_recursion() {
+        // 400 000 уровней — рекурсивный обход упал бы на стеке потока тестов
+        // (2 МиБ); освобождение такого дерева тоже рекурсивно, поэтому сначала
+        // «разбираем» его в цикле, чтобы не упасть в `Drop`.
+        let mut expr = int(0);
+        for _ in 0..400_000 {
+            expr = ex(ExprKind::Binary(BinOp::Add, boxed(expr), boxed(int(1))));
+        }
+        let root = st(StmtKind::ExprStmt(expr));
+        assert!(exceeds_depth(&root, 1_000));
+        assert!(exceeds_depth(&root, 399_999));
+        let StmtKind::ExprStmt(mut expr) = root.kind else {
+            unreachable!()
+        };
+        while let ExprKind::Binary(_, left, _) = expr.kind {
+            expr = *left;
+        }
+    }
+}

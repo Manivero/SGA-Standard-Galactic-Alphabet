@@ -31,7 +31,7 @@
 //! пользовательских функций (`helper`, `mid_fn`, ...) — это ASCII
 //! идентификаторы, тоже не требующие кодирования.
 
-use sga::ast::{Expr, Program, Stmt};
+use sga::ast::{Expr, ExprKind, Program, StmtKind};
 use sga::lexer::Lexer;
 use sga::module_resolver::{resolve_imports, ImportError, ModuleLoader};
 use sga::parser::Parser;
@@ -86,13 +86,13 @@ fn parse(source: &str) -> Result<Program, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Считает количество top-level `Stmt::FnDecl` с данным именем в
+/// Считает количество top-level `StmtKind::FnDecl` с данным именем в
 /// программе — удобно для проверки, что инлайнинг произошёл ровно
 /// один раз (а не 0 и не 2+ раза).
 fn count_fn_decls(program: &Program, name: &str) -> usize {
     program
         .iter()
-        .filter(|s| matches!(s, Stmt::FnDecl { name: n, .. } if n == name))
+        .filter(|s| matches!(&s.kind, StmtKind::FnDecl { name: n, .. } if n == name))
         .count()
 }
 
@@ -109,10 +109,57 @@ fn test_simple_import_inlines_function_from_other_file() {
     let program = parse(&entry_src).unwrap();
     let resolved = resolve_imports(program, Path::new("entry.sga"), &loader, &parse).unwrap();
 
-    // Stmt::Import должен полностью исчезнуть из резолвленного AST
-    assert!(!resolved.iter().any(|s| matches!(s, Stmt::Import(_))));
+    // StmtKind::Import должен полностью исчезнуть из резолвленного AST
+    assert!(!resolved
+        .iter()
+        .any(|s| matches!(s.kind, StmtKind::Import(_))));
     // helper() должен быть инлайнен ровно один раз
     assert_eq!(count_fn_decls(&resolved, "helper"), 1);
+}
+
+#[test]
+fn test_entry_statements_keep_their_spans_and_detached_module_nodes_stay_unspanned() {
+    // T017: узлы AST несут позиции (индексы токенов ТОЙ таблицы, из которой
+    // построены). Операторы главного файла после резолва сохраняют свои
+    // позиции; узлы модуля разобраны `Parser::detached` (так `lib.rs` разбирает
+    // импортируемые файлы) и остаются без позиции — их индексы относились бы к
+    // таблице токенов другого файла.
+    let entry_src = format!(
+        "{import} \"lib.sga\";\n{let_kw} x = 1;\n",
+        import = kw("IMPORT"),
+        let_kw = kw("LET")
+    );
+    let lib_src = format!("{fn} helper() {{ {ret} 42; }}\n", fn = kw("FN"), ret = kw("RETURN"));
+    let loader = InMemoryLoader::new(&[("entry.sga", &entry_src), ("lib.sga", &lib_src)]);
+    let detached = |source: &str| -> Result<Program, String> {
+        let tokens = Lexer::new(source).tokenize().map_err(|e| e.to_string())?;
+        Parser::detached(tokens)
+            .parse_program()
+            .map_err(|e| e.to_string())
+    };
+
+    let program = parse(&entry_src).unwrap();
+    let resolved = resolve_imports(program, Path::new("entry.sga"), &loader, &detached).unwrap();
+    assert_eq!(resolved.len(), 2, "{resolved:?}");
+
+    // сначала оператор модуля — без позиции, у вложенных узлов тоже
+    assert!(matches!(resolved[0].kind, StmtKind::FnDecl { .. }));
+    assert!(resolved[0].span.is_none(), "узел модуля без позиции");
+    if let StmtKind::FnDecl { body, .. } = &resolved[0].kind {
+        assert!(body.iter().all(|s| s.span.is_none()));
+    }
+
+    // затем оператор главного файла: позиция сохранилась и указывает на
+    // `LET x = 1;` на второй строке главного файла
+    assert!(matches!(resolved[1].kind, StmtKind::VarDecl { .. }));
+    assert!(
+        !resolved[1].span.is_none(),
+        "узел главного файла с позицией"
+    );
+    let (_, table) = Lexer::new(&entry_src).tokenize_with_spans().unwrap();
+    let range = resolved[1].span.resolve(&table).expect("позиция в таблице");
+    assert_eq!((range.line, range.col), (2, 1));
+    assert_eq!((range.end_line, range.end_col), (2, 11));
 }
 
 #[test]
@@ -364,7 +411,9 @@ fn test_transitive_import_chain_is_resolved() {
 
     assert_eq!(count_fn_decls(&resolved, "mid_fn"), 1);
     assert_eq!(count_fn_decls(&resolved, "leaf_fn"), 1);
-    assert!(!resolved.iter().any(|s| matches!(s, Stmt::Import(_))));
+    assert!(!resolved
+        .iter()
+        .any(|s| matches!(s.kind, StmtKind::Import(_))));
 }
 
 #[test]
@@ -385,9 +434,9 @@ fn test_resolved_program_preserves_non_import_statements_in_order() {
 
     // Ожидаемый порядок: VarDecl(x), FnDecl(from_lib), VarDecl(y)
     assert_eq!(resolved.len(), 3);
-    assert!(matches!(&resolved[0], Stmt::VarDecl { name, .. } if name == "x"));
-    assert!(matches!(&resolved[1], Stmt::FnDecl { name, .. } if name == "from_lib"));
-    assert!(matches!(&resolved[2], Stmt::VarDecl { name, .. } if name == "y"));
+    assert!(matches!(&resolved[0].kind, StmtKind::VarDecl { name, .. } if name == "x"));
+    assert!(matches!(&resolved[1].kind, StmtKind::FnDecl { name, .. } if name == "from_lib"));
+    assert!(matches!(&resolved[2].kind, StmtKind::VarDecl { name, .. } if name == "y"));
 }
 
 #[test]
@@ -414,10 +463,16 @@ fn test_imported_top_level_expr_stmt_is_preserved() {
     let resolved = resolve_imports(program, Path::new("entry.sga"), &loader, &parse).unwrap();
 
     assert_eq!(resolved.len(), 1);
-    match &resolved[0] {
-        Stmt::Print(args) => assert!(matches!(args.first(), Some(Expr::Int(1)))),
+    match &resolved[0].kind {
+        StmtKind::Print(args) => assert!(matches!(
+            args.first(),
+            Some(Expr {
+                kind: ExprKind::Int(1),
+                ..
+            })
+        )),
         other => panic!(
-            "ожидался Stmt::Print из импортированного файла, получено {:?}",
+            "ожидался StmtKind::Print из импортированного файла, получено {:?}",
             other
         ),
     }

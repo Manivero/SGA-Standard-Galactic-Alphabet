@@ -85,32 +85,129 @@ pub struct Token {
     pub col: usize,
 }
 
-/// Таблица соответствия декодированной ASCII-мнемоники SGA-слова -> ключевое слово.
-pub fn keyword_from_mnemonic(word: &str) -> Option<TokenKind> {
-    Some(match word {
-        "LET" => TokenKind::Let,
-        "VAR" => TokenKind::Var,
-        "CONST" => TokenKind::Const,
-        "FN" => TokenKind::Fn,
-        "RETURN" => TokenKind::Return,
-        "IF" => TokenKind::If,
-        "ELSE" => TokenKind::Else,
-        "WHILE" => TokenKind::While,
-        "FOR" => TokenKind::For,
-        "IN" => TokenKind::In,
-        "TRUE" => TokenKind::True,
-        "FALSE" => TokenKind::False,
-        "STRUCT" => TokenKind::Struct,
-        "PRINT" => TokenKind::Print,
-        "BREAK" => TokenKind::Break,
-        "CONTINUE" => TokenKind::Continue,
-        "AND" => TokenKind::And,
-        "OR" => TokenKind::Or,
-        "NOT" => TokenKind::Not,
-        "NIL" => TokenKind::Nil,
-        "MUT" => TokenKind::Mut,
-        "IMPORT" => TokenKind::Import,
-        "MATCH" => TokenKind::Match,
-        _ => return None,
-    })
+/// Границы токена в исходном тексте. Начало (`line`, `col`) совпадает с
+/// `Token::line`/`Token::col`; конец (`end_line`, `end_col`) — позиция сразу
+/// ПОСЛЕ последнего символа токена (исключающая). Строки и колонки — с
+/// единицы, колонка считается в символах Unicode. У токена `Eof` диапазон
+/// пуст (`начало == конец`); у строковой константы с переводом строки
+/// внутри `end_line` больше `line`. Таблицу границ строит
+/// `Lexer::tokenize_with_spans`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenSpan {
+    pub line: usize,
+    pub col: usize,
+    pub end_line: usize,
+    pub end_col: usize,
+}
+
+/// Таблица ключевых слов: ЕДИНСТВЕННЫЙ источник и для `keyword_from_mnemonic`
+/// (лексер), и для `KEYWORD_MNEMONICS` (перечень слов для языкового сервера:
+/// подсказки перечисляют слова языка, а не угадывают их, и не могут разойтись
+/// с лексером — T018, M007). Новое ключевое слово добавляется ТОЛЬКО сюда.
+macro_rules! keyword_table {
+    ($($mnemonic:literal => $kind:ident),+ $(,)?) => {
+        /// ASCII-мнемоники всех ключевых слов в порядке таблицы. Слово языка —
+        /// эта мнемоника, записанная буквами SGA (`sga_alphabet::encode_word`).
+        pub const KEYWORD_MNEMONICS: &[&str] = &[$($mnemonic),+];
+
+        /// Таблица соответствия декодированной ASCII-мнемоники SGA-слова -> ключевое слово.
+        pub fn keyword_from_mnemonic(word: &str) -> Option<TokenKind> {
+            Some(match word {
+                $($mnemonic => TokenKind::$kind,)+
+                _ => return None,
+            })
+        }
+    };
+}
+
+keyword_table! {
+    "LET" => Let,
+    "VAR" => Var,
+    "CONST" => Const,
+    "FN" => Fn,
+    "RETURN" => Return,
+    "IF" => If,
+    "ELSE" => Else,
+    "WHILE" => While,
+    "FOR" => For,
+    "IN" => In,
+    "TRUE" => True,
+    "FALSE" => False,
+    "STRUCT" => Struct,
+    "PRINT" => Print,
+    "BREAK" => Break,
+    "CONTINUE" => Continue,
+    "AND" => And,
+    "OR" => Or,
+    "NOT" => Not,
+    "NIL" => Nil,
+    "MUT" => Mut,
+    "IMPORT" => Import,
+    "MATCH" => Match,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Эталон: 23 слова в порядке таблицы, записан вручную независимо от неё.
+    const GOLDEN: &[&str] = &[
+        "LET", "VAR", "CONST", "FN", "RETURN", "IF", "ELSE", "WHILE", "FOR", "IN", "TRUE", "FALSE",
+        "STRUCT", "PRINT", "BREAK", "CONTINUE", "AND", "OR", "NOT", "NIL", "MUT", "IMPORT",
+        "MATCH",
+    ];
+
+    #[test]
+    fn keyword_list_matches_the_golden_list_in_order() {
+        assert_eq!(KEYWORD_MNEMONICS, GOLDEN);
+        assert_eq!(KEYWORD_MNEMONICS.len(), 23);
+    }
+
+    #[test]
+    fn every_listed_mnemonic_is_a_keyword_and_distinct() {
+        for (i, word) in KEYWORD_MNEMONICS.iter().enumerate() {
+            assert!(
+                keyword_from_mnemonic(word).is_some(),
+                "{word} есть в перечне, но лексер его не знает"
+            );
+            assert!(
+                word.chars().all(|c| c.is_ascii_uppercase()),
+                "мнемоника — прописные ASCII-буквы: {word}"
+            );
+            assert!(
+                KEYWORD_MNEMONICS.iter().skip(i + 1).all(|o| o != word),
+                "повтор {word}"
+            );
+        }
+    }
+
+    #[test]
+    fn mnemonics_outside_the_list_are_not_keywords() {
+        for word in [
+            "", "let", "Let", "XYZ", "LETS", "LE", "FUNC", "FUNCTION", "TRU", "ELIF", "DEF",
+            "PRINTLN", "MATCHES", "NULL", "WHILE ", " IF",
+        ] {
+            assert_eq!(keyword_from_mnemonic(word), None, "{word:?}");
+        }
+    }
+
+    #[test]
+    fn keywords_map_to_their_own_token_kinds() {
+        assert_eq!(keyword_from_mnemonic("LET"), Some(TokenKind::Let));
+        assert_eq!(keyword_from_mnemonic("MATCH"), Some(TokenKind::Match));
+        assert_eq!(keyword_from_mnemonic("IMPORT"), Some(TokenKind::Import));
+        assert_eq!(keyword_from_mnemonic("MUT"), Some(TokenKind::Mut));
+        assert_eq!(keyword_from_mnemonic("NIL"), Some(TokenKind::Nil));
+        // все токены различны: два слова не могут вести в один вид токена
+        let kinds: Vec<TokenKind> = KEYWORD_MNEMONICS
+            .iter()
+            .map(|w| keyword_from_mnemonic(w).expect("известное слово"))
+            .collect();
+        for (i, kind) in kinds.iter().enumerate() {
+            assert!(
+                kinds.iter().skip(i + 1).all(|o| o != kind),
+                "два слова ведут в {kind:?}"
+            );
+        }
+    }
 }

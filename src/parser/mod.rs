@@ -7,8 +7,19 @@
 //! знать, находимся ли мы на верхнем уровне программы (`top_level`):
 //! `IMPORT` и именованный `FN имя(...)` синтаксически допустимы ТОЛЬКО
 //! там, см. docs/COMPILER_SPEC.md.
+//!
+//! ПОЗИЦИИ (T017, M007): каждый узел AST несёт `ast::Span` — диапазон ИНДЕКСОВ
+//! токенов (не символов). Координат строк/столбцов парсер не знает: их даёт
+//! таблица `Lexer::tokenize_with_spans`, параллельная вектору токенов. Правила
+//! диапазонов описаны у `ast::Span`; здесь они реализованы одним приёмом:
+//! `let start = self.pos` на входе в функцию разбора узла и
+//! `self.span_from(start)` после последнего потреблённого токена. `Token` и
+//! `ParseError` при этом НЕ менялись (рост полей `Token` съедал запас стека
+//! отладочной сборки, см. IMPLEMENTATION_LOG.md, T016/T017).
 
-use crate::ast::{BinOp, Expr, MatchArm, Param, Pattern, Stmt, TypeAnnotation, UnOp};
+use crate::ast::{
+    BinOp, Expr, ExprKind, MatchArm, Param, Pattern, Span, Stmt, StmtKind, TypeAnnotation, UnOp,
+};
 use crate::lexer::token::{Token, TokenKind};
 
 #[derive(Debug, Clone)]
@@ -84,6 +95,8 @@ pub struct Parser {
     /// счётчик для обоих — стек растёт от обоих видов рекурсии вместе,
     /// поэтому лимитировать их по отдельности было бы недостаточно).
     depth: usize,
+    /// T017: `true` — узлы получают `Span::NONE` (см. `Parser::detached`).
+    detached: bool,
 }
 
 type PResult<T> = Result<T, ParseError>;
@@ -94,6 +107,34 @@ impl Parser {
             tokens,
             pos: 0,
             depth: 0,
+            detached: false,
+        }
+    }
+
+    /// Парсер, который НЕ ставит позиций: каждый узел получает `Span::NONE`.
+    ///
+    /// Нужен там, где AST попадает в программу из ДРУГОГО текста, чем тот, по
+    /// которому будет строиться таблица позиций: индексы токенов импортируемого
+    /// модуля, подставленные в программу главного файла, указывали бы на чужие
+    /// токены и давали бы ложные `[строка:столбец]` (см. `parse_full_flat`).
+    /// Структура дерева и поведение разбора от режима не зависят — `Span` не
+    /// участвует ни в сравнении узлов, ни в кодогенерации.
+    pub fn detached(tokens: Vec<Token>) -> Self {
+        Parser {
+            detached: true,
+            ..Parser::new(tokens)
+        }
+    }
+
+    /// Диапазон токенов `start..=pos-1`: всё, что потреблено с тех пор, как
+    /// `self.pos` была равна `start`. Вызывается ПОСЛЕ последнего токена узла.
+    /// Ни один узел не потребляет `Eof`, поэтому `pos - 1` — всегда реальный
+    /// токен (`advance` на `Eof` не сдвигает `pos`, но и не вызывается).
+    fn span_from(&self, start: usize) -> Span {
+        if self.detached {
+            Span::NONE
+        } else {
+            Span::new(start, self.pos.saturating_sub(1))
         }
     }
 
@@ -219,9 +260,13 @@ impl Parser {
     }
 
     fn parse_stmt(&mut self, top_level: bool) -> PResult<Stmt> {
-        self.guarded_recursion("блоков/операторов", |p| {
+        let start = self.pos;
+        let kind = self.guarded_recursion("блоков/операторов", |p| {
             p.parse_stmt_inner(top_level)
-        })
+        })?;
+        // Диапазон оператора включает завершающую `;`, если она есть: её
+        // потребляет `parse_stmt_inner`.
+        Ok(Stmt::new(kind, self.span_from(start)))
     }
 
     /// `top_level=true` только для statement'ов непосредственно в теле
@@ -230,7 +275,7 @@ impl Parser {
     /// запретить вложенные `FN`/`IMPORT` синтаксически, вместо того
     /// чтобы давать им молча пройти semantic-анализ (см.
     /// docs/COMPILER_SPEC.md — функции и импорты только верхнего уровня).
-    fn parse_stmt_inner(&mut self, top_level: bool) -> PResult<Stmt> {
+    fn parse_stmt_inner(&mut self, top_level: bool) -> PResult<StmtKind> {
         match self.peek_kind().clone() {
             TokenKind::Let => {
                 self.advance();
@@ -247,16 +292,10 @@ impl Parser {
             TokenKind::Print => {
                 self.advance();
                 self.expect(TokenKind::LParen, "'('")?;
-                let mut args = Vec::new();
-                if !self.check(&TokenKind::RParen) {
-                    args.push(self.parse_expr()?);
-                    while self.match_kind(&TokenKind::Comma) {
-                        args.push(self.parse_expr()?);
-                    }
-                }
+                let args = self.parse_args()?;
                 self.expect(TokenKind::RParen, "')'")?;
                 self.match_kind(&TokenKind::Semicolon);
-                Ok(Stmt::Print(args))
+                Ok(StmtKind::Print(args))
             }
             TokenKind::If => {
                 self.advance();
@@ -271,7 +310,7 @@ impl Parser {
                 } else {
                     None
                 };
-                Ok(Stmt::If {
+                Ok(StmtKind::If {
                     cond,
                     then_branch,
                     else_branch,
@@ -281,7 +320,7 @@ impl Parser {
                 self.advance();
                 let cond = self.parse_expr()?;
                 let body = self.parse_block()?;
-                Ok(Stmt::While { cond, body })
+                Ok(StmtKind::While { cond, body })
             }
             TokenKind::For => {
                 self.advance();
@@ -292,7 +331,7 @@ impl Parser {
                 self.expect(TokenKind::Dot, "'.' (диапазон '..')")?;
                 let end = self.parse_expr()?;
                 let body = self.parse_block()?;
-                Ok(Stmt::ForIn {
+                Ok(StmtKind::ForIn {
                     var,
                     start,
                     end,
@@ -322,7 +361,7 @@ impl Parser {
                     }
                 }
                 self.expect(TokenKind::RBrace, "'}'")?;
-                Ok(Stmt::StructDecl { name, fields })
+                Ok(StmtKind::StructDecl { name, fields })
             }
             TokenKind::Import => {
                 if !top_level {
@@ -344,13 +383,13 @@ impl Parser {
                     }
                 };
                 self.match_kind(&TokenKind::Semicolon);
-                Ok(Stmt::Import(path))
+                Ok(StmtKind::Import(path))
             }
             TokenKind::Fn => {
                 // Неоднозначность грамматики: `FN` начинает ОБЕ формы —
                 // именованное top-level объявление (`FN name(...) {...}`,
-                // даёт `Stmt::FnDecl`) И анонимную функцию-выражение
-                // (`FN(...) {...}`, даёт `Expr::Lambda` через
+                // даёт `StmtKind::FnDecl`) И анонимную функцию-выражение
+                // (`FN(...) {...}`, даёт `ExprKind::Lambda` через
                 // `parse_primary`). Различаем по тому, идёт ли сразу за
                 // `FN` идентификатор или сразу `(` — оба токена видны
                 // через прямой доступ `self.tokens[self.pos + 1]`, без
@@ -388,7 +427,7 @@ impl Parser {
                         None
                     };
                     let body = self.parse_block()?;
-                    Ok(Stmt::FnDecl {
+                    Ok(StmtKind::FnDecl {
                         name,
                         params,
                         body,
@@ -403,7 +442,7 @@ impl Parser {
                     // statement, например голый вызов функции `f();`).
                     let expr = self.parse_expr()?;
                     self.match_kind(&TokenKind::Semicolon);
-                    Ok(Stmt::ExprStmt(expr))
+                    Ok(StmtKind::ExprStmt(expr))
                 }
             }
             TokenKind::Return => {
@@ -414,28 +453,28 @@ impl Parser {
                     Some(self.parse_expr()?)
                 };
                 self.match_kind(&TokenKind::Semicolon);
-                Ok(Stmt::Return(value))
+                Ok(StmtKind::Return(value))
             }
             TokenKind::Break => {
                 self.advance();
                 self.match_kind(&TokenKind::Semicolon);
-                Ok(Stmt::Break)
+                Ok(StmtKind::Break)
             }
             TokenKind::Continue => {
                 self.advance();
                 self.match_kind(&TokenKind::Semicolon);
-                Ok(Stmt::Continue)
+                Ok(StmtKind::Continue)
             }
-            TokenKind::LBrace => Ok(Stmt::Block(self.parse_block()?)),
+            TokenKind::LBrace => Ok(StmtKind::Block(self.parse_block()?)),
             _ => {
                 let expr = self.parse_expr()?;
                 self.match_kind(&TokenKind::Semicolon);
-                Ok(Stmt::ExprStmt(expr))
+                Ok(StmtKind::ExprStmt(expr))
             }
         }
     }
 
-    fn parse_var_decl(&mut self, mutable_is_false: bool) -> PResult<Stmt> {
+    fn parse_var_decl(&mut self, mutable_is_false: bool) -> PResult<StmtKind> {
         // mutable_is_false=true означает immutable (LET/CONST), false означает VAR (mutable)
         let name = self.parse_ident_name()?;
         let ty = if self.match_kind(&TokenKind::Colon) {
@@ -446,7 +485,7 @@ impl Parser {
         self.expect(TokenKind::Assign, "'='")?;
         let value = self.parse_expr()?;
         self.match_kind(&TokenKind::Semicolon);
-        Ok(Stmt::VarDecl {
+        Ok(StmtKind::VarDecl {
             name,
             value,
             mutable: !mutable_is_false,
@@ -465,11 +504,12 @@ impl Parser {
     }
 
     /// Параметр именованной top-level функции: `[MUT] имя [: тип]`.
-    /// Параметры анонимных функций/замыканий (`Expr::Lambda`) НЕ
+    /// Параметры анонимных функций/замыканий (`ExprKind::Lambda`) НЕ
     /// проходят через этот метод — см. `parse_primary`, ветка
-    /// `TokenKind::Fn`, и комментарий у `ast::Expr::Lambda` о том, почему
+    /// `TokenKind::Fn`, и комментарий у `ast::ExprKind::Lambda` о том, почему
     /// MUT/типы для замыканий не поддерживаются в v0.1.
     fn parse_param(&mut self) -> PResult<Param> {
+        let start = self.pos;
         let mutable = self.match_kind(&TokenKind::Mut);
         let name = self.parse_ident_name()?;
         let ty = if self.match_kind(&TokenKind::Colon) {
@@ -477,7 +517,12 @@ impl Parser {
         } else {
             None
         };
-        Ok(Param { name, ty, mutable })
+        Ok(Param {
+            name,
+            ty,
+            mutable,
+            span: self.span_from(start),
+        })
     }
 
     /// Имя типа в позиции аннотации (после `:` или `->`). Имена типов —
@@ -520,41 +565,70 @@ impl Parser {
     }
 
     fn parse_assignment(&mut self) -> PResult<Expr> {
+        let start = self.pos;
         let expr = self.parse_or()?;
         if self.check(&TokenKind::Assign) {
             self.advance();
-            let value = self.parse_assignment()?;
-            return match expr {
-                Expr::Ident(name) => Ok(Expr::Assign(name, Box::new(value))),
-                Expr::Index(target, idx) => Ok(Expr::IndexAssign(target, idx, Box::new(value))),
-                Expr::FieldAccess(obj, field) => Ok(Expr::FieldAssign(obj, field, Box::new(value))),
-                _ => Err(self.err("недопустимая левая часть присваивания (ожидалось имя переменной, индексное выражение или доступ к полю)")),
+            // T016 (M007): цепочка `a = b = c = ...` рекурсивна по
+            // `parse_assignment`, минуя `parse_expr`, поэтому без
+            // собственной защиты глубины тысячи `=` подряд давали
+            // `stack overflow` и abort процесса (языковой сервер парсит
+            // любой текст редактора и не может на этом падать).
+            let value =
+                self.guarded_recursion("присваиваний", |p| p.parse_assignment())?;
+            // Диапазон присваивания: от первого токена цели (вместе с её
+            // скобками) до последнего токена значения.
+            let span = self.span_from(start);
+            let kind = match expr.kind {
+                ExprKind::Ident(name) => ExprKind::Assign(name, Box::new(value)),
+                ExprKind::Index(target, idx) => {
+                    ExprKind::IndexAssign(target, idx, Box::new(value))
+                }
+                ExprKind::FieldAccess(obj, field) => {
+                    ExprKind::FieldAssign(obj, field, Box::new(value))
+                }
+                _ => return Err(self.err("недопустимая левая часть присваивания (ожидалось имя переменной, индексное выражение или доступ к полю)")),
             };
+            return Ok(Expr::new(kind, span));
         }
         Ok(expr)
     }
 
+    /// Бинарный узел `left op right`. `start` — токен, с которого началось
+    /// разбираемое ВЫРАЖЕНИЕ УРОВНЯ (вместе с открывающей скобкой, если левый
+    /// операнд взят в скобки); конец — последний потреблённый токен (вместе с
+    /// закрывающей скобкой правого операнда).
+    fn binary(&self, start: usize, op: BinOp, left: Expr, right: Expr) -> Expr {
+        Expr::new(
+            ExprKind::Binary(op, Box::new(left), Box::new(right)),
+            self.span_from(start),
+        )
+    }
+
     fn parse_or(&mut self) -> PResult<Expr> {
+        let start = self.pos;
         let mut left = self.parse_and()?;
         while self.check(&TokenKind::Or) {
             self.advance();
             let right = self.parse_and()?;
-            left = Expr::Binary(BinOp::Or, Box::new(left), Box::new(right));
+            left = self.binary(start, BinOp::Or, left, right);
         }
         Ok(left)
     }
 
     fn parse_and(&mut self) -> PResult<Expr> {
+        let start = self.pos;
         let mut left = self.parse_equality()?;
         while self.check(&TokenKind::And) {
             self.advance();
             let right = self.parse_equality()?;
-            left = Expr::Binary(BinOp::And, Box::new(left), Box::new(right));
+            left = self.binary(start, BinOp::And, left, right);
         }
         Ok(left)
     }
 
     fn parse_equality(&mut self) -> PResult<Expr> {
+        let start = self.pos;
         let mut left = self.parse_comparison()?;
         loop {
             let op = match self.peek_kind() {
@@ -564,12 +638,13 @@ impl Parser {
             };
             self.advance();
             let right = self.parse_comparison()?;
-            left = Expr::Binary(op, Box::new(left), Box::new(right));
+            left = self.binary(start, op, left, right);
         }
         Ok(left)
     }
 
     fn parse_comparison(&mut self) -> PResult<Expr> {
+        let start = self.pos;
         let mut left = self.parse_term()?;
         loop {
             let op = match self.peek_kind() {
@@ -581,12 +656,13 @@ impl Parser {
             };
             self.advance();
             let right = self.parse_term()?;
-            left = Expr::Binary(op, Box::new(left), Box::new(right));
+            left = self.binary(start, op, left, right);
         }
         Ok(left)
     }
 
     fn parse_term(&mut self) -> PResult<Expr> {
+        let start = self.pos;
         let mut left = self.parse_factor()?;
         loop {
             let op = match self.peek_kind() {
@@ -596,12 +672,13 @@ impl Parser {
             };
             self.advance();
             let right = self.parse_factor()?;
-            left = Expr::Binary(op, Box::new(left), Box::new(right));
+            left = self.binary(start, op, left, right);
         }
         Ok(left)
     }
 
     fn parse_factor(&mut self) -> PResult<Expr> {
+        let start = self.pos;
         let mut left = self.parse_unary()?;
         loop {
             let op = match self.peek_kind() {
@@ -612,33 +689,57 @@ impl Parser {
             };
             self.advance();
             let right = self.parse_unary()?;
-            left = Expr::Binary(op, Box::new(left), Box::new(right));
+            left = self.binary(start, op, left, right);
         }
         Ok(left)
     }
 
     fn parse_unary(&mut self) -> PResult<Expr> {
         match self.peek_kind() {
-            TokenKind::Minus => {
-                self.advance();
-                Ok(Expr::Unary(UnOp::Neg, Box::new(self.parse_unary()?)))
-            }
-            TokenKind::Not => {
-                self.advance();
-                Ok(Expr::Unary(UnOp::Not, Box::new(self.parse_unary()?)))
-            }
+            TokenKind::Minus | TokenKind::Not => self.parse_prefix_operator(),
             _ => self.parse_postfix(),
         }
     }
 
+    /// Унарный `-` / `NOT` и его операнд.
+    ///
+    /// T016 (M007): унарные операторы рекурсивны по `parse_unary`, минуя
+    /// `parse_expr`, поэтому цепочка `- - - ... x` / `NOT NOT ... x` обязана
+    /// проходить через `guarded_recursion` — иначе несколько тысяч операторов
+    /// подряд давали `stack overflow` и abort процесса (языковой сервер
+    /// парсит любой текст редактора и не может на этом падать).
+    ///
+    /// Ветка вынесена из `parse_unary` в отдельную функцию намеренно:
+    /// `parse_unary` стоит в кадре КАЖДОГО уровня вложенных скобок, а в
+    /// отладочной сборке кадр содержит временные значения всех веток сразу.
+    /// Тонкий `parse_unary` + отдельная функция для редкой ветки не только
+    /// не добавляют стека на пути скобок (см. `MAX_PARSE_DEPTH`), но и
+    /// уменьшают его относительно прежней формы с двумя встроенными ветками.
+    fn parse_prefix_operator(&mut self) -> PResult<Expr> {
+        let start = self.pos;
+        let op = if self.check(&TokenKind::Minus) {
+            UnOp::Neg
+        } else {
+            UnOp::Not
+        };
+        self.advance();
+        let operand =
+            self.guarded_recursion("унарных операторов", |p| p.parse_unary())?;
+        Ok(Expr::new(
+            ExprKind::Unary(op, Box::new(operand)),
+            self.span_from(start),
+        ))
+    }
+
     fn parse_postfix(&mut self) -> PResult<Expr> {
+        // `start` — первый токен ВСЕГО постфиксного выражения (вместе с
+        // открывающей скобкой, если операнд взят в скобки): от него считается
+        // диапазон каждого `Index`/`FieldAccess`/`MethodCall`/`CallExpr`.
+        let start = self.pos;
         let mut expr = self.parse_primary()?;
         loop {
-            if self.check(&TokenKind::LBracket) {
-                self.advance();
-                let idx = self.parse_expr()?;
-                self.expect(TokenKind::RBracket, "']'")?;
-                expr = Expr::Index(Box::new(expr), Box::new(idx));
+            expr = if self.check(&TokenKind::LBracket) {
+                self.parse_index_suffix(expr, start)?
             } else if self.check(&TokenKind::Dot) && !self.next_is_dot() {
                 // FUSION/НАЙДЕНО ПРИ СЛИЯНИИ (см. MIGRATION_REPORT.md):
                 // доступ к полю/вызов метода struct перенесён из ветки B,
@@ -658,22 +759,7 @@ impl Parser {
                 // FieldAccess; `..` (два `Dot` подряд) — оставляем
                 // нетронутым для `Stmt::For`, которое потребляет оба через
                 // явный `expect(TokenKind::Dot)` дважды.
-                self.advance();
-                let field = self.parse_ident_name()?;
-                if self.check(&TokenKind::LParen) {
-                    self.advance();
-                    let mut args = Vec::new();
-                    if !self.check(&TokenKind::RParen) {
-                        args.push(self.parse_expr()?);
-                        while self.match_kind(&TokenKind::Comma) {
-                            args.push(self.parse_expr()?);
-                        }
-                    }
-                    self.expect(TokenKind::RParen, "')'")?;
-                    expr = Expr::MethodCall(Box::new(expr), field, args);
-                } else {
-                    expr = Expr::FieldAccess(Box::new(expr), field);
-                }
+                self.parse_member_suffix(expr, start)?
             } else if self.check(&TokenKind::LParen) {
                 // Общий постфиксный вызов: применяется к ЛЮБОМУ
                 // выражению, полученному на данный момент — литералу
@@ -681,180 +767,253 @@ impl Parser {
                 // результату предыдущего вызова (`f()()`) и т.п. Вызов
                 // по статическому ИМЕНИ (`Ident` сразу за которым `(`)
                 // уже полностью разобран раньше, в `parse_primary`
-                // (даёт `Expr::Call`, не доходя до этой ветки с тем же
+                // (даёт `ExprKind::Call`, не доходя до этой ветки с тем же
                 // `(` сразу после простого идентификатора) — сюда
                 // попадает только всё остальное, поэтому используется
-                // отдельный AST-вариант `Expr::CallExpr`, а не `Call`,
+                // отдельный AST-вариант `ExprKind::CallExpr`, а не `Call`,
                 // у которого callee — `String`, а не произвольное
-                // выражение. См. docstring у `ast::Expr::CallExpr`.
-                self.advance();
-                let mut args = Vec::new();
-                if !self.check(&TokenKind::RParen) {
-                    args.push(self.parse_expr()?);
-                    while self.match_kind(&TokenKind::Comma) {
-                        args.push(self.parse_expr()?);
-                    }
-                }
-                self.expect(TokenKind::RParen, "')'")?;
-                expr = Expr::CallExpr(Box::new(expr), args);
+                // выражение. См. docstring у `ast::ExprKind::CallExpr`.
+                self.parse_call_suffix(expr, start)?
             } else {
-                break;
+                return Ok(expr);
+            };
+        }
+    }
+
+    // Суффиксы вынесены из тела цикла `parse_postfix` в отдельные функции
+    // намеренно: `parse_postfix` стоит в кадре КАЖДОГО уровня вложенных скобок
+    // (см. `MAX_PARSE_DEPTH`), а в отладочной сборке кадр содержит временные
+    // значения всех веток сразу. Диапазоны узлов добавили бы к этому кадру
+    // ещё по два временных значения на ветку.
+
+    /// `target[индекс]`: `[` ещё не потреблена.
+    fn parse_index_suffix(&mut self, target: Expr, start: usize) -> PResult<Expr> {
+        self.advance();
+        let idx = self.parse_expr()?;
+        self.expect(TokenKind::RBracket, "']'")?;
+        Ok(Expr::new(
+            ExprKind::Index(Box::new(target), Box::new(idx)),
+            self.span_from(start),
+        ))
+    }
+
+    /// `object.поле` или `object.метод(аргументы)`: `.` ещё не потреблена.
+    fn parse_member_suffix(&mut self, object: Expr, start: usize) -> PResult<Expr> {
+        self.advance();
+        let field = self.parse_ident_name()?;
+        if self.check(&TokenKind::LParen) {
+            self.advance();
+            let args = self.parse_args()?;
+            self.expect(TokenKind::RParen, "')'")?;
+            Ok(Expr::new(
+                ExprKind::MethodCall(Box::new(object), field, args),
+                self.span_from(start),
+            ))
+        } else {
+            Ok(Expr::new(
+                ExprKind::FieldAccess(Box::new(object), field),
+                self.span_from(start),
+            ))
+        }
+    }
+
+    /// `callee(аргументы)` для произвольного `callee`: `(` ещё не потреблена.
+    fn parse_call_suffix(&mut self, callee: Expr, start: usize) -> PResult<Expr> {
+        self.advance();
+        let args = self.parse_args()?;
+        self.expect(TokenKind::RParen, "')'")?;
+        Ok(Expr::new(
+            ExprKind::CallExpr(Box::new(callee), args),
+            self.span_from(start),
+        ))
+    }
+
+    /// Ноль или больше выражений через запятую — до закрывающей `)`, которую
+    /// потребляет вызывающий (аргументы `PRINT`, вызова функции, метода и
+    /// произвольного вызова).
+    fn parse_args(&mut self) -> PResult<Vec<Expr>> {
+        let mut args = Vec::new();
+        if !self.check(&TokenKind::RParen) {
+            args.push(self.parse_expr()?);
+            while self.match_kind(&TokenKind::Comma) {
+                args.push(self.parse_expr()?);
             }
         }
-        Ok(expr)
+        Ok(args)
     }
 
     fn parse_primary(&mut self) -> PResult<Expr> {
-        match self.peek_kind().clone() {
-            TokenKind::IntLit(v) => {
-                self.advance();
-                Ok(Expr::Int(v))
-            }
-            TokenKind::FloatLit(v) => {
-                self.advance();
-                Ok(Expr::Float(v))
-            }
-            TokenKind::StringLit(s) => {
-                self.advance();
-                Ok(Expr::Str(s))
-            }
-            TokenKind::True => {
-                self.advance();
-                Ok(Expr::Bool(true))
-            }
-            TokenKind::False => {
-                self.advance();
-                Ok(Expr::Bool(false))
-            }
-            TokenKind::Nil => {
-                self.advance();
-                Ok(Expr::Nil)
-            }
-            TokenKind::Fn => {
-                // FN(params) { body } как ВЫРАЖЕНИЕ (анонимная функция /
-                // замыкание) — отличается от Stmt::FnDecl ("FN имя(...)
-                // {...}"), которая обрабатывается раньше, в parse_stmt, и
-                // сюда, в parse_primary, никогда не доходит (см. развилку
-                // `next_is_ident` там). Здесь FN всегда сразу следует за
-                // "(" (без имени). Параметры лямбды — простые имена, без
-                // MUT/типов (см. ast::Expr::Lambda).
-                self.advance();
-                self.expect(
-                    TokenKind::LParen,
-                    "'(' (анонимная функция: 'FN(параметры) { тело }', без имени)",
-                )?;
-                let mut params = Vec::new();
-                if !self.check(&TokenKind::RParen) {
-                    params.push(self.parse_ident_name()?);
-                    while self.match_kind(&TokenKind::Comma) {
-                        params.push(self.parse_ident_name()?);
-                    }
-                }
-                self.expect(TokenKind::RParen, "')'")?;
-                if self.match_kind(&TokenKind::Arrow) {
-                    self.parse_type_name()?; // тип возврата лямбды — парсится и отбрасывается (см. ROADMAP)
-                }
-                let body = self.parse_block()?;
-                Ok(Expr::Lambda { params, body })
-            }
-            TokenKind::Match => {
-                // MATCH scrutinee { паттерн -> выражение, ... } — T006
-                // (M002). Выражение (не statement), как и Lambda/FN.
-                // Обязательность catch-all последним пунктом парсер НЕ
-                // проверяет (только форму паттернов) — это делает
-                // semantic::Analyzer, см. ast::Pattern/ast::MatchArm.
-                self.advance();
-                let scrutinee = self.parse_expr()?;
-                self.expect(TokenKind::LBrace, "'{' (после выражения в MATCH)")?;
-                let mut arms = Vec::new();
-                if !self.check(&TokenKind::RBrace) {
-                    arms.push(self.parse_match_arm()?);
-                    while self.match_kind(&TokenKind::Comma) {
-                        if self.check(&TokenKind::RBrace) {
-                            break;
-                        }
-                        arms.push(self.parse_match_arm()?);
-                    }
-                }
-                self.expect(TokenKind::RBrace, "'}' (конец MATCH)")?;
-                Ok(Expr::Match(Box::new(scrutinee), arms))
-            }
-            TokenKind::Ident(name) => {
-                self.advance();
-                if self.check(&TokenKind::LParen) {
-                    self.advance();
-                    let mut args = Vec::new();
-                    if !self.check(&TokenKind::RParen) {
-                        args.push(self.parse_expr()?);
-                        while self.match_kind(&TokenKind::Comma) {
-                            args.push(self.parse_expr()?);
-                        }
-                    }
-                    self.expect(TokenKind::RParen, "')'")?;
-                    Ok(Expr::Call(name, args))
-                } else if self.check(&TokenKind::LBrace) && self.is_struct_lit_lookahead() {
-                    // TypeName { field: expr, ... } — struct-литерал.
-                    // Перенесено из ветки B. Лукахед (`is_struct_lit_lookahead`)
-                    // нужен, чтобы не путать с `Ident` сразу перед блоком
-                    // `{...}` где-то ещё в грамматике — в текущей грамматике
-                    // SGA такого места нет (блок `{}` как самостоятельное
-                    // выражение не существует), но лукахед сохранён из
-                    // ветки B как защита на будущее и для пустого литерала
-                    // `TypeName {}` (см. правило ниже).
-                    self.advance();
-                    let mut fields = Vec::new();
-                    if !self.check(&TokenKind::RBrace) {
-                        let field_name = self.parse_ident_name()?;
-                        self.expect(TokenKind::Colon, "':' (в литерале struct: field: value)")?;
-                        let field_val = self.parse_expr()?;
-                        fields.push((field_name, field_val));
-                        while self.match_kind(&TokenKind::Comma) {
-                            if self.check(&TokenKind::RBrace) {
-                                break;
-                            }
-                            let field_name = self.parse_ident_name()?;
-                            self.expect(TokenKind::Colon, "':'")?;
-                            let field_val = self.parse_expr()?;
-                            fields.push((field_name, field_val));
-                        }
-                    }
-                    self.expect(TokenKind::RBrace, "'}'")?;
-                    Ok(Expr::StructLit {
-                        type_name: name,
-                        fields,
-                    })
-                } else {
-                    Ok(Expr::Ident(name))
-                }
-            }
-            TokenKind::LBracket => {
-                self.advance();
-                let mut items = Vec::new();
-                if !self.check(&TokenKind::RBracket) {
-                    items.push(self.parse_expr()?);
-                    while self.match_kind(&TokenKind::Comma) {
-                        items.push(self.parse_expr()?);
-                    }
-                }
-                self.expect(TokenKind::RBracket, "']'")?;
-                Ok(Expr::Array(items))
-            }
+        // Редкие ветки (`FN`, `MATCH`, имя, `[`) вынесены в отдельные функции
+        // по той же причине, что и суффиксы в `parse_postfix`: на пути
+        // вложенных скобок `parse_primary` — самый тяжёлый кадр цепочки.
+        let start = self.pos;
+        let kind = match self.peek_kind().clone() {
+            TokenKind::IntLit(v) => ExprKind::Int(v),
+            TokenKind::FloatLit(v) => ExprKind::Float(v),
+            TokenKind::StringLit(s) => ExprKind::Str(s),
+            TokenKind::True => ExprKind::Bool(true),
+            TokenKind::False => ExprKind::Bool(false),
+            TokenKind::Nil => ExprKind::Nil,
+            TokenKind::Fn => return self.parse_lambda(),
+            TokenKind::Match => return self.parse_match(),
+            TokenKind::Ident(name) => return self.parse_ident_expr(name),
+            TokenKind::LBracket => return self.parse_array_literal(),
             TokenKind::LParen => {
+                // Скобки собственного узла не создают: результат — внутреннее
+                // выражение со своим (узким) диапазоном; скобки входят только
+                // в диапазоны ОХВАТЫВАЮЩИХ узлов (через их `start`).
                 self.advance();
                 let e = self.parse_expr()?;
                 self.expect(TokenKind::RParen, "')'")?;
-                Ok(e)
+                return Ok(e);
             }
-            other => Err(self.err(&format!("неожиданный токен в выражении: {:?}", other))),
+            other => return Err(self.err(&format!("неожиданный токен в выражении: {:?}", other))),
+        };
+        // Литерал — ровно один токен.
+        self.advance();
+        Ok(Expr::new(kind, self.span_from(start)))
+    }
+
+    /// `FN(params) { body }` как ВЫРАЖЕНИЕ (анонимная функция /
+    /// замыкание) — отличается от `StmtKind::FnDecl` ("FN имя(...)
+    /// {...}"), которая обрабатывается раньше, в parse_stmt, и
+    /// сюда, в parse_primary, никогда не доходит (см. развилку
+    /// `next_is_ident` там). Здесь FN всегда сразу следует за
+    /// "(" (без имени). Параметры лямбды — простые имена, без
+    /// MUT/типов (см. `ast::ExprKind::Lambda`).
+    fn parse_lambda(&mut self) -> PResult<Expr> {
+        let start = self.pos;
+        self.advance();
+        self.expect(
+            TokenKind::LParen,
+            "'(' (анонимная функция: 'FN(параметры) { тело }', без имени)",
+        )?;
+        let mut params = Vec::new();
+        if !self.check(&TokenKind::RParen) {
+            params.push(self.parse_ident_name()?);
+            while self.match_kind(&TokenKind::Comma) {
+                params.push(self.parse_ident_name()?);
+            }
         }
+        self.expect(TokenKind::RParen, "')'")?;
+        if self.match_kind(&TokenKind::Arrow) {
+            self.parse_type_name()?; // тип возврата лямбды — парсится и отбрасывается (см. ROADMAP)
+        }
+        let body = self.parse_block()?;
+        Ok(Expr::new(
+            ExprKind::Lambda { params, body },
+            self.span_from(start),
+        ))
+    }
+
+    /// MATCH scrutinee { паттерн -> выражение, ... } — T006
+    /// (M002). Выражение (не statement), как и Lambda/FN.
+    /// Обязательность catch-all последним пунктом парсер НЕ
+    /// проверяет (только форму паттернов) — это делает
+    /// semantic::Analyzer, см. ast::Pattern/ast::MatchArm.
+    fn parse_match(&mut self) -> PResult<Expr> {
+        let start = self.pos;
+        self.advance();
+        let scrutinee = self.parse_expr()?;
+        self.expect(TokenKind::LBrace, "'{' (после выражения в MATCH)")?;
+        let mut arms = Vec::new();
+        if !self.check(&TokenKind::RBrace) {
+            arms.push(self.parse_match_arm()?);
+            while self.match_kind(&TokenKind::Comma) {
+                if self.check(&TokenKind::RBrace) {
+                    break;
+                }
+                arms.push(self.parse_match_arm()?);
+            }
+        }
+        self.expect(TokenKind::RBrace, "'}' (конец MATCH)")?;
+        Ok(Expr::new(
+            ExprKind::Match(Box::new(scrutinee), arms),
+            self.span_from(start),
+        ))
+    }
+
+    /// Выражение, начинающееся с имени: переменная, вызов по имени
+    /// `имя(аргументы)` или struct-литерал `Имя { поле: значение }`. Токен
+    /// имени ещё не потреблён (`name` — его копия).
+    fn parse_ident_expr(&mut self, name: String) -> PResult<Expr> {
+        let start = self.pos;
+        self.advance();
+        let kind = if self.check(&TokenKind::LParen) {
+            self.advance();
+            let args = self.parse_args()?;
+            self.expect(TokenKind::RParen, "')'")?;
+            ExprKind::Call(name, args)
+        } else if self.check(&TokenKind::LBrace) && self.is_struct_lit_lookahead() {
+            // TypeName { field: expr, ... } — struct-литерал.
+            // Перенесено из ветки B. Лукахед (`is_struct_lit_lookahead`)
+            // нужен, чтобы не путать с `Ident` сразу перед блоком
+            // `{...}` где-то ещё в грамматике — в текущей грамматике
+            // SGA такого места нет (блок `{}` как самостоятельное
+            // выражение не существует), но лукахед сохранён из
+            // ветки B как защита на будущее и для пустого литерала
+            // `TypeName {}` (см. правило ниже).
+            let fields = self.parse_struct_lit_fields()?;
+            ExprKind::StructLit {
+                type_name: name,
+                fields,
+            }
+        } else {
+            ExprKind::Ident(name)
+        };
+        Ok(Expr::new(kind, self.span_from(start)))
+    }
+
+    /// Поля struct-литерала: `{ поле: значение, ... }` (с необязательной
+    /// запятой в конце). `{` ещё не потреблена.
+    fn parse_struct_lit_fields(&mut self) -> PResult<Vec<(String, Expr)>> {
+        self.advance();
+        let mut fields = Vec::new();
+        if !self.check(&TokenKind::RBrace) {
+            let field_name = self.parse_ident_name()?;
+            self.expect(TokenKind::Colon, "':' (в литерале struct: field: value)")?;
+            let field_val = self.parse_expr()?;
+            fields.push((field_name, field_val));
+            while self.match_kind(&TokenKind::Comma) {
+                if self.check(&TokenKind::RBrace) {
+                    break;
+                }
+                let field_name = self.parse_ident_name()?;
+                self.expect(TokenKind::Colon, "':'")?;
+                let field_val = self.parse_expr()?;
+                fields.push((field_name, field_val));
+            }
+        }
+        self.expect(TokenKind::RBrace, "'}'")?;
+        Ok(fields)
+    }
+
+    /// Литерал массива `[a, b, c]`: `[` ещё не потреблена.
+    fn parse_array_literal(&mut self) -> PResult<Expr> {
+        let start = self.pos;
+        self.advance();
+        let mut items = Vec::new();
+        if !self.check(&TokenKind::RBracket) {
+            items.push(self.parse_expr()?);
+            while self.match_kind(&TokenKind::Comma) {
+                items.push(self.parse_expr()?);
+            }
+        }
+        self.expect(TokenKind::RBracket, "']'")?;
+        Ok(Expr::new(ExprKind::Array(items), self.span_from(start)))
     }
 
     /// Один пункт MATCH: `паттерн -> выражение`. См. `parse_pattern`.
     fn parse_match_arm(&mut self) -> PResult<MatchArm> {
+        let start = self.pos;
         let pattern = self.parse_pattern()?;
         self.expect(TokenKind::Arrow, "'->' (после паттерна в MATCH)")?;
         let body = self.parse_expr()?;
-        Ok(MatchArm { pattern, body })
+        Ok(MatchArm {
+            pattern,
+            body,
+            span: self.span_from(start),
+        })
     }
 
     /// Паттерн в v0.1 — только литералы (включая отрицательные числа
@@ -919,5 +1078,235 @@ impl Parser {
                 other
             ))),
         }
+    }
+}
+
+/// Прямые unit-тесты парсера (до T016 парсер покрывался только сквозными
+/// тестами `tests/integration_test.rs`). Здесь — защита глубины для цепочек
+/// унарных операторов и присваиваний, добавленная в T016 (M007).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::Lexer;
+    use crate::sga_alphabet::encode_word as kw;
+
+    /// Разбирает `src` в потоке со стеком в 2 МиБ — столько получает поток
+    /// тестового харнесса; если защита глубины не сработает, процесс тестов
+    /// упадёт на `stack overflow`, а не вернёт `Err`.
+    fn parse_on_small_stack(src: String) -> Result<Vec<Stmt>, ParseError> {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let tokens = Lexer::new(&src).tokenize().expect("лексинг");
+                Parser::new(tokens).parse_program()
+            })
+            .expect("поток")
+            .join()
+            .expect("поток не должен падать (stack overflow?)")
+    }
+
+    fn let_value(src: String) -> Result<Expr, ParseError> {
+        let program = parse_on_small_stack(src)?;
+        match program.into_iter().next() {
+            Some(Stmt {
+                kind: StmtKind::VarDecl { value, .. },
+                ..
+            }) => Ok(value),
+            other => panic!("ожидалось объявление переменной, получено {other:?}"),
+        }
+    }
+
+    // Ожидаемые деревья строятся БЕЗ позиций (`unspanned`): равенство узлов
+    // структурное и `Span` в нём не участвует (см. `ast::Expr`), а сами
+    // диапазоны проверяются отдельно — `tests/ast_spans_test.rs`.
+
+    fn int(v: i64) -> Expr {
+        Expr::unspanned(ExprKind::Int(v))
+    }
+
+    fn ident(name: &str) -> Expr {
+        Expr::unspanned(ExprKind::Ident(name.into()))
+    }
+
+    fn neg(inner: Expr) -> Expr {
+        Expr::unspanned(ExprKind::Unary(UnOp::Neg, Box::new(inner)))
+    }
+
+    fn not(inner: Expr) -> Expr {
+        Expr::unspanned(ExprKind::Unary(UnOp::Not, Box::new(inner)))
+    }
+
+    fn assign(name: &str, value: Expr) -> Expr {
+        Expr::unspanned(ExprKind::Assign(name.into(), Box::new(value)))
+    }
+
+    fn expr_stmt(expr: Expr) -> Stmt {
+        Stmt::unspanned(StmtKind::ExprStmt(expr))
+    }
+
+    // ── структура дерева (поведение без изменений) ───────────────────
+
+    #[test]
+    fn unary_operators_nest_to_the_right() {
+        let src = format!("{} x = - {} - y;", kw("LET"), kw("NOT"));
+        assert_eq!(let_value(src).unwrap(), neg(not(neg(ident("y")))));
+        let src = format!("{} x = ----1;", kw("LET"));
+        assert_eq!(let_value(src).unwrap(), neg(neg(neg(neg(int(1))))));
+    }
+
+    #[test]
+    fn unary_binds_tighter_than_binary_operators() {
+        let src = format!("{} x = -a + -b;", kw("LET"));
+        assert_eq!(
+            let_value(src).unwrap(),
+            Expr::unspanned(ExprKind::Binary(
+                BinOp::Add,
+                Box::new(neg(ident("a"))),
+                Box::new(neg(ident("b"))),
+            ))
+        );
+    }
+
+    #[test]
+    fn assignments_nest_to_the_right() {
+        let program = parse_on_small_stack("a = b = 1;".to_string()).unwrap();
+        assert_eq!(program, vec![expr_stmt(assign("a", assign("b", int(1))))]);
+    }
+
+    #[test]
+    fn index_and_field_targets_still_chain() {
+        let program = parse_on_small_stack("a[0] = b.c = d = 2;".to_string()).unwrap();
+        assert_eq!(
+            program,
+            vec![expr_stmt(Expr::unspanned(ExprKind::IndexAssign(
+                Box::new(ident("a")),
+                Box::new(int(0)),
+                Box::new(Expr::unspanned(ExprKind::FieldAssign(
+                    Box::new(ident("b")),
+                    "c".into(),
+                    Box::new(assign("d", int(2)))
+                )))
+            )))]
+        );
+    }
+
+    #[test]
+    fn invalid_assignment_target_is_still_an_error_after_the_value_is_parsed() {
+        let err = parse_on_small_stack("1 = 2;".to_string()).unwrap_err();
+        assert!(
+            err.message.contains("недопустимая левая часть"),
+            "{}",
+            err.message
+        );
+    }
+
+    // ── граница защиты глубины ───────────────────────────────────────
+
+    /// `LET x = <n операторов>1;`: охватывающий оператор и `parse_expr`
+    /// занимают два уровня, каждый унарный оператор — ещё один.
+    #[test]
+    fn unary_chain_is_accepted_up_to_exactly_the_depth_limit() {
+        let longest_ok = MAX_PARSE_DEPTH - 2;
+        for n in [1, 2, 50, longest_ok - 1, longest_ok] {
+            let src = format!("{} x = {}1;", kw("LET"), "-".repeat(n));
+            assert!(let_value(src).is_ok(), "{n} операторов должны разбираться");
+        }
+        for n in [longest_ok + 1, longest_ok + 2, 1000] {
+            let src = format!("{} x = {}1;", kw("LET"), "-".repeat(n));
+            let err = let_value(src).expect_err("цепочка длиннее предела");
+            assert!(
+                err.message.contains("глубин") && err.message.contains("унарных операторов"),
+                "{n} операторов: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn not_chain_is_limited_like_the_minus_chain() {
+        let not_kw = kw("NOT");
+        let longest_ok = MAX_PARSE_DEPTH - 2;
+        let src = format!(
+            "{} x = {}y;",
+            kw("LET"),
+            format!("{not_kw} ").repeat(longest_ok)
+        );
+        assert!(let_value(src).is_ok());
+        let src = format!(
+            "{} x = {}y;",
+            kw("LET"),
+            format!("{not_kw} ").repeat(longest_ok + 1)
+        );
+        assert!(let_value(src).is_err());
+    }
+
+    #[test]
+    fn assignment_chain_is_accepted_up_to_exactly_the_depth_limit() {
+        let longest_ok = MAX_PARSE_DEPTH - 2;
+        for n in [1, 2, 50, longest_ok - 1, longest_ok] {
+            let src = format!("{}1;", "a = ".repeat(n));
+            assert!(
+                parse_on_small_stack(src).is_ok(),
+                "{n} присваиваний должны разбираться"
+            );
+        }
+        for n in [longest_ok + 1, longest_ok + 2, 1000] {
+            let src = format!("{}1;", "a = ".repeat(n));
+            let err = parse_on_small_stack(src).expect_err("цепочка длиннее предела");
+            assert!(
+                err.message.contains("глубин") && err.message.contains("присваиваний"),
+                "{n} присваиваний: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn the_depth_error_points_at_a_real_token_of_the_chain() {
+        let src = format!("{} x = {}1;", kw("LET"), "-".repeat(500));
+        let err = let_value(src).unwrap_err();
+        assert_eq!(err.line, 1);
+        // `LET x = ` — 8 символов; ошибка — на одном из минусов или на токене
+        // после них, но не раньше начала цепочки и не после конца текста
+        assert!(
+            (9..=9 + 500 + 2).contains(&err.col),
+            "колонка ошибки {} вне цепочки",
+            err.col
+        );
+    }
+
+    // ── устойчивость на маленьком стеке ──────────────────────────────
+
+    #[test]
+    fn very_long_chains_are_a_parse_error_not_a_stack_overflow() {
+        let not_kw = kw("NOT");
+        let inputs = [
+            format!("{} x = {}1;", kw("LET"), "-".repeat(200_000)),
+            format!(
+                "{} x = {}y;",
+                kw("LET"),
+                format!("{not_kw} ").repeat(100_000)
+            ),
+            format!("{}1;", "a = ".repeat(200_000)),
+            // вперемешку: унарные внутри значения присваивания
+            format!("{}{}1;", "a = ".repeat(60), "- ".repeat(100)),
+        ];
+        for src in inputs {
+            let err = parse_on_small_stack(src).expect_err("ожидалась ParseError");
+            assert!(err.message.contains("глубин"), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn mixed_unary_and_paren_nesting_shares_one_depth_budget() {
+        // Каждая пара `-(` стоит два уровня: унарный оператор и `parse_expr`
+        // внутри скобок. Бюджет глубины общий: 30 пар (62 уровня) проходят,
+        // 60 пар (122 уровня) — нет.
+        let n = 30;
+        let ok = format!("{} x = {}1{};", kw("LET"), "-(".repeat(n), ")".repeat(n));
+        assert!(let_value(ok).is_ok());
+        let too_deep = format!("{} x = {}1{};", kw("LET"), "-(".repeat(60), ")".repeat(60));
+        let err = let_value(too_deep).expect_err("слишком глубоко");
+        assert!(err.message.contains("глубин"), "{}", err.message);
     }
 }

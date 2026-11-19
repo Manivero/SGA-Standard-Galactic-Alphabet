@@ -17,12 +17,20 @@
 //! union/intersection-типы, вывод типов для сложных выражений за пределами
 //! литералов и бинарных операций.
 
-use crate::ast::{BinOp, Expr, Pattern, Program, Stmt, TypeAnnotation, UnOp};
+use crate::ast::{
+    BinOp, Expr, ExprKind, Pattern, Program, Span, Stmt, StmtKind, TypeAnnotation, UnOp,
+};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct TypeError {
     pub message: String,
+    /// T017: узел AST, к которому относится ошибка (какой именно — см.
+    /// `err_at` у каждого места ошибки). `Span::NONE` — позиция неизвестна
+    /// (узел из импортированного модуля, разобранного без таблицы позиций, или
+    /// AST, собранный вручную). Сообщение и `Display` от позиции не зависят:
+    /// префикс `[строка:столбец]` добавляет вызывающий (см. `lib.rs`).
+    pub span: Span,
 }
 
 impl std::fmt::Display for TypeError {
@@ -33,9 +41,12 @@ impl std::fmt::Display for TypeError {
 
 type TResult<T> = Result<T, TypeError>;
 
-fn err(msg: impl Into<String>) -> TypeError {
+/// Ошибка типов, привязанная к узлу AST. Ошибки БЕЗ позиции намеренно не
+/// предусмотрены: новое место ошибки обязано выбрать узел.
+fn err_at(span: Span, msg: impl Into<String>) -> TypeError {
     TypeError {
         message: msg.into(),
+        span,
     }
 }
 
@@ -148,12 +159,12 @@ impl Typechecker {
         // Первый проход: собрать сигнатуры функций верхнего уровня —
         // как и semantic-analyzer, чтобы поддержать опережающие вызовы.
         for stmt in program {
-            if let Stmt::FnDecl {
+            if let StmtKind::FnDecl {
                 name,
                 params,
                 return_ty,
                 ..
-            } = stmt
+            } = &stmt.kind
             {
                 let sig = FnSig {
                     params: params
@@ -181,13 +192,14 @@ impl Typechecker {
     }
 
     fn check_stmt(&mut self, stmt: &Stmt) -> TResult<()> {
-        match stmt {
-            Stmt::VarDecl { name, value, ty, .. } => {
+        match &stmt.kind {
+            StmtKind::VarDecl { name, value, ty, .. } => {
                 let value_ty = self.infer(value)?;
                 match ty {
                     Some(declared) => {
                         if !compatible(declared, &value_ty) {
-                            return Err(err(format!(
+                            // ошибка — в инициализаторе, а не во всём операторе
+                            return Err(err_at(value.span, format!(
                                 "переменная '{}' объявлена с типом {}, но присвоено значение типа {}",
                                 name,
                                 show(declared),
@@ -209,17 +221,17 @@ impl Typechecker {
                 }
                 Ok(())
             }
-            Stmt::ExprStmt(e) => {
+            StmtKind::ExprStmt(e) => {
                 self.infer(e)?;
                 Ok(())
             }
-            Stmt::Print(args) => {
+            StmtKind::Print(args) => {
                 for a in args {
                     self.infer(a)?;
                 }
                 Ok(())
             }
-            Stmt::If { cond, then_branch, else_branch } => {
+            StmtKind::If { cond, then_branch, else_branch } => {
                 self.infer(cond)?;
                 self.check_block(then_branch)?;
                 if let Some(else_b) = else_branch {
@@ -227,15 +239,16 @@ impl Typechecker {
                 }
                 Ok(())
             }
-            Stmt::While { cond, body } => {
+            StmtKind::While { cond, body } => {
                 self.infer(cond)?;
                 self.check_block(body)
             }
-            Stmt::ForIn { var, start, end, body } => {
+            StmtKind::ForIn { var, start, end, body } => {
                 let start_ty = self.infer(start)?;
                 let end_ty = self.infer(end)?;
                 if !compatible(&start_ty, &end_ty) {
-                    return Err(err(format!(
+                    // несовместимость выявляется на конце диапазона
+                    return Err(err_at(end.span, format!(
                         "границы диапазона FOR..IN имеют несовместимые типы: {} и {}",
                         show(&start_ty),
                         show(&end_ty)
@@ -250,7 +263,7 @@ impl Typechecker {
                 self.pop_scope();
                 Ok(())
             }
-            Stmt::FnDecl { params, body, return_ty, .. } => {
+            StmtKind::FnDecl { params, body, return_ty, .. } => {
                 self.push_scope();
                 for p in params {
                     self.declare(&p.name, p.ty.clone().unwrap_or(TypeAnnotation::Any));
@@ -264,14 +277,17 @@ impl Typechecker {
                 self.pop_scope();
                 Ok(())
             }
-            Stmt::Return(expr) => {
+            StmtKind::Return(expr) => {
                 let actual = match expr {
                     Some(e) => self.infer(e)?,
                     None => TypeAnnotation::Nil,
                 };
                 if let Some(expected) = self.current_return_ty.clone() {
                     if !compatible(&expected, &actual) {
-                        return Err(err(format!(
+                        // возвращаемое выражение; у `RETURN;` без значения —
+                        // весь оператор
+                        let at = expr.as_ref().map_or(stmt.span, |e| e.span);
+                        return Err(err_at(at, format!(
                             "функция объявлена с возвращаемым типом {}, но RETURN возвращает {}",
                             show(&expected),
                             show(&actual)
@@ -280,13 +296,13 @@ impl Typechecker {
                 }
                 Ok(())
             }
-            Stmt::Break | Stmt::Continue => Ok(()),
-            Stmt::Block(stmts) => self.check_block(stmts),
-            // FUSION: `Stmt::Import` не должен достигать typechecker'а в
+            StmtKind::Break | StmtKind::Continue => Ok(()),
+            StmtKind::Block(stmts) => self.check_block(stmts),
+            // FUSION: `StmtKind::Import` не должен достигать typechecker'а в
             // нормальном пайплайне (см. semantic::check_stmt, та же
             // defense-in-depth логика) — резолвится `module_resolver`
             // раньше. Явная ошибка вместо игнорирования варианта.
-            Stmt::Import(path) => Err(err(format!(
+            StmtKind::Import(path) => Err(err_at(stmt.span, format!(
                 "IMPORT \"{}\" не был резолвлен до проверки типов — используйте sga::run_source_file()",
                 path
             ))),
@@ -294,7 +310,7 @@ impl Typechecker {
             // типов — нет TypeAnnotation::Struct в v0.1 (см.
             // docs/ROADMAP.md). StructDecl — pure compile-time, не несёт
             // проверяемой информации для typechecker'а.
-            Stmt::StructDecl { .. } => Ok(()),
+            StmtKind::StructDecl { .. } => Ok(()),
         }
     }
 
@@ -302,57 +318,57 @@ impl Typechecker {
     /// "статически неизвестно/не проверяем" — не ошибка.
     fn infer(&mut self, expr: &Expr) -> TResult<TypeAnnotation> {
         use TypeAnnotation::*;
-        Ok(match expr {
-            Expr::Int(_) => Int,
-            Expr::Float(_) => Float,
-            Expr::Str(_) => String,
-            Expr::Bool(_) => Bool,
-            Expr::Nil => Nil,
-            Expr::Ident(name) => self.lookup(name),
-            Expr::Array(items) => {
+        Ok(match &expr.kind {
+            ExprKind::Int(_) => Int,
+            ExprKind::Float(_) => Float,
+            ExprKind::Str(_) => String,
+            ExprKind::Bool(_) => Bool,
+            ExprKind::Nil => Nil,
+            ExprKind::Ident(name) => self.lookup(name),
+            ExprKind::Array(items) => {
                 for it in items {
                     self.infer(it)?;
                 }
                 Array
             }
-            Expr::Index(target, idx) => {
+            ExprKind::Index(target, idx) => {
                 let tt = self.infer(target)?;
                 let it = self.infer(idx)?;
                 if tt != Any && tt != Array && tt != String {
-                    return Err(err(format!(
-                        "индексация '[...]' не определена для типа {}",
-                        show(&tt)
-                    )));
+                    return Err(err_at(
+                        target.span,
+                        format!("индексация '[...]' не определена для типа {}", show(&tt)),
+                    ));
                 }
                 if it != Any && it != Int {
-                    return Err(err(format!(
-                        "индекс массива должен быть int, получено {}",
-                        show(&it)
-                    )));
+                    return Err(err_at(
+                        idx.span,
+                        format!("индекс массива должен быть int, получено {}", show(&it)),
+                    ));
                 }
                 Any
             }
-            Expr::Unary(op, e) => {
+            ExprKind::Unary(op, e) => {
                 let t = self.infer(e)?;
                 match op {
                     UnOp::Not => Bool,
                     UnOp::Neg => match t {
                         Any | Int | Float => t,
                         other => {
-                            return Err(err(format!(
-                                "унарный '-' не определён для {}",
-                                show(&other)
-                            )))
+                            return Err(err_at(
+                                expr.span,
+                                format!("унарный '-' не определён для {}", show(&other)),
+                            ))
                         }
                     },
                 }
             }
-            Expr::Binary(op, l, r) => {
+            ExprKind::Binary(op, l, r) => {
                 let lt = self.infer(l)?;
                 let rt = self.infer(r)?;
-                infer_binary(op, &lt, &rt)?
+                infer_binary(op, &lt, &rt, expr.span)?
             }
-            Expr::Call(name, args) => {
+            ExprKind::Call(name, args) => {
                 let arg_tys: Vec<TypeAnnotation> =
                     args.iter().map(|a| self.infer(a)).collect::<TResult<_>>()?;
                 let sig = self.functions.get(name).cloned();
@@ -360,13 +376,17 @@ impl Typechecker {
                     for (i, (declared, actual)) in sig.params.iter().zip(arg_tys.iter()).enumerate()
                     {
                         if !compatible(declared, actual) {
-                            return Err(err(format!(
-                                "функция '{}': аргумент {} должен быть {}, передан {}",
-                                name,
-                                i + 1,
-                                show(declared),
-                                show(actual)
-                            )));
+                            // ошибка — в аргументе (`args` и `arg_tys` параллельны)
+                            return Err(err_at(
+                                args[i].span,
+                                format!(
+                                    "функция '{}': аргумент {} должен быть {}, передан {}",
+                                    name,
+                                    i + 1,
+                                    show(declared),
+                                    show(actual)
+                                ),
+                            ));
                         }
                     }
                     sig.ret
@@ -375,11 +395,11 @@ impl Typechecker {
                     Any
                 }
             }
-            Expr::CallExpr(callee, args) => {
+            ExprKind::CallExpr(callee, args) => {
                 // Callee — произвольное выражение, не статическое имя
                 // функции, поэтому у него нет записи в `self.functions`
                 // (та таблица сигнатур заполняется только из
-                // `Stmt::FnDecl`, см. `Typechecker::new`/`declare_fn`).
+                // `StmtKind::FnDecl`, см. `Typechecker::new`/`declare_fn`).
                 // Ожидаем `Closure` либо `Any` — если объявлено что-то
                 // явно несовместимое (например, `let x: int = 5; x(1);`,
                 // что синтаксически даёт `CallExpr` через постфиксный
@@ -387,29 +407,35 @@ impl Typechecker {
                 // здесь и сейчас, а не только RuntimeError позже в VM.
                 let callee_ty = self.infer(callee)?;
                 if callee_ty != Any && callee_ty != Closure {
-                    return Err(err(format!(
-                        "вызов значения типа {} как функции невозможен (ожидался closure)",
-                        show(&callee_ty)
-                    )));
+                    return Err(err_at(
+                        callee.span,
+                        format!(
+                            "вызов значения типа {} как функции невозможен (ожидался closure)",
+                            show(&callee_ty)
+                        ),
+                    ));
                 }
                 for a in args {
                     self.infer(a)?;
                 }
                 // Сигнатура замыкания не типизирована (см.
-                // `Expr::Lambda` выше) — результат вызова через
+                // `ExprKind::Lambda` выше) — результат вызова через
                 // вычисляемый callee статически неизвестен.
                 Any
             }
-            Expr::Assign(name, value) => {
+            ExprKind::Assign(name, value) => {
                 let value_ty = self.infer(value)?;
                 let declared = self.lookup(name);
                 if !compatible(&declared, &value_ty) {
-                    return Err(err(format!(
+                    return Err(err_at(
+                        value.span,
+                        format!(
                         "невозможно присвоить значение типа {} переменной '{}' (объявлена как {})",
                         show(&value_ty),
                         name,
                         show(&declared)
-                    )));
+                    ),
+                    ));
                 }
                 if declared == Any {
                     value_ty
@@ -417,26 +443,29 @@ impl Typechecker {
                     declared
                 }
             }
-            Expr::IndexAssign(target, idx, value) => {
+            ExprKind::IndexAssign(target, idx, value) => {
                 let tt = self.infer(target)?;
                 let it = self.infer(idx)?;
                 if tt != Any && tt != Array {
-                    return Err(err(format!(
-                        "индексное присваивание не определено для типа {}",
-                        show(&tt)
-                    )));
+                    return Err(err_at(
+                        target.span,
+                        format!(
+                            "индексное присваивание не определено для типа {}",
+                            show(&tt)
+                        ),
+                    ));
                 }
                 if it != Any && it != Int {
-                    return Err(err(format!(
-                        "индекс массива должен быть int, получено {}",
-                        show(&it)
-                    )));
+                    return Err(err_at(
+                        idx.span,
+                        format!("индекс массива должен быть int, получено {}", show(&it)),
+                    ));
                 }
                 self.infer(value)?
             }
-            Expr::Lambda { params, body } => {
+            ExprKind::Lambda { params, body } => {
                 // FUSION: типы параметров/возврата замыкания НЕ
-                // аннотируются в грамматике (см. ast::Expr::Lambda) —
+                // аннотируются в грамматике (см. ast::ExprKind::Lambda) —
                 // каждый параметр трактуется как `Any`, тело проверяется
                 // в новой области видимости поверх текущей (для
                 // корректного вывода типов внутри тела, если оно
@@ -466,32 +495,32 @@ impl Typechecker {
             }
             // FUSION: structs (ветка B) — все операции типизируются как
             // `Any`, нет статических типов полей/struct-имён в v0.1 (см.
-            // комментарий у Stmt::StructDecl выше). Поля литерала всё же
+            // комментарий у StmtKind::StructDecl выше). Поля литерала всё же
             // рекурсивно проверяются — это даёт раннее обнаружение ошибок
             // типов ВНУТРИ значений полей (например, `Point{x: 1+"a"}`),
             // даже если сама struct нетипизирована.
-            Expr::StructLit { fields, .. } => {
+            ExprKind::StructLit { fields, .. } => {
                 for (_, e) in fields {
                     self.infer(e)?;
                 }
                 Any
             }
-            Expr::FieldAccess(obj, _field) => {
+            ExprKind::FieldAccess(obj, _field) => {
                 self.infer(obj)?;
                 Any
             }
-            Expr::FieldAssign(obj, _field, value) => {
+            ExprKind::FieldAssign(obj, _field, value) => {
                 self.infer(obj)?;
                 self.infer(value)?
             }
-            Expr::MethodCall(obj, _method, args) => {
+            ExprKind::MethodCall(obj, _method, args) => {
                 self.infer(obj)?;
                 for a in args {
                     self.infer(a)?;
                 }
                 Any
             }
-            Expr::Match(scrutinee, arms) => {
+            ExprKind::Match(scrutinee, arms) => {
                 // Инвариант "catch-all обязан быть последним" уже
                 // проверен semantic::Analyzer РАНЬШЕ typechecker в общем
                 // пайплайне (см. lib.rs::run_source) — здесь достаточно
@@ -517,7 +546,12 @@ impl Typechecker {
     }
 }
 
-fn infer_binary(op: &BinOp, lt: &TypeAnnotation, rt: &TypeAnnotation) -> TResult<TypeAnnotation> {
+fn infer_binary(
+    op: &BinOp,
+    lt: &TypeAnnotation,
+    rt: &TypeAnnotation,
+    span: Span,
+) -> TResult<TypeAnnotation> {
     use TypeAnnotation::*;
     match op {
         BinOp::Eq
@@ -536,11 +570,10 @@ fn infer_binary(op: &BinOp, lt: &TypeAnnotation, rt: &TypeAnnotation) -> TResult
                 (Int, Int) => Ok(Int),
                 (Float, Float) | (Int, Float) | (Float, Int) => Ok(Float),
                 (String, String) => Ok(String),
-                _ => Err(err(format!(
-                    "оператор '+' не определён для {} и {}",
-                    show(lt),
-                    show(rt)
-                ))),
+                _ => Err(err_at(
+                    span,
+                    format!("оператор '+' не определён для {} и {}", show(lt), show(rt)),
+                )),
             }
         }
         BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
@@ -550,11 +583,14 @@ fn infer_binary(op: &BinOp, lt: &TypeAnnotation, rt: &TypeAnnotation) -> TResult
             match (lt, rt) {
                 (Int, Int) => Ok(Int),
                 (Float, Float) | (Int, Float) | (Float, Int) => Ok(Float),
-                _ => Err(err(format!(
-                    "арифметический оператор не определён для {} и {}",
-                    show(lt),
-                    show(rt)
-                ))),
+                _ => Err(err_at(
+                    span,
+                    format!(
+                        "арифметический оператор не определён для {} и {}",
+                        show(lt),
+                        show(rt)
+                    ),
+                )),
             }
         }
     }

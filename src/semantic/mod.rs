@@ -8,9 +8,9 @@
 //!    переприсвоить, ни мутировать содержимое); параметры с `MUT` —
 //!    mutable-заимствование, и тогда аргумент на месте вызова обязан быть
 //!    `var`-связанным именем, иначе ошибка компиляции. См. `check_call_borrows`.
-//!  - **Замыкания/модули**: `Expr::Lambda` анализируется в области
+//!  - **Замыкания/модули**: `ExprKind::Lambda` анализируется в области
 //!    видимости, открытой к внешним переменным (для корректного захвата
-//!    в рантайме, см. `runtime::ClosureValue`); `Stmt::Import` на этой
+//!    в рантайме, см. `runtime::ClosureValue`); `StmtKind::Import` на этой
 //!    стадии — defense-in-depth ошибка (см. ниже).
 //!
 //! Статическая проверка типов — в отдельном модуле `src/typechecker`.
@@ -19,12 +19,18 @@
 //! времена жизни — в т.ч. для замыканий, захватывающих окружение) НЕ
 //! реализован — см. docs/ROADMAP.md.
 
-use crate::ast::{Expr, Pattern, Stmt};
+use crate::ast::{Expr, ExprKind, Pattern, Span, Stmt, StmtKind};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct SemError {
     pub message: String,
+    /// T017: узел AST, к которому относится ошибка (какой именно — см.
+    /// `err_at` у каждого места ошибки). `Span::NONE` — позиция неизвестна
+    /// (узел из импортированного модуля, разобранного без таблицы позиций, или
+    /// AST, собранный вручную). Сообщение и `Display` от позиции не зависят:
+    /// префикс `[строка:столбец]` добавляет вызывающий (см. `lib.rs`).
+    pub span: Span,
 }
 
 impl std::fmt::Display for SemError {
@@ -54,7 +60,7 @@ pub struct Analyzer {
     /// ветки B (структуры там не имели ownership-модели вообще). Нет
     /// статической типизации переменных по имени struct (см.
     /// typechecker) — таблица используется только для проверки
-    /// `Expr::StructLit` (поле существует, нет дублей).
+    /// `ExprKind::StructLit` (поле существует, нет дублей).
     structs: HashMap<String, std::collections::HashSet<String>>,
     loop_depth: u32,
     fn_depth: u32,
@@ -79,9 +85,12 @@ impl Analyzer {
         }
     }
 
-    fn err(msg: impl Into<String>) -> SemError {
+    /// Ошибка семантики, привязанная к узлу AST. Ошибки БЕЗ позиции намеренно
+    /// не предусмотрены: новое место ошибки обязано выбрать узел.
+    fn err_at(span: Span, msg: impl Into<String>) -> SemError {
         SemError {
             message: msg.into(),
+            span,
         }
     }
 
@@ -95,13 +104,19 @@ impl Analyzer {
         self.scopes.pop();
     }
 
-    fn declare(&mut self, name: &str, mutable: bool) -> SResult<()> {
+    /// Объявляет имя в текущей области. `span` — узел, ВВОДЯЩИЙ имя (оператор
+    /// `LET`/`VAR`/`FOR`, параметр функции, замыкание с этим параметром,
+    /// пункт `MATCH` с привязкой): на нём сообщается повторное объявление.
+    fn declare(&mut self, name: &str, mutable: bool, span: Span) -> SResult<()> {
         let scope = self.scopes.last_mut().unwrap();
         if scope.vars.contains_key(name) {
-            return Err(Self::err(format!(
-                "переменная '{}' уже объявлена в этой области видимости",
-                name
-            )));
+            return Err(Self::err_at(
+                span,
+                format!(
+                    "переменная '{}' уже объявлена в этой области видимости",
+                    name
+                ),
+            ));
         }
         scope.vars.insert(name.to_string(), mutable);
         Ok(())
@@ -125,9 +140,9 @@ impl Analyzer {
     /// мы не можем статически определить владельца и не блокируем
     /// операцию (известное ограничение v0.1, см. docs/ROADMAP.md).
     fn mutation_root(expr: &Expr) -> Option<&str> {
-        match expr {
-            Expr::Ident(name) => Some(name.as_str()),
-            Expr::Index(target, _) => Self::mutation_root(target),
+        match &expr.kind {
+            ExprKind::Ident(name) => Some(name.as_str()),
+            ExprKind::Index(target, _) => Self::mutation_root(target),
             // FUSION: структуры (ветка B) — такие же reference-типы, как
             // массивы (Rc<RefCell<...>>), поэтому глубокая мутация через
             // цепочку доступа к полю (`p.x = 1`, `a.b.c = 1`) обязана
@@ -136,7 +151,7 @@ impl Analyzer {
             // единственной "дырой" в ownership-модели, позволяющей
             // мутировать состояние через `LET`-переменную. См.
             // MIGRATION_REPORT.md.
-            Expr::FieldAccess(target, _) => Self::mutation_root(target),
+            ExprKind::FieldAccess(target, _) => Self::mutation_root(target),
             _ => None,
         }
     }
@@ -150,7 +165,9 @@ impl Analyzer {
     fn check_mutation_target(&self, target: &Expr, what: &str) -> SResult<()> {
         if let Some(name) = Self::mutation_root(target) {
             if let Some(false) = self.lookup(name) {
-                return Err(Self::err(format!(
+                // ошибка — на ЦЕЛИ мутации (первый аргумент `push`, цель
+                // индексного присваивания, объект присваивания полю)
+                return Err(Self::err_at(target.span, format!(
                     "невозможно изменить содержимое immutable-переменной '{}' через {} (объявлена через LET/CONST, либо параметр функции без MUT)",
                     name, what
                 )));
@@ -172,9 +189,10 @@ impl Analyzer {
                 if !is_mut_param {
                     continue;
                 }
-                if let Expr::Ident(arg_name) = arg {
+                if let ExprKind::Ident(arg_name) = &arg.kind {
                     if let Some(false) = self.lookup(arg_name) {
-                        return Err(Self::err(format!(
+                        // ошибка — на самом аргументе
+                        return Err(Self::err_at(arg.span, format!(
                             "нельзя передать immutable-переменную '{}' в параметр {} функции '{}', объявленный как MUT (требуется VAR)",
                             arg_name, i + 1, fn_name
                         )));
@@ -192,9 +210,12 @@ impl Analyzer {
         // парсер (parse_stmt, top_level) гарантирует, что `FnDecl`
         // синтаксически не может появиться нигде, кроме верхнего уровня.
         for stmt in program {
-            if let Stmt::FnDecl { name, params, .. } = stmt {
+            if let StmtKind::FnDecl { name, params, .. } = &stmt.kind {
                 if self.functions.contains_key(name) {
-                    return Err(Self::err(format!("функция '{}' уже объявлена", name)));
+                    return Err(Self::err_at(
+                        stmt.span,
+                        format!("функция '{}' уже объявлена", name),
+                    ));
                 }
                 let mut_params = params.iter().map(|p| p.mutable).collect();
                 self.functions.insert(
@@ -205,9 +226,12 @@ impl Analyzer {
                     },
                 );
             }
-            if let Stmt::StructDecl { name, fields } = stmt {
+            if let StmtKind::StructDecl { name, fields } = &stmt.kind {
                 if self.structs.contains_key(name) {
-                    return Err(Self::err(format!("тип '{}' уже объявлен", name)));
+                    return Err(Self::err_at(
+                        stmt.span,
+                        format!("тип '{}' уже объявлен", name),
+                    ));
                 }
                 self.structs
                     .insert(name.clone(), fields.iter().cloned().collect());
@@ -229,25 +253,25 @@ impl Analyzer {
     }
 
     fn check_stmt(&mut self, stmt: &Stmt) -> SResult<()> {
-        match stmt {
-            Stmt::VarDecl {
+        match &stmt.kind {
+            StmtKind::VarDecl {
                 name,
                 value,
                 mutable,
                 ..
             } => {
                 self.check_expr(value)?;
-                self.declare(name, *mutable)?;
+                self.declare(name, *mutable, stmt.span)?;
                 Ok(())
             }
-            Stmt::ExprStmt(e) => self.check_expr(e),
-            Stmt::Print(args) => {
+            StmtKind::ExprStmt(e) => self.check_expr(e),
+            StmtKind::Print(args) => {
                 for a in args {
                     self.check_expr(a)?;
                 }
                 Ok(())
             }
-            Stmt::If {
+            StmtKind::If {
                 cond,
                 then_branch,
                 else_branch,
@@ -259,14 +283,14 @@ impl Analyzer {
                 }
                 Ok(())
             }
-            Stmt::While { cond, body } => {
+            StmtKind::While { cond, body } => {
                 self.check_expr(cond)?;
                 self.loop_depth += 1;
                 let r = self.check_block(body);
                 self.loop_depth -= 1;
                 r
             }
-            Stmt::ForIn {
+            StmtKind::ForIn {
                 var,
                 start,
                 end,
@@ -275,7 +299,7 @@ impl Analyzer {
                 self.check_expr(start)?;
                 self.check_expr(end)?;
                 self.push_scope();
-                self.declare(var, true)?;
+                self.declare(var, true, stmt.span)?;
                 self.loop_depth += 1;
                 for s in body {
                     self.check_stmt(s)?;
@@ -284,14 +308,14 @@ impl Analyzer {
                 self.pop_scope();
                 Ok(())
             }
-            Stmt::FnDecl {
+            StmtKind::FnDecl {
                 name: _,
                 params,
                 body,
                 ..
             } => {
                 // Сбрасываем loop_depth на время проверки тела функции.
-                // На практике для Stmt::FnDecl это недостижимо иначе как
+                // На практике для StmtKind::FnDecl это недостижимо иначе как
                 // через 0 (FnDecl гарантированно top-level — см.
                 // parser::parse_stmt, top_level — а на верхнем уровне
                 // программы loop_depth всегда 0), но делаем это явно для
@@ -304,7 +328,7 @@ impl Analyzer {
                 for p in params {
                     // Ownership/Borrowing: без MUT параметр — immutable-
                     // заимствование (false), с MUT — mutable (true).
-                    self.declare(&p.name, p.mutable)?;
+                    self.declare(&p.name, p.mutable, p.span)?;
                 }
                 let result = (|| {
                     for s in body {
@@ -317,90 +341,106 @@ impl Analyzer {
                 self.loop_depth = saved_loop_depth;
                 result
             }
-            Stmt::Return(expr) => {
+            StmtKind::Return(expr) => {
                 if self.fn_depth == 0 {
-                    return Err(Self::err("RETURN вне функции"));
+                    return Err(Self::err_at(stmt.span, "RETURN вне функции"));
                 }
                 if let Some(e) = expr {
                     self.check_expr(e)?;
                 }
                 Ok(())
             }
-            Stmt::Break => {
+            StmtKind::Break => {
                 if self.loop_depth == 0 {
-                    return Err(Self::err("BREAK вне цикла"));
+                    return Err(Self::err_at(stmt.span, "BREAK вне цикла"));
                 }
                 Ok(())
             }
-            Stmt::Continue => {
+            StmtKind::Continue => {
                 if self.loop_depth == 0 {
-                    return Err(Self::err("CONTINUE вне цикла"));
+                    return Err(Self::err_at(stmt.span, "CONTINUE вне цикла"));
                 }
                 Ok(())
             }
-            Stmt::Block(stmts) => self.check_block(stmts),
-            Stmt::StructDecl { .. } => {
+            StmtKind::Block(stmts) => self.check_block(stmts),
+            StmtKind::StructDecl { .. } => {
                 // Уже обработано в первом проходе analyze() — здесь
                 // только exhaustive match. Перенесено из ветки B.
                 Ok(())
             }
-            Stmt::Import(path) => {
+            StmtKind::Import(path) => {
                 // В нормальном пайплайне (`run_source`/`run_source_file`,
                 // см. src/lib.rs) до этой точки IMPORT уже либо отклонён
                 // (`reject_imports`), либо полностью резолвлен
-                // (`module_resolver::resolve_imports`) — `Stmt::Import`
+                // (`module_resolver::resolve_imports`) — `StmtKind::Import`
                 // физически не должен достигать семантического анализа.
                 // Эта ветка — defense-in-depth для случая, когда кто-то
                 // вызывает `Analyzer::analyze` напрямую на AST, полученном
                 // из `parser` в обход `lib.rs`-пайплайна.
-                Err(Self::err(format!(
-                    "IMPORT \"{}\" не был резолвлен до семантического анализа — \
+                Err(Self::err_at(
+                    stmt.span,
+                    format!(
+                        "IMPORT \"{}\" не был резолвлен до семантического анализа — \
                      используйте sga::run_source_file() для файлов с IMPORT \
                      (Analyzer::analyze ожидает уже резолвленный AST)",
-                    path
-                )))
+                        path
+                    ),
+                ))
             }
         }
     }
 
     fn check_expr(&mut self, expr: &Expr) -> SResult<()> {
-        match expr {
-            Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Nil => Ok(()),
-            Expr::Ident(name) => {
+        match &expr.kind {
+            ExprKind::Int(_)
+            | ExprKind::Float(_)
+            | ExprKind::Str(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Nil => Ok(()),
+            ExprKind::Ident(name) => {
                 if self.lookup(name).is_none() {
-                    return Err(Self::err(format!("неопределённая переменная '{}'", name)));
+                    return Err(Self::err_at(
+                        expr.span,
+                        format!("неопределённая переменная '{}'", name),
+                    ));
                 }
                 Ok(())
             }
-            Expr::Array(items) => {
+            ExprKind::Array(items) => {
                 for it in items {
                     self.check_expr(it)?;
                 }
                 Ok(())
             }
-            Expr::Index(target, idx) => {
+            ExprKind::Index(target, idx) => {
                 self.check_expr(target)?;
                 self.check_expr(idx)
             }
-            Expr::Unary(_, e) => self.check_expr(e),
-            Expr::Binary(_, l, r) => {
+            ExprKind::Unary(_, e) => self.check_expr(e),
+            ExprKind::Binary(_, l, r) => {
                 self.check_expr(l)?;
                 self.check_expr(r)
             }
-            Expr::Call(name, args) => {
+            ExprKind::Call(name, args) => {
                 let is_known_fn = self.functions.contains_key(name);
                 let is_var = self.lookup(name).is_some();
                 if !is_known_fn && !is_builtin(name) && !is_var {
-                    return Err(Self::err(format!("неопределённая функция '{}'", name)));
+                    return Err(Self::err_at(
+                        expr.span,
+                        format!("неопределённая функция '{}'", name),
+                    ));
                 }
                 if let Some(info) = self.functions.get(name) {
                     if info.arity != args.len() {
-                        return Err(Self::err(format!(
-                            "функция '{}' ожидает {} аргумент(ов), передано {}",
-                            name,
-                            info.arity,
-                            args.len()
-                        )));
+                        return Err(Self::err_at(
+                            expr.span,
+                            format!(
+                                "функция '{}' ожидает {} аргумент(ов), передано {}",
+                                name,
+                                info.arity,
+                                args.len()
+                            ),
+                        ));
                     }
                 } else if let Some((min, max)) = builtin_arity(name) {
                     if args.len() < min || args.len() > max {
@@ -409,12 +449,15 @@ impl Analyzer {
                         } else {
                             format!("от {} до {}", min, max)
                         };
-                        return Err(Self::err(format!(
-                            "функция '{}' ожидает {} аргумент(ов), передано {}",
-                            name,
-                            expected,
-                            args.len()
-                        )));
+                        return Err(Self::err_at(
+                            expr.span,
+                            format!(
+                                "функция '{}' ожидает {} аргумент(ов), передано {}",
+                                name,
+                                expected,
+                                args.len()
+                            ),
+                        ));
                     }
                 }
                 // Если `name` — ни известная top-level функция, ни
@@ -443,12 +486,12 @@ impl Analyzer {
                 }
                 Ok(())
             }
-            Expr::CallExpr(callee, args) => {
+            ExprKind::CallExpr(callee, args) => {
                 // Callee — произвольное выражение (не статическое имя),
                 // поэтому здесь НЕТ ни проверки арности, ни
                 // borrow-checking — оба полностью динамические и
                 // проверяются в VM при исполнении (`vm::call_value`),
-                // точно так же, как для `Expr::Call` в ветке `is_var`
+                // точно так же, как для `ExprKind::Call` в ветке `is_var`
                 // выше (вызов через переменную). См. там подробный
                 // комментарий о причине.
                 self.check_expr(callee)?;
@@ -457,7 +500,7 @@ impl Analyzer {
                 }
                 Ok(())
             }
-            Expr::Lambda { params, body } => {
+            ExprKind::Lambda { params, body } => {
                 // Тело замыкания проверяется в НОВОЙ области видимости,
                 // содержащей только его параметры — НЕ копию текущего
                 // scope. Это осознанное решение: захват переменных
@@ -491,15 +534,15 @@ impl Analyzer {
                 // объемлющей функции.
                 //
                 // Параметры лямбды всегда объявляются как mutable=true:
-                // у `Expr::Lambda` нет `MUT`-аннотаций (см.
-                // `ast::Expr::Lambda`), borrow-checking для замыканий не
+                // у `ExprKind::Lambda` нет `MUT`-аннотаций (см.
+                // `ast::ExprKind::Lambda`), borrow-checking для замыканий не
                 // реализован в v0.1 — см. docs/ROADMAP.md.
                 let saved_loop_depth = self.loop_depth;
                 self.loop_depth = 0;
                 self.push_scope();
                 self.fn_depth += 1;
                 for p in params {
-                    self.declare(p, true)?;
+                    self.declare(p, true, expr.span)?;
                 }
                 let result = (|| {
                     for s in body {
@@ -512,11 +555,16 @@ impl Analyzer {
                 self.loop_depth = saved_loop_depth;
                 result
             }
-            Expr::Assign(name, value) => {
+            ExprKind::Assign(name, value) => {
                 match self.lookup(name) {
-                    None => return Err(Self::err(format!("неопределённая переменная '{}'", name))),
+                    None => {
+                        return Err(Self::err_at(
+                            expr.span,
+                            format!("неопределённая переменная '{}'", name),
+                        ))
+                    }
                     Some(false) => {
-                        return Err(Self::err(format!(
+                        return Err(Self::err_at(expr.span, format!(
                             "невозможно изменить immutable-переменную '{}' (объявлена через LET/CONST, либо параметр функции без MUT)",
                             name
                         )))
@@ -525,7 +573,7 @@ impl Analyzer {
                 }
                 self.check_expr(value)
             }
-            Expr::IndexAssign(target, idx, value) => {
+            ExprKind::IndexAssign(target, idx, value) => {
                 self.check_expr(target)?;
                 self.check_mutation_target(target, "индексное присваивание")?;
                 self.check_expr(idx)?;
@@ -536,11 +584,14 @@ impl Analyzer {
             // через `check_mutation_target` (см. `mutation_root`, ветка
             // FieldAccess, и комментарий там) — единственное реальное
             // изменение поведения относительно исходного кода ветки B.
-            Expr::StructLit { type_name, fields } => {
+            ExprKind::StructLit { type_name, fields } => {
                 // Проверяем: тип объявлен, нет лишних полей, нет дублей.
                 // Отсутствующие поля допустимы — инициализируются Nil.
                 if !self.structs.contains_key(type_name) {
-                    return Err(Self::err(format!("неизвестный тип '{}'", type_name)));
+                    return Err(Self::err_at(
+                        expr.span,
+                        format!("неизвестный тип '{}'", type_name),
+                    ));
                 }
                 // Клонируем набор полей перед циклом — `self.check_expr`
                 // нужен `&mut self`, а `self.structs.get(...)` держал бы
@@ -553,33 +604,36 @@ impl Analyzer {
                 let mut seen = std::collections::HashSet::new();
                 for (field_name, field_expr) in fields {
                     if !declared.contains(field_name) {
-                        return Err(Self::err(format!(
-                            "тип '{}' не имеет поля '{}'",
-                            type_name, field_name
-                        )));
+                        return Err(Self::err_at(
+                            expr.span,
+                            format!("тип '{}' не имеет поля '{}'", type_name, field_name),
+                        ));
                     }
                     if !seen.insert(field_name) {
-                        return Err(Self::err(format!(
-                            "поле '{}' указано дважды в литерале '{}'",
-                            field_name, type_name
-                        )));
+                        return Err(Self::err_at(
+                            expr.span,
+                            format!(
+                                "поле '{}' указано дважды в литерале '{}'",
+                                field_name, type_name
+                            ),
+                        ));
                     }
                     self.check_expr(field_expr)?;
                 }
                 Ok(())
             }
-            Expr::FieldAccess(obj, _field) => {
+            ExprKind::FieldAccess(obj, _field) => {
                 // Имя поля не проверяем статически — нет статических
                 // типов структур (см. typechecker). Обращение к
                 // несуществующему полю — RuntimeError (см. vm::GetField).
                 self.check_expr(obj)
             }
-            Expr::FieldAssign(obj, _field, value) => {
+            ExprKind::FieldAssign(obj, _field, value) => {
                 self.check_expr(obj)?;
                 self.check_mutation_target(obj, "присваивание полю struct")?;
                 self.check_expr(value)
             }
-            Expr::MethodCall(obj, method_name, args) => {
+            ExprKind::MethodCall(obj, method_name, args) => {
                 // Метод = top-level функция `TypeName_method`, разрешаемая
                 // в рантайме по фактическому типу `obj` (см. vm::CallMethod).
                 // Статическая арность/borrow-checking для self-параметра
@@ -598,7 +652,7 @@ impl Analyzer {
                 }
                 Ok(())
             }
-            Expr::Match(scrutinee, arms) => {
+            ExprKind::Match(scrutinee, arms) => {
                 // T006 (M002): последний arm ОБЯЗАН быть catch-all
                 // ('_' или имя-привязка) — устраняет непокрытый случай
                 // на этапе компиляции вместо runtime-ошибки (осознанное
@@ -606,7 +660,8 @@ impl Analyzer {
                 // Catch-all раньше последней позиции — недостижимый код.
                 self.check_expr(scrutinee)?;
                 if arms.is_empty() {
-                    return Err(Self::err(
+                    return Err(Self::err_at(
+                        expr.span,
                         "MATCH без единого arm — нужен хотя бы завершающий catch-all ('_' или имя-привязка)"
                             .to_string(),
                     ));
@@ -615,13 +670,15 @@ impl Analyzer {
                 for (i, arm) in arms.iter().enumerate() {
                     let is_catch_all = matches!(arm.pattern, Pattern::Wildcard | Pattern::Bind(_));
                     if is_catch_all && i != last_idx {
-                        return Err(Self::err(format!(
+                        // ошибка — на самом пункте, нарушающем правило
+                        return Err(Self::err_at(arm.span, format!(
                             "недостижимый паттерн в MATCH: catch-all ('_' или имя-привязка) на позиции {} — arm'ы после него никогда не выполнятся; catch-all обязан быть последним",
                             i + 1
                         )));
                     }
                     if i == last_idx && !is_catch_all {
-                        return Err(Self::err(
+                        return Err(Self::err_at(
+                            arm.span,
                             "MATCH обязан заканчиваться catch-all-паттерном ('_' или имя-привязка) — иначе возможен непокрытый случай"
                                 .to_string(),
                         ));
@@ -630,9 +687,9 @@ impl Analyzer {
                         // Bind связывает scrutinee с новым именем,
                         // видимым только в теле СВОЕГО arm — immutable,
                         // как LET (та же семантика, что и параметры
-                        // замыкания, см. Expr::Lambda выше).
+                        // замыкания, см. ExprKind::Lambda выше).
                         self.push_scope();
-                        self.declare(name, false)?;
+                        self.declare(name, false, arm.span)?;
                         self.check_expr(&arm.body)?;
                         self.pop_scope();
                     } else {
@@ -650,48 +707,13 @@ fn is_builtin(name: &str) -> bool {
 }
 
 /// Допустимый диапазон количества аргументов (min, max) для каждой
-/// builtin-функции. `push` — единственная исходно-builtin функция с
-/// переменной арностью (см. FUSION-комментарий у `runtime::call_builtin`).
-/// Остальные новые записи (`range`..`str_lower`) перенесены из ветки B —
-/// её stdlib (см. MIGRATION_REPORT.md, раздел "Stdlib").
-fn builtin_arity(name: &str) -> Option<(usize, usize)> {
-    match name {
-        "len" => Some((1, 1)),
-        "push" => Some((1, 2)),
-        "to_string" => Some((1, 1)),
-        "to_int" => Some((1, 1)),
-        "to_float" => Some((1, 1)),
-        "type_of" => Some((1, 1)),
-        "keys" => Some((1, 1)),
-        "range" => Some((1, 2)),
-        "sqrt" => Some((1, 1)),
-        "floor" => Some((1, 1)),
-        "ceil" => Some((1, 1)),
-        "abs" => Some((1, 1)),
-        "min" => Some((2, 2)),
-        "max" => Some((2, 2)),
-        "pow" => Some((2, 2)),
-        "str_split" => Some((2, 2)),
-        "str_contains" => Some((2, 2)),
-        "str_trim" => Some((1, 1)),
-        "str_starts_with" => Some((2, 2)),
-        "str_ends_with" => Some((2, 2)),
-        "str_replace" => Some((3, 3)),
-        "str_upper" => Some((1, 1)),
-        "str_lower" => Some((1, 1)),
-        "json_stringify" => Some((1, 1)),
-        "json_parse" => Some((1, 1)),
-        "read_file" => Some((1, 1)),
-        // T012 (M006): args() — без аргументов.
-        "args" => Some((0, 0)),
-        // T013 (M006): read_line() / read_stdin() — без аргументов.
-        "read_line" => Some((0, 0)),
-        "read_stdin" => Some((0, 0)),
-        // T014 (M006): time_now_ms() / time_monotonic_ms() — без аргументов.
-        "time_now_ms" => Some((0, 0)),
-        "time_monotonic_ms" => Some((0, 0)),
-        // T015 (M006): write_file(path, content) — ровно 2 аргумента.
-        "write_file" => Some((2, 2)),
-        _ => None,
-    }
+/// builtin-функции. `push` и `range` — функции с переменной арностью.
+///
+/// Арность хранится в едином реестре `runtime::BUILTINS` (T018, M007): раньше
+/// здесь был отдельный `match` на 32 имени, который мог разойтись с
+/// `runtime::is_builtin`, а языковой сервер не мог им воспользоваться. Теперь
+/// это функция-делегат: `semantic` проверяет арность, `lsp` показывает её в
+/// подсказках, и оба берут её из одного места.
+pub fn builtin_arity(name: &str) -> Option<(usize, usize)> {
+    crate::runtime::builtin_arity(name)
 }

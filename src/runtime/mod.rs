@@ -284,64 +284,112 @@ fn fmt_value(v: &Value, depth: usize, f: &mut fmt::Formatter<'_>) -> fmt::Result
     }
 }
 
+/// Запись реестра builtin-функций: имя и допустимое число аргументов
+/// (включительно). Арность проверяет `semantic` при компиляции вызова.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuiltinSig {
+    pub name: &'static str,
+    pub min_args: usize,
+    pub max_args: usize,
+}
+
+/// Реестр builtin-функций: ЕДИНСТВЕННЫЙ источник имён и арности (T018, M007;
+/// частично закрывает TD-013). Из одного списка макрос порождает и перечень
+/// [`BUILTINS`] (его перечисляет языковой сервер, `lsp::vocabulary`), и
+/// `match`, на котором построены [`builtin_arity`] и [`is_builtin`]: список
+/// подсказок не может разойтись с компилятором. `match` (а не поиск по срезу)
+/// нужен потому, что VM вызывает `is_builtin` на КАЖДОМ вызове функции
+/// (`Vm::call`) — линейный поиск по 32 записям замедлял рекурсивные
+/// программы заметно (≈ +6 % на `fib(27)`, замер T018), а `match` по строкам
+/// компилируется так же, как прежний `matches!`.
+///
+/// Порядок — как в `docs/VM_SPEC.md`. `push` и `range` — функции с переменной
+/// арностью. Новый builtin добавляется сюда, в `call_builtin` (или в перехват
+/// `Vm::call`, если ему нужно состояние VM) и в `lsp::vocabulary` —
+/// отсутствие записи в словаре подсказок ловит тест.
+macro_rules! builtin_registry {
+    ($($name:literal => ($min:literal, $max:literal)),+ $(,)?) => {
+        /// Все builtin-функции в порядке реестра.
+        pub const BUILTINS: &[BuiltinSig] = &[
+            $(BuiltinSig { name: $name, min_args: $min, max_args: $max }),+
+        ];
+
+        /// Допустимый диапазон количества аргументов `(min, max)`
+        /// builtin-функции; `None` — это не builtin.
+        pub fn builtin_arity(name: &str) -> Option<(usize, usize)> {
+            match name {
+                $($name => Some(($min, $max)),)+
+                _ => None,
+            }
+        }
+    };
+}
+
+builtin_registry! {
+    // коллекции и общие
+    "len" => (1, 1),
+    "push" => (1, 2),
+    "keys" => (1, 1),
+    "range" => (1, 2),
+    "to_string" => (1, 1),
+    "to_int" => (1, 1),
+    "to_float" => (1, 1),
+    "type_of" => (1, 1),
+    // числовые
+    "sqrt" => (1, 1),
+    "floor" => (1, 1),
+    "ceil" => (1, 1),
+    "abs" => (1, 1),
+    "min" => (2, 2),
+    "max" => (2, 2),
+    "pow" => (2, 2),
+    // строковые
+    "str_split" => (2, 2),
+    "str_contains" => (2, 2),
+    "str_trim" => (1, 1),
+    "str_starts_with" => (2, 2),
+    "str_ends_with" => (2, 2),
+    "str_replace" => (3, 3),
+    "str_upper" => (1, 1),
+    "str_lower" => (1, 1),
+    // std/json (T008)
+    "json_stringify" => (1, 1),
+    "json_parse" => (1, 1),
+    // T009 (M003): read_file зарегистрирован здесь (нужно codegen'у и
+    // semantic'у), но НЕ реализован в call_builtin — перехватывается раньше, в
+    // Vm::call(), т.к. нужен доступ к Vm::sandbox_root, которого у свободной
+    // функции нет. См. src/vm/mod.rs::call_read_file.
+    "read_file" => (1, 1),
+    // T015 (M006): write_file — по той же причине, что read_file: нужны
+    // разрешение на запись (Vm::set_allow_write) и корень песочницы
+    // (Vm::sandbox_root). См. src/vm/mod.rs::call_write_file; проверка пути и
+    // сама запись — src/fs_sandbox.rs.
+    "write_file" => (2, 2),
+    // T013 (M006): read_line / read_stdin — читатель стандартного ввода
+    // хранится в Vm (Vm::set_stdin). См. src/vm/mod.rs::call_read_line /
+    // call_read_stdin; разбор самого ввода — src/stdin.rs.
+    "read_line" => (0, 0),
+    "read_stdin" => (0, 0),
+    // T012 (M006): args — аргументы программы хранятся в Vm (Vm::set_args). См.
+    // src/vm/mod.rs::call_args.
+    "args" => (0, 0),
+    // T014 (M006): time_now_ms не требует состояния VM и реализован в
+    // call_builtin; time_monotonic_ms отсчитывает время от создания VM
+    // (Vm::started), поэтому перехватывается в Vm::call(). Чистые функции над
+    // инъектируемыми значениями времени — src/clock.rs.
+    "time_now_ms" => (0, 0),
+    "time_monotonic_ms" => (0, 0),
+}
+
+/// Запись реестра по имени (для языкового сервера; на горячем пути VM не
+/// используется — там `is_builtin`).
+pub fn builtin_sig(name: &str) -> Option<&'static BuiltinSig> {
+    BUILTINS.iter().find(|b| b.name == name)
+}
+
+/// `true`, если `name` — имя builtin-функции.
 pub fn is_builtin(name: &str) -> bool {
-    matches!(
-        name,
-        "len"
-            | "push"
-            | "to_string"
-            | "to_int"
-            | "to_float"
-            | "type_of"
-            | "keys"
-            | "sqrt"
-            | "floor"
-            | "ceil"
-            | "abs"
-            | "min"
-            | "max"
-            | "pow"
-            | "str_split"
-            | "str_contains"
-            | "str_trim"
-            | "str_starts_with"
-            | "str_ends_with"
-            | "str_replace"
-            | "str_upper"
-            | "str_lower"
-            | "range"
-            | "json_stringify"
-            | "json_parse"
-            // T009 (M003): read_file зарегистрирован здесь (нужно
-            // codegen'у и semantic'у), но НЕ реализован ниже в
-            // call_builtin — перехватывается раньше, в Vm::call(),
-            // т.к. нужен доступ к Vm::sandbox_root, которого у этой
-            // свободной функции нет. См. src/vm/mod.rs::call_read_file.
-            | "read_file"
-            // T012 (M006): args — по той же причине, что read_file:
-            // аргументы программы хранятся в Vm (Vm::set_args), у
-            // свободной функции call_builtin доступа к ним нет. См.
-            // src/vm/mod.rs::call_args.
-            | "args"
-            // T013 (M006): read_line / read_stdin — по той же причине:
-            // читатель стандартного ввода хранится в Vm (Vm::set_stdin).
-            // См. src/vm/mod.rs::call_read_line / call_read_stdin; разбор
-            // самого ввода — src/stdin.rs.
-            | "read_line"
-            | "read_stdin"
-            // T014 (M006): time_now_ms / time_monotonic_ms. Первая не
-            // требует состояния VM и реализована ниже, в call_builtin;
-            // вторая отсчитывает время от создания VM (Vm::started),
-            // поэтому перехватывается в Vm::call(). Чистые функции над
-            // инъектируемыми значениями времени — src/clock.rs.
-            | "time_now_ms"
-            | "time_monotonic_ms"
-            // T015 (M006): write_file — по той же причине, что read_file:
-            // нужны разрешение на запись (Vm::set_allow_write) и корень
-            // песочницы (Vm::sandbox_root). См. src/vm/mod.rs::call_write_file;
-            // проверка пути и сама запись — src/fs_sandbox.rs.
-            | "write_file"
-    )
+    builtin_arity(name).is_some()
 }
 
 /// FUSION: расширено при слиянии — исходно (ветка A) здесь было только
@@ -715,5 +763,152 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> Result<Value, String> {
         }
 
         _ => Err(format!("неизвестная встроенная функция '{}'", name)),
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    /// Эталон: имя и арность в порядке `docs/VM_SPEC.md`. Копия записана
+    /// ВРУЧНУЮ и независимо от реестра: правка реестра без правки эталона (и
+    /// спецификации) должна ломать тест, а не проходить молча.
+    const GOLDEN: &[(&str, usize, usize)] = &[
+        ("len", 1, 1),
+        ("push", 1, 2),
+        ("keys", 1, 1),
+        ("range", 1, 2),
+        ("to_string", 1, 1),
+        ("to_int", 1, 1),
+        ("to_float", 1, 1),
+        ("type_of", 1, 1),
+        ("sqrt", 1, 1),
+        ("floor", 1, 1),
+        ("ceil", 1, 1),
+        ("abs", 1, 1),
+        ("min", 2, 2),
+        ("max", 2, 2),
+        ("pow", 2, 2),
+        ("str_split", 2, 2),
+        ("str_contains", 2, 2),
+        ("str_trim", 1, 1),
+        ("str_starts_with", 2, 2),
+        ("str_ends_with", 2, 2),
+        ("str_replace", 3, 3),
+        ("str_upper", 1, 1),
+        ("str_lower", 1, 1),
+        ("json_stringify", 1, 1),
+        ("json_parse", 1, 1),
+        ("read_file", 1, 1),
+        ("write_file", 2, 2),
+        ("read_line", 0, 0),
+        ("read_stdin", 0, 0),
+        ("args", 0, 0),
+        ("time_now_ms", 0, 0),
+        ("time_monotonic_ms", 0, 0),
+    ];
+
+    #[test]
+    fn registry_matches_the_golden_list_in_order() {
+        let actual: Vec<(&str, usize, usize)> = BUILTINS
+            .iter()
+            .map(|b| (b.name, b.min_args, b.max_args))
+            .collect();
+        assert_eq!(actual, GOLDEN);
+        assert_eq!(BUILTINS.len(), 32);
+    }
+
+    #[test]
+    fn names_are_unique_and_well_formed() {
+        for (i, b) in BUILTINS.iter().enumerate() {
+            assert!(
+                !b.name.is_empty()
+                    && b.name
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                "имя builtin должно быть строчным ASCII-идентификатором: {:?}",
+                b.name
+            );
+            assert!(b.min_args <= b.max_args, "{}: min > max", b.name);
+            assert!(
+                BUILTINS.iter().skip(i + 1).all(|o| o.name != b.name),
+                "повтор имени {}",
+                b.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_lookup_function_agrees_with_the_table() {
+        for b in BUILTINS {
+            assert!(is_builtin(b.name), "{}", b.name);
+            assert_eq!(builtin_arity(b.name), Some((b.min_args, b.max_args)));
+            assert_eq!(builtin_sig(b.name), Some(b));
+        }
+    }
+
+    #[test]
+    fn non_builtin_names_are_rejected_by_every_lookup() {
+        for name in [
+            "",
+            " ",
+            "len ",
+            " len",
+            "LEN",
+            "Len",
+            "print",
+            "PRINT",
+            "str_",
+            "json",
+            "read",
+            "readfile",
+            "time_now",
+            "time_monotonic",
+            "main",
+            "Point_move",
+            "x",
+            "len\0",
+            "лен",
+            "\u{EB40}",
+        ] {
+            assert!(!is_builtin(name), "{name:?}");
+            assert_eq!(builtin_arity(name), None, "{name:?}");
+            assert_eq!(builtin_sig(name), None, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn every_registered_name_is_implemented_by_the_runtime_or_intercepted() {
+        // Перехватываемые в `Vm::call` имена в `call_builtin` стоят как
+        // `unreachable!` (вызывать их напрямую нельзя); остальные обязаны
+        // давать НЕ «неизвестную встроенную функцию»: реестр не должен
+        // содержать имя, которое некому выполнить.
+        const INTERCEPTED: &[&str] = &[
+            "read_file",
+            "write_file",
+            "read_line",
+            "read_stdin",
+            "args",
+            "time_monotonic_ms",
+        ];
+        for b in BUILTINS {
+            if INTERCEPTED.contains(&b.name) {
+                continue;
+            }
+            // пустой список аргументов: для любого builtin результат — Ok или
+            // осмысленная ошибка про аргументы, но не про неизвестное имя
+            match call_builtin(b.name, vec![]) {
+                Ok(_) => {}
+                Err(message) => assert!(
+                    !message.contains("неизвестная встроенная функция"),
+                    "{}: {message}",
+                    b.name
+                ),
+            }
+        }
+        assert_eq!(
+            call_builtin("no_such_builtin", vec![]),
+            Err("неизвестная встроенная функция 'no_such_builtin'".to_string())
+        );
     }
 }

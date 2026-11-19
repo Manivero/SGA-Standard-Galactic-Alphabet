@@ -7,7 +7,7 @@
 //! фиксируется в стеке контекстов циклов и патчится постфактум, когда стаёт
 //! известен адрес конца цикла.
 
-use crate::ast::{BinOp, Expr, Pattern, Program, Stmt, UnOp};
+use crate::ast::{BinOp, Expr, ExprKind, Pattern, Program, Stmt, StmtKind, UnOp};
 use crate::runtime::{is_builtin, Value};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -30,7 +30,7 @@ pub struct Compiler {
     loop_stack: Vec<LoopCtx>,
     /// Имена top-level функций, известные на момент компиляции (собраны
     /// `compile()` первым проходом по `program`, как и в
-    /// `semantic::Analyzer::analyze`). Нужно для `Expr::Call(name, args)`:
+    /// `semantic::Analyzer::analyze`). Нужно для `ExprKind::Call(name, args)`:
     /// если `name` входит сюда (или является builtin) — эмиттируется
     /// статический `OpCode::Call(name, argc)` (быстрый путь, поиск по
     /// строке в `Vm::functions`). Если `name` НЕ входит сюда — это
@@ -47,7 +47,7 @@ pub struct Compiler {
     /// переменных (T006, M002: scrutinee выражения MATCH хранится в
     /// переменной вида `__match_N`, чтобы вычислить его РОВНО ОДИН РАЗ
     /// и переиспользовать при сравнении с каждым паттерном — см.
-    /// `compile_expr`, ветка `Expr::Match`). Достаточно per-`Compiler`
+    /// `compile_expr`, ветка `ExprKind::Match`). Достаточно per-`Compiler`
     /// счётчика (не глобального): уникальность нужна только для
     /// ВЛОЖЕННЫХ `MATCH` внутри одного и того же чанка — соседние
     /// (не вложенные) `MATCH` никогда не пересекаются по времени жизни
@@ -58,7 +58,7 @@ pub struct Compiler {
 pub fn compile(program: &Program) -> CompiledProgram {
     let mut known_functions = HashSet::new();
     for stmt in program {
-        if let Stmt::FnDecl { name, .. } = stmt {
+        if let StmtKind::FnDecl { name, .. } = &stmt.kind {
             known_functions.insert(name.clone());
         }
     }
@@ -75,7 +75,7 @@ pub fn compile(program: &Program) -> CompiledProgram {
     // FUSION-ПРИМЕЧАНИЕ: значение ПОСЛЕДНЕГО top-level statement'а,
     // компилируемого в main-чанк (то есть последнего НЕ-FnDecl statement'а
     // в `program` — FnDecl компилируются отдельно, в `functions`, и не
-    // попадают в поток инструкций main-чанка), если это `Stmt::ExprStmt`,
+    // попадают в поток инструкций main-чанка), если это `StmtKind::ExprStmt`,
     // становится результатом выполнения всей программы (значением,
     // возвращаемым `Vm::run`/`sga::run_source`), а не отбрасывается
     // оператором `Pop`, как любой другой expression-statement.
@@ -95,12 +95,12 @@ pub fn compile(program: &Program) -> CompiledProgram {
     // скрипты. Подробности — см. MIGRATION_REPORT.md.
     let last_main_stmt_idx = program
         .iter()
-        .rposition(|s| !matches!(s, Stmt::FnDecl { .. }));
+        .rposition(|s| !matches!(s.kind, StmtKind::FnDecl { .. }));
 
     for (i, stmt) in program.iter().enumerate() {
-        if let Stmt::FnDecl {
+        if let StmtKind::FnDecl {
             name, params, body, ..
-        } = stmt
+        } = &stmt.kind
         {
             let mut fc = Compiler {
                 chunk: Chunk::default(),
@@ -153,7 +153,7 @@ pub fn compile(program: &Program) -> CompiledProgram {
 
 impl Compiler {
     /// Компилирует ПОСЛЕДНИЙ statement главного потока программы. Для
-    /// `Stmt::ExprStmt` — в отличие от обычного `compile_stmt` — НЕ
+    /// `StmtKind::ExprStmt` — в отличие от обычного `compile_stmt` — НЕ
     /// эмиттирует `Pop` после вычисления выражения, а сразу эмиттирует
     /// `OpCode::Return(true)`, оставляя значение выражения результатом
     /// всей программы. Для любого другого варианта `Stmt` — поведение
@@ -161,7 +161,7 @@ impl Compiler {
     /// программа в этом случае просто завершается с `Value::Nil`, как и
     /// раньше). См. подробное обоснование в `compile()`.
     fn compile_tail_stmt(&mut self, stmt: &Stmt) {
-        if let Stmt::ExprStmt(e) = stmt {
+        if let StmtKind::ExprStmt(e) = &stmt.kind {
             self.compile_expr(e);
             self.emit(OpCode::Return(true));
         } else {
@@ -192,8 +192,8 @@ impl Compiler {
     }
 
     fn compile_stmt(&mut self, stmt: &Stmt) {
-        match stmt {
-            Stmt::VarDecl {
+        match &stmt.kind {
+            StmtKind::VarDecl {
                 name,
                 value,
                 mutable,
@@ -202,18 +202,18 @@ impl Compiler {
                 self.compile_expr(value);
                 self.emit(OpCode::DefineVar(name.clone(), *mutable));
             }
-            Stmt::ExprStmt(e) => {
+            StmtKind::ExprStmt(e) => {
                 self.compile_expr(e);
                 self.emit(OpCode::Pop);
             }
-            Stmt::Print(args) => {
+            StmtKind::Print(args) => {
                 let n = args.len();
                 for a in args {
                     self.compile_expr(a);
                 }
                 self.emit(OpCode::Print(n));
             }
-            Stmt::If {
+            StmtKind::If {
                 cond,
                 then_branch,
                 else_branch,
@@ -241,7 +241,7 @@ impl Compiler {
                     self.patch_jump(jif, end);
                 }
             }
-            Stmt::While { cond, body } => {
+            StmtKind::While { cond, body } => {
                 let loop_start = self.here();
                 self.compile_expr(cond);
                 let jif = self.emit(OpCode::JumpIfFalse(0));
@@ -265,7 +265,7 @@ impl Compiler {
                     self.patch_jump(p, loop_start);
                 }
             }
-            Stmt::ForIn {
+            StmtKind::ForIn {
                 var,
                 start,
                 end,
@@ -305,7 +305,7 @@ impl Compiler {
                     self.patch_jump(p, incr_pos);
                 }
             }
-            Stmt::FnDecl { .. } => {
+            StmtKind::FnDecl { .. } => {
                 // С учётом запрета вложенных FN на уровне парсера
                 // (см. parser/mod.rs::parse_stmt, top_level) эта ветка
                 // в codegen синтаксически недостижима для корректно
@@ -314,7 +314,7 @@ impl Compiler {
                 // парсера. Верхнеуровневая компиляция функций
                 // обрабатывается в `compile()` (см. выше).
             }
-            Stmt::Return(expr) => match expr {
+            StmtKind::Return(expr) => match expr {
                 Some(e) => {
                     self.compile_expr(e);
                     self.emit(OpCode::Return(true));
@@ -323,86 +323,86 @@ impl Compiler {
                     self.emit(OpCode::Return(false));
                 }
             },
-            Stmt::Break => {
+            StmtKind::Break => {
                 let pos = self.emit(OpCode::Jump(0));
                 if let Some(ctx) = self.loop_stack.last_mut() {
                     ctx.break_patches.push(pos);
                 }
             }
-            Stmt::Continue => {
+            StmtKind::Continue => {
                 let pos = self.emit(OpCode::Jump(0));
                 if let Some(ctx) = self.loop_stack.last_mut() {
                     ctx.continue_patches.push(pos);
                 }
             }
-            Stmt::Block(stmts) => {
+            StmtKind::Block(stmts) => {
                 self.emit(OpCode::PushScope);
                 for s in stmts {
                     self.compile_stmt(s);
                 }
                 self.emit(OpCode::PopScope);
             }
-            Stmt::Import(_) => {
+            StmtKind::Import(_) => {
                 // Недостижимо в нормальном пайплайне: semantic-анализ
-                // отклоняет нерезолвленный `Stmt::Import` раньше. No-op
+                // отклоняет нерезолвленный `StmtKind::Import` раньше. No-op
                 // defense-in-depth.
             }
-            Stmt::StructDecl { .. } => {
+            StmtKind::StructDecl { .. } => {
                 // FUSION: перенесено из ветки B. StructDecl не производит
                 // байткода — pure-compile-time объявление. Тип
                 // зарегистрирован в `semantic::Analyzer::structs` (первый
                 // проход `analyze`) и используется при проверке
-                // `Expr::StructLit`. В рантайме struct создаётся через
+                // `ExprKind::StructLit`. В рантайме struct создаётся через
                 // `OpCode::MakeStruct`.
             }
         }
     }
 
     fn compile_expr(&mut self, expr: &Expr) {
-        match expr {
-            Expr::Int(v) => {
+        match &expr.kind {
+            ExprKind::Int(v) => {
                 let idx = self.add_const(Value::Int(*v));
                 self.emit(OpCode::PushConst(idx));
             }
-            Expr::Float(v) => {
+            ExprKind::Float(v) => {
                 let idx = self.add_const(Value::Float(*v));
                 self.emit(OpCode::PushConst(idx));
             }
-            Expr::Str(s) => {
+            ExprKind::Str(s) => {
                 let idx = self.add_const(Value::Str(s.clone()));
                 self.emit(OpCode::PushConst(idx));
             }
-            Expr::Bool(b) => {
+            ExprKind::Bool(b) => {
                 let idx = self.add_const(Value::Bool(*b));
                 self.emit(OpCode::PushConst(idx));
             }
-            Expr::Nil => {
+            ExprKind::Nil => {
                 let idx = self.add_const(Value::Nil);
                 self.emit(OpCode::PushConst(idx));
             }
-            Expr::Ident(name) => {
+            ExprKind::Ident(name) => {
                 self.emit(OpCode::LoadVar(name.clone()));
             }
-            Expr::Array(items) => {
+            ExprKind::Array(items) => {
                 let n = items.len();
                 for it in items {
                     self.compile_expr(it);
                 }
                 self.emit(OpCode::MakeArray(n));
             }
-            Expr::Index(target, idx) => {
+            ExprKind::Index(target, idx) => {
                 self.compile_expr(target);
                 self.compile_expr(idx);
                 self.emit(OpCode::Index);
             }
-            Expr::Unary(op, e) => {
+            ExprKind::Unary(op, e) => {
                 self.compile_expr(e);
                 self.emit(match op {
                     UnOp::Neg => OpCode::Neg,
                     UnOp::Not => OpCode::Not,
                 });
             }
-            Expr::Binary(op, l, r) => {
+            ExprKind::Binary(op, l, r) => {
                 self.compile_expr(l);
                 self.compile_expr(r);
                 self.emit(match op {
@@ -421,7 +421,7 @@ impl Compiler {
                     BinOp::Or => OpCode::Or,
                 });
             }
-            Expr::Call(name, args) => {
+            ExprKind::Call(name, args) => {
                 let n = args.len();
                 if self.known_functions.contains(name) || is_builtin(name) {
                     // Статически известная top-level функция или builtin
@@ -438,7 +438,7 @@ impl Compiler {
                     // не builtin — это обращение к переменной (semantic
                     // уже гарантировала, что переменная с таким именем
                     // видна — см. `semantic::check_expr`, ветка
-                    // `Expr::Call`, `is_var`). Загружаем её значение и
+                    // `ExprKind::Call`, `is_var`). Загружаем её значение и
                     // вызываем динамически через `CallValue`: VM в
                     // рантайме проверит, что это действительно
                     // `Value::Closure` (см. `vm::run_chunk`, ветка
@@ -451,13 +451,13 @@ impl Compiler {
                     self.emit(OpCode::CallValue(n));
                 }
             }
-            Expr::CallExpr(callee, args) => {
+            ExprKind::CallExpr(callee, args) => {
                 // Общий случай: callee — произвольное выражение, не
                 // статическое имя. Компилируется так же, как
                 // вызов-через-переменную выше (`LoadVar` + `CallValue`),
                 // только вместо `LoadVar(name)` — полноценная компиляция
                 // произвольного выражения (например, тела лямбды для
-                // IIFE: `OpCode::MakeClosure`, см. `Expr::Lambda` ниже).
+                // IIFE: `OpCode::MakeClosure`, см. `ExprKind::Lambda` ниже).
                 self.compile_expr(callee);
                 let n = args.len();
                 for a in args {
@@ -465,7 +465,7 @@ impl Compiler {
                 }
                 self.emit(OpCode::CallValue(n));
             }
-            Expr::Lambda { params, body } => {
+            ExprKind::Lambda { params, body } => {
                 // Тело лямбды компилируется в ОТДЕЛЬНЫЙ Chunk новым
                 // Compiler'ом — точно так же, как тело top-level FnDecl
                 // компилируется в compile() — а не инлайнится в текущий
@@ -491,11 +491,11 @@ impl Compiler {
                     body: Rc::new(lambda_compiler.chunk),
                 });
             }
-            Expr::Assign(name, value) => {
+            ExprKind::Assign(name, value) => {
                 self.compile_expr(value);
                 self.emit(OpCode::StoreVar(name.clone()));
             }
-            Expr::IndexAssign(target, idx, value) => {
+            ExprKind::IndexAssign(target, idx, value) => {
                 self.compile_expr(target);
                 self.compile_expr(idx);
                 self.compile_expr(value);
@@ -504,7 +504,7 @@ impl Compiler {
             // FUSION: ниже — перенесено из ветки B без изменений
             // (codegen для structs не пересекается с ownership-моделью —
             // та проверка выполнена раньше, в semantic).
-            Expr::StructLit { type_name, fields } => {
+            ExprKind::StructLit { type_name, fields } => {
                 // Компилируем значения полей в порядке объявления поля в
                 // литерале (не порядке объявления в STRUCT), чтобы
                 // MakeStruct в VM мог сопоставить позицию на стеке с
@@ -519,16 +519,16 @@ impl Compiler {
                     fields: field_names,
                 });
             }
-            Expr::FieldAccess(obj, field) => {
+            ExprKind::FieldAccess(obj, field) => {
                 self.compile_expr(obj);
                 self.emit(OpCode::GetField(field.clone()));
             }
-            Expr::FieldAssign(obj, field, value) => {
+            ExprKind::FieldAssign(obj, field, value) => {
                 self.compile_expr(obj);
                 self.compile_expr(value);
                 self.emit(OpCode::SetField(field.clone()));
             }
-            Expr::MethodCall(obj, method_name, args) => {
+            ExprKind::MethodCall(obj, method_name, args) => {
                 // Компилируем объект (self) и аргументы на стек.
                 // Разрешение имени функции (`TypeName_method`) происходит
                 // в рантайме через OpCode::CallMethod, которое знает
@@ -542,7 +542,7 @@ impl Compiler {
                     argc: args.len(),
                 });
             }
-            Expr::Match(scrutinee, arms) => {
+            ExprKind::Match(scrutinee, arms) => {
                 // T006 (M002). Компилируется ИСКЛЮЧИТЕЛЬНО в уже
                 // существующие опкоды (PushConst/LoadVar/DefineVar/
                 // PushScope/PopScope/Eq/Jump/JumpIfFalse) — ни одного
@@ -604,7 +604,7 @@ impl Compiler {
     /// вариантов `Expr` в этой же функции. Вызывается только для
     /// литеральных вариантов `Pattern` (`Wildcard`/`Bind` обрабатываются
     /// отдельно в вызывающем коде, до этой функции, и никогда сюда не
-    /// попадают — см. `compile_expr`, ветка `Expr::Match`).
+    /// попадают — см. `compile_expr`, ветка `ExprKind::Match`).
     fn compile_pattern_literal(&mut self, pattern: &Pattern) {
         match pattern {
             Pattern::Int(v) => {
@@ -628,7 +628,7 @@ impl Compiler {
                 self.emit(OpCode::PushConst(idx));
             }
             Pattern::Wildcard | Pattern::Bind(_) => unreachable!(
-                "compile_pattern_literal вызывается только для литеральных паттернов, catch-all обрабатывается отдельно в Expr::Match"
+                "compile_pattern_literal вызывается только для литеральных паттернов, catch-all обрабатывается отдельно в ExprKind::Match"
             ),
         }
     }

@@ -58,6 +58,21 @@ fn main() -> ExitCode {
             eprintln!("См. docs/ROADMAP.md, раздел 'Бэкенды'.");
             ExitCode::FAILURE
         }
+        "lsp" => match parse_lsp_args(&args[2..]) {
+            // Языковой сервер на stdin/stdout (T016, M007): в stdout уходят
+            // только фреймы протокола, диагностика самого сервера — в stderr.
+            Ok(()) => {
+                if sga::lsp::run_stdio() == 0 {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                }
+            }
+            Err(msg) => {
+                eprintln!("{}", msg);
+                ExitCode::FAILURE
+            }
+        },
         "init" => cmd_init(args.get(2).map(|s| s.as_str()).unwrap_or(".")),
         "test" => {
             eprintln!("'sga test' (тест-раннер с аннотацией #[test]) пока не реализован. См. docs/ROADMAP.md.");
@@ -104,6 +119,13 @@ fn print_usage() {
     eprintln!("                    без него запись запрещена; -- завершает список флагов");
     eprintln!(
         "                    (поддерживает IMPORT \"путь.sga\"; — см. docs/COMPILER_SPEC.md)"
+    );
+    eprintln!("  lsp [--stdio]     запустить языковой сервер (LSP) на stdin/stdout: диагностики");
+    eprintln!("                    лексера, парсера, семантики и типов для редактора (в файле с");
+    eprintln!("                    IMPORT — только синтаксис), подсказка при наведении (hover) и");
+    eprintln!("                    автодополнение; программы НЕ исполняются;");
+    eprintln!(
+        "                    --stdio принимается для совместимости с клиентами (см. docs/LSP.md)"
     );
     eprintln!("  init [путь]       создать новый проект (sga.toml + src/main.sga)");
     eprintln!("  fmt <файл.sga>    вывести AST-нормализованный псевдокод файла (диагностика;");
@@ -172,6 +194,26 @@ fn parse_run_args(rest: &[String]) -> Result<RunInvocation, String> {
             program_args: rest[index + 1..].to_vec(),
         }),
         None => Err(RUN_USAGE.to_string()),
+    }
+}
+
+/// Использование `sga lsp` — единственный источник текста для сообщения об
+/// ошибке разбора.
+const LSP_USAGE: &str = "использование: sga lsp [--stdio]";
+
+/// Разбирает аргументы после `sga lsp` (T016, M007): допустимы только пустой
+/// список и один флаг `--stdio` (клиенты вроде vscode-languageclient передают
+/// его серверу; транспорт у сервера один — stdio, поэтому флаг ничего не
+/// меняет). Любой другой аргумент — ошибка использования: сервер не стартует,
+/// опечатка во флаге не должна молча превращаться в запуск.
+fn parse_lsp_args(rest: &[String]) -> Result<(), String> {
+    match rest {
+        [] => Ok(()),
+        [flag] if flag == "--stdio" => Ok(()),
+        _ => Err(format!(
+            "неизвестные аргументы команды lsp: {:?}; допустим только --stdio\n{}",
+            rest, LSP_USAGE
+        )),
     }
 }
 
@@ -361,6 +403,33 @@ mod tests {
         }
         // Неизвестный флаг после допустимого — тоже ошибка.
         assert!(parse_run_args(&v(&["--allow-write", "--bogus", "main.sga"])).is_err());
+    }
+
+    #[test]
+    fn lsp_accepts_no_arguments_or_a_single_stdio_flag() {
+        assert_eq!(parse_lsp_args(&v(&[])), Ok(()));
+        assert_eq!(parse_lsp_args(&v(&["--stdio"])), Ok(()));
+    }
+
+    #[test]
+    fn lsp_rejects_everything_else_with_the_usage() {
+        for rest in [
+            v(&["--bogus"]),
+            v(&["stdio"]),
+            v(&["-stdio"]),
+            v(&["--stdio=1"]),
+            v(&["--stdio", "--stdio"]),
+            v(&["--stdio", "extra"]),
+            v(&["extra", "--stdio"]),
+            v(&[""]),
+            v(&["--socket=5000"]),
+            v(&["--pipe=/tmp/x"]),
+            v(&["--node-ipc"]),
+        ] {
+            let err = parse_lsp_args(&rest).unwrap_err();
+            assert!(err.contains(LSP_USAGE), "нет строки использования: {err}");
+            assert!(err.contains("--stdio"), "{err}");
+        }
     }
 
     #[test]

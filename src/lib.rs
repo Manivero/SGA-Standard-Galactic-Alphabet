@@ -11,9 +11,11 @@
 pub mod ast;
 mod clock;
 pub mod codegen;
+pub mod diagnostics;
 mod fs_sandbox;
 pub mod json;
 pub mod lexer;
+pub mod lsp;
 pub mod manifest;
 pub mod module_resolver;
 pub mod optimizer;
@@ -25,7 +27,7 @@ mod stdin;
 pub mod typechecker;
 pub mod vm;
 
-use ast::{Program, Stmt};
+use ast::{Program, Span, StmtKind};
 use runtime::Value;
 use std::path::Path;
 
@@ -77,21 +79,60 @@ impl From<ParseFullError> for SgaError {
 /// в `module_resolver::resolve_imports`, которому не нужно (и не должно)
 /// знать о публичном `SgaError`.
 fn parse_full(source: &str) -> Result<Program, ParseFullError> {
+    parse_source(source, parser::Parser::new)
+}
+
+/// Общий код разбора: лексер + парсер, созданный `make_parser` — обычный
+/// (`Parser::new`, узлы с позициями) или без позиций (`Parser::detached`).
+fn parse_source(
+    source: &str,
+    make_parser: fn(Vec<lexer::token::Token>) -> parser::Parser,
+) -> Result<Program, ParseFullError> {
     let tokens = lexer::Lexer::new(source)
         .tokenize()
         .map_err(|e| ParseFullError::Lex(e.to_string()))?;
-    parser::Parser::new(tokens)
+    make_parser(tokens)
         .parse_program()
         .map_err(|e| ParseFullError::Parse(e.to_string()))
 }
 
+/// Разбор ИМПОРТИРУЕМОГО модуля (его вызывает `module_resolver`): узлы без
+/// позиций (T017). Индексы токенов такого модуля относились бы к его собственной
+/// таблице токенов, а после подстановки в программу главного файла по ним
+/// читалась бы таблица ГЛАВНОГО файла (`position_prefix`) — ошибка в модуле
+/// получила бы ложный `[строка:столбец]` из чужого файла. Без позиции сообщение
+/// остаётся без префикса, как и до T017.
 fn parse_full_flat(source: &str) -> Result<Program, String> {
-    parse_full(source).map_err(|e| match e {
+    parse_source(source, parser::Parser::detached).map_err(|e| match e {
         ParseFullError::Lex(s) | ParseFullError::Parse(s) => s,
     })
 }
 
-/// Возвращает `Err` при первом `Stmt::Import`, найденном на верхнем
+/// Префикс `[строка:столбец] ` для ошибки анализа (`semantic`/`typechecker`),
+/// относящейся к узлу AST с диапазоном `span` (T017); формат тот же, что у ошибок
+/// лексера и парсера.
+///
+/// `Span` хранит индексы токенов, а не координаты, поэтому координаты строятся
+/// ЗДЕСЬ, на пути ошибки: `source` — текст, из которого парсер строил дерево, —
+/// лексируется ещё раз с таблицей границ токенов (`tokenize_with_spans`). Лексер
+/// детерминирован, таблица соответствует тем же токенам; успешный запуск этой
+/// работы не делает. Префикса нет (пустая строка), если позиции нет
+/// (`Span::NONE`: узел импортированного модуля или AST, собранный без парсера)
+/// либо она не находится в таблице.
+fn position_prefix(source: &str, span: Span) -> String {
+    if span.is_none() {
+        return String::new();
+    }
+    let Ok((_, table)) = lexer::Lexer::new(source).tokenize_with_spans() else {
+        return String::new();
+    };
+    match span.resolve(&table) {
+        Some(at) => format!("[{}:{}] ", at.line, at.col),
+        None => String::new(),
+    }
+}
+
+/// Возвращает `Err` при первом `StmtKind::Import`, найденном на верхнем
 /// уровне программы (рекурсивно внутрь блоков спускаться не нужно —
 /// парсер гарантирует, что `IMPORT`, как и `FN`, синтаксически возможен
 /// только на верхнем уровне). Используется `run_source`, у которой нет
@@ -101,7 +142,7 @@ fn parse_full_flat(source: &str) -> Result<Program, String> {
 /// пайплайну.
 fn reject_imports(program: &Program) -> Result<(), SgaError> {
     for stmt in program {
-        if let Stmt::Import(path) = stmt {
+        if let StmtKind::Import(path) = &stmt.kind {
             return Err(SgaError::Import(format!(
                 "IMPORT \"{}\" использован в run_source(), у которого нет файлового контекста для резолвинга путей; используйте run_source_file()",
                 path
@@ -233,7 +274,7 @@ pub fn run_source_with_options(source: &str, options: RunOptions) -> Result<Valu
     // T009 (M003): нет файлового пути — нет confinement-границы для
     // read_file. `None` даёт понятную RuntimeError при попытке вызова
     // (см. vm::Vm::call_read_file), а не тихо угадывает cwd процесса.
-    run_resolved_program(program, None, options)
+    run_resolved_program(program, source, None, options)
 }
 
 /// Полный конвейер для файла на диске, с поддержкой `IMPORT`. Импорты
@@ -265,15 +306,19 @@ pub fn run_source_file_with_options(path: &Path, options: RunOptions) -> Result<
     // resolve_imports для IMPORT — единый источник истины, см.
     // module_resolver::compute_confinement_root.
     let sandbox_root = Some(module_resolver::compute_confinement_root(path));
-    run_resolved_program(resolved, sandbox_root, options)
+    run_resolved_program(resolved, &source, sandbox_root, options)
 }
 
 /// Общий хвост пайплайна после того, как `Program` гарантированно не
-/// содержит `Stmt::Import` (либо отклонён в `run_source`, либо
+/// содержит `StmtKind::Import` (либо отклонён в `run_source`, либо
 /// полностью резолвлен в `run_source_file`): семантический анализ
 /// (включая Ownership/Borrowing) -> проверка типов (градуальная) ->
 /// компиляция в байткод -> верификация байткода (`vm::Vm::new`) ->
 /// исполнение.
+///
+/// `source` (T017) — текст ГЛАВНОГО файла, из которого парсер строил `program`:
+/// по нему ошибкам семантики и типов добавляется `[строка:столбец]`
+/// (`position_prefix`). Узлы импортированных модулей позиций не несут.
 ///
 /// `sandbox_root` (T009, M003) — confinement-граница для `read_file`;
 /// `None` от `run_source`, `Some(..)` от `run_source_file`.
@@ -281,15 +326,16 @@ pub fn run_source_file_with_options(path: &Path, options: RunOptions) -> Result<
 /// `Vm::new` и `run`.
 fn run_resolved_program(
     program: Program,
+    source: &str,
     sandbox_root: Option<std::path::PathBuf>,
     options: RunOptions,
 ) -> Result<Value, SgaError> {
     semantic::Analyzer::new()
         .analyze(&program)
-        .map_err(|e| SgaError::Semantic(e.to_string()))?;
+        .map_err(|e| SgaError::Semantic(format!("{}{}", position_prefix(source, e.span), e)))?;
     typechecker::Typechecker::new()
         .analyze(&program)
-        .map_err(|e| SgaError::Type(e.to_string()))?;
+        .map_err(|e| SgaError::Type(format!("{}{}", position_prefix(source, e.span), e)))?;
     // T010 (M004): AST->AST проход между typechecker и codegen —
     // семантически прозрачен (см. src/optimizer.rs), работает только
     // над уже ВАЛИДИРОВАННЫМ AST (недостижимый код по-прежнему был

@@ -11,8 +11,16 @@
 //! (особенно важно для переполнения `Int` и деления на ноль — оба
 //! ДОЛЖНЫ остаться ошибками времени выполнения, если сворачивание
 //! невозможно, см. `fold_binary`/`fold_unary` ниже).
+//!
+//! ПОЗИЦИИ (T017): проход сохраняет `Span` узлов. Свёрнутая константа получает
+//! диапазон ВСЕГО исходного выражения (`1 + 2` → `3` с диапазоном `1 + 2`),
+//! а заменивший `IF`/`WHILE` блок — диапазон исходного оператора. Позиции
+//! после этого прохода никто не читает (ошибки находят `semantic` и
+//! `typechecker` РАНЬШЕ), но потерянные диапазоны сделали бы дерево
+//! недостоверным для любого будущего потребителя (например, ошибок времени
+//! выполнения с позицией).
 
-use crate::ast::{BinOp, Expr, MatchArm, Program, Stmt, UnOp};
+use crate::ast::{BinOp, Expr, ExprKind, MatchArm, Program, Stmt, StmtKind, UnOp};
 use crate::runtime::{OpCode, Value};
 use crate::vm;
 
@@ -30,7 +38,10 @@ fn optimize_stmts(stmts: Vec<Stmt>) -> Vec<Stmt> {
     let mut out = Vec::with_capacity(stmts.len());
     for stmt in stmts {
         let optimized = optimize_stmt(stmt);
-        let is_terminator = matches!(optimized, Stmt::Return(_) | Stmt::Break | Stmt::Continue);
+        let is_terminator = matches!(
+            optimized.kind,
+            StmtKind::Return(_) | StmtKind::Break | StmtKind::Continue
+        );
         out.push(optimized);
         if is_terminator {
             break;
@@ -40,21 +51,22 @@ fn optimize_stmts(stmts: Vec<Stmt>) -> Vec<Stmt> {
 }
 
 fn optimize_stmt(stmt: Stmt) -> Stmt {
-    match stmt {
-        Stmt::VarDecl {
+    let span = stmt.span;
+    let kind = match stmt.kind {
+        StmtKind::VarDecl {
             name,
             value,
             mutable,
             ty,
-        } => Stmt::VarDecl {
+        } => StmtKind::VarDecl {
             name,
             value: fold_expr(value),
             mutable,
             ty,
         },
-        Stmt::ExprStmt(e) => Stmt::ExprStmt(fold_expr(e)),
-        Stmt::Print(exprs) => Stmt::Print(exprs.into_iter().map(fold_expr).collect()),
-        Stmt::If {
+        StmtKind::ExprStmt(e) => StmtKind::ExprStmt(fold_expr(e)),
+        StmtKind::Print(exprs) => StmtKind::Print(exprs.into_iter().map(fold_expr).collect()),
+        StmtKind::If {
             cond,
             then_branch,
             else_branch,
@@ -63,145 +75,155 @@ fn optimize_stmt(stmt: Stmt) -> Stmt {
             let then_branch = optimize_stmts(then_branch);
             let else_branch = else_branch.map(optimize_stmts);
             match const_bool(&cond) {
-                Some(true) => Stmt::Block(then_branch),
-                Some(false) => Stmt::Block(else_branch.unwrap_or_default()),
-                None => Stmt::If {
+                Some(true) => StmtKind::Block(then_branch),
+                Some(false) => StmtKind::Block(else_branch.unwrap_or_default()),
+                None => StmtKind::If {
                     cond,
                     then_branch,
                     else_branch,
                 },
             }
         }
-        Stmt::While { cond, body } => {
+        StmtKind::While { cond, body } => {
             let cond = fold_expr(cond);
             let body = optimize_stmts(body);
             match const_bool(&cond) {
-                Some(false) => Stmt::Block(vec![]),
-                _ => Stmt::While { cond, body },
+                Some(false) => StmtKind::Block(vec![]),
+                _ => StmtKind::While { cond, body },
             }
         }
-        Stmt::ForIn {
+        StmtKind::ForIn {
             var,
             start,
             end,
             body,
-        } => Stmt::ForIn {
+        } => StmtKind::ForIn {
             var,
             start: fold_expr(start),
             end: fold_expr(end),
             body: optimize_stmts(body),
         },
-        Stmt::FnDecl {
+        StmtKind::FnDecl {
             name,
             params,
             body,
             return_ty,
-        } => Stmt::FnDecl {
+        } => StmtKind::FnDecl {
             name,
             params,
             body: optimize_stmts(body),
             return_ty,
         },
-        Stmt::Return(opt_e) => Stmt::Return(opt_e.map(fold_expr)),
-        Stmt::Break => Stmt::Break,
-        Stmt::Continue => Stmt::Continue,
-        Stmt::Block(stmts) => Stmt::Block(optimize_stmts(stmts)),
-        other @ (Stmt::Import(_) | Stmt::StructDecl { .. }) => other,
-    }
+        StmtKind::Return(opt_e) => StmtKind::Return(opt_e.map(fold_expr)),
+        StmtKind::Break => StmtKind::Break,
+        StmtKind::Continue => StmtKind::Continue,
+        StmtKind::Block(stmts) => StmtKind::Block(optimize_stmts(stmts)),
+        other @ (StmtKind::Import(_) | StmtKind::StructDecl { .. }) => other,
+    };
+    Stmt::new(kind, span)
 }
 
 fn const_bool(e: &Expr) -> Option<bool> {
-    match e {
-        Expr::Bool(b) => Some(*b),
+    match &e.kind {
+        ExprKind::Bool(b) => Some(*b),
         _ => None,
     }
 }
 
 fn fold_expr(expr: Expr) -> Expr {
-    match expr {
-        Expr::Int(_)
-        | Expr::Float(_)
-        | Expr::Str(_)
-        | Expr::Bool(_)
-        | Expr::Nil
-        | Expr::Ident(_) => expr,
-        Expr::Array(items) => Expr::Array(items.into_iter().map(fold_expr).collect()),
-        Expr::Index(arr, idx) => Expr::Index(Box::new(fold_expr(*arr)), Box::new(fold_expr(*idx))),
-        Expr::Unary(op, inner) => {
+    let span = expr.span;
+    let kind = match expr.kind {
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Nil
+        | ExprKind::Ident(_) => return expr,
+        ExprKind::Array(items) => ExprKind::Array(items.into_iter().map(fold_expr).collect()),
+        ExprKind::Index(arr, idx) => {
+            ExprKind::Index(Box::new(fold_expr(*arr)), Box::new(fold_expr(*idx)))
+        }
+        ExprKind::Unary(op, inner) => {
             let inner = fold_expr(*inner);
             match fold_unary(&op, &inner) {
                 Some(folded) => folded,
-                None => Expr::Unary(op, Box::new(inner)),
+                None => ExprKind::Unary(op, Box::new(inner)),
             }
         }
-        Expr::Binary(op, l, r) => {
+        ExprKind::Binary(op, l, r) => {
             let l = fold_expr(*l);
             let r = fold_expr(*r);
             match fold_binary(&op, &l, &r) {
                 Some(folded) => folded,
-                None => Expr::Binary(op, Box::new(l), Box::new(r)),
+                None => ExprKind::Binary(op, Box::new(l), Box::new(r)),
             }
         }
-        Expr::Call(name, args) => Expr::Call(name, args.into_iter().map(fold_expr).collect()),
-        Expr::CallExpr(callee, args) => Expr::CallExpr(
+        ExprKind::Call(name, args) => {
+            ExprKind::Call(name, args.into_iter().map(fold_expr).collect())
+        }
+        ExprKind::CallExpr(callee, args) => ExprKind::CallExpr(
             Box::new(fold_expr(*callee)),
             args.into_iter().map(fold_expr).collect(),
         ),
-        Expr::Assign(name, value) => Expr::Assign(name, Box::new(fold_expr(*value))),
-        Expr::IndexAssign(arr, idx, value) => Expr::IndexAssign(
+        ExprKind::Assign(name, value) => ExprKind::Assign(name, Box::new(fold_expr(*value))),
+        ExprKind::IndexAssign(arr, idx, value) => ExprKind::IndexAssign(
             Box::new(fold_expr(*arr)),
             Box::new(fold_expr(*idx)),
             Box::new(fold_expr(*value)),
         ),
-        Expr::Lambda { params, body } => Expr::Lambda {
+        ExprKind::Lambda { params, body } => ExprKind::Lambda {
             params,
             body: optimize_stmts(body),
         },
-        Expr::StructLit { type_name, fields } => Expr::StructLit {
+        ExprKind::StructLit { type_name, fields } => ExprKind::StructLit {
             type_name,
             fields: fields.into_iter().map(|(k, v)| (k, fold_expr(v))).collect(),
         },
-        Expr::FieldAccess(obj, field) => Expr::FieldAccess(Box::new(fold_expr(*obj)), field),
-        Expr::FieldAssign(obj, field, value) => Expr::FieldAssign(
+        ExprKind::FieldAccess(obj, field) => {
+            ExprKind::FieldAccess(Box::new(fold_expr(*obj)), field)
+        }
+        ExprKind::FieldAssign(obj, field, value) => ExprKind::FieldAssign(
             Box::new(fold_expr(*obj)),
             field,
             Box::new(fold_expr(*value)),
         ),
-        Expr::MethodCall(obj, method, args) => Expr::MethodCall(
+        ExprKind::MethodCall(obj, method, args) => ExprKind::MethodCall(
             Box::new(fold_expr(*obj)),
             method,
             args.into_iter().map(fold_expr).collect(),
         ),
-        Expr::Match(scrutinee, arms) => Expr::Match(
+        ExprKind::Match(scrutinee, arms) => ExprKind::Match(
             Box::new(fold_expr(*scrutinee)),
             arms.into_iter()
                 .map(|arm| MatchArm {
                     pattern: arm.pattern,
                     body: fold_expr(arm.body),
+                    span: arm.span,
                 })
                 .collect(),
         ),
-    }
+    };
+    Expr::new(kind, span)
 }
 
 fn expr_to_value(e: &Expr) -> Option<Value> {
-    match e {
-        Expr::Int(n) => Some(Value::Int(*n)),
-        Expr::Float(f) => Some(Value::Float(*f)),
-        Expr::Str(s) => Some(Value::Str(s.clone())),
-        Expr::Bool(b) => Some(Value::Bool(*b)),
-        Expr::Nil => Some(Value::Nil),
+    match &e.kind {
+        ExprKind::Int(n) => Some(Value::Int(*n)),
+        ExprKind::Float(f) => Some(Value::Float(*f)),
+        ExprKind::Str(s) => Some(Value::Str(s.clone())),
+        ExprKind::Bool(b) => Some(Value::Bool(*b)),
+        ExprKind::Nil => Some(Value::Nil),
         _ => None,
     }
 }
 
-fn value_to_expr(v: Value) -> Option<Expr> {
+fn value_to_kind(v: Value) -> Option<ExprKind> {
     match v {
-        Value::Int(n) => Some(Expr::Int(n)),
-        Value::Float(f) => Some(Expr::Float(f)),
-        Value::Str(s) => Some(Expr::Str(s)),
-        Value::Bool(b) => Some(Expr::Bool(b)),
-        Value::Nil => Some(Expr::Nil),
+        Value::Int(n) => Some(ExprKind::Int(n)),
+        Value::Float(f) => Some(ExprKind::Float(f)),
+        Value::Str(s) => Some(ExprKind::Str(s)),
+        Value::Bool(b) => Some(ExprKind::Bool(b)),
+        Value::Nil => Some(ExprKind::Nil),
         Value::Array(_) | Value::Struct { .. } | Value::Closure(_) => None,
     }
 }
@@ -224,12 +246,12 @@ fn binop_to_opcode(op: &BinOp) -> OpCode {
     }
 }
 
-fn fold_binary(op: &BinOp, l: &Expr, r: &Expr) -> Option<Expr> {
+fn fold_binary(op: &BinOp, l: &Expr, r: &Expr) -> Option<ExprKind> {
     let lv = expr_to_value(l)?;
     let rv = expr_to_value(r)?;
     match op {
-        BinOp::And => return value_to_expr(Value::Bool(lv.is_truthy() && rv.is_truthy())),
-        BinOp::Or => return value_to_expr(Value::Bool(lv.is_truthy() || rv.is_truthy())),
+        BinOp::And => return value_to_kind(Value::Bool(lv.is_truthy() && rv.is_truthy())),
+        BinOp::Or => return value_to_kind(Value::Bool(lv.is_truthy() || rv.is_truthy())),
         _ => {}
     }
     let opcode = binop_to_opcode(op);
@@ -242,15 +264,15 @@ fn fold_binary(op: &BinOp, l: &Expr, r: &Expr) -> Option<Expr> {
         }
         BinOp::And | BinOp::Or => unreachable!("обработаны выше через return"),
     };
-    result.ok().and_then(value_to_expr)
+    result.ok().and_then(value_to_kind)
 }
 
-fn fold_unary(op: &UnOp, inner: &Expr) -> Option<Expr> {
+fn fold_unary(op: &UnOp, inner: &Expr) -> Option<ExprKind> {
     let v = expr_to_value(inner)?;
     match (op, v) {
-        (UnOp::Neg, Value::Int(n)) => n.checked_neg().and_then(|r| value_to_expr(Value::Int(r))),
-        (UnOp::Neg, Value::Float(f)) => value_to_expr(Value::Float(-f)),
-        (UnOp::Not, v) => value_to_expr(Value::Bool(!v.is_truthy())),
+        (UnOp::Neg, Value::Int(n)) => n.checked_neg().and_then(|r| value_to_kind(Value::Int(r))),
+        (UnOp::Neg, Value::Float(f)) => value_to_kind(Value::Float(-f)),
+        (UnOp::Not, v) => value_to_kind(Value::Bool(!v.is_truthy())),
         _ => None,
     }
 }
@@ -258,195 +280,277 @@ fn fold_unary(op: &UnOp, inner: &Expr) -> Option<Expr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::Span;
+
+    fn e(kind: ExprKind) -> Expr {
+        Expr::unspanned(kind)
+    }
+
+    fn st(kind: StmtKind) -> Stmt {
+        Stmt::unspanned(kind)
+    }
+
+    fn int(n: i64) -> Expr {
+        e(ExprKind::Int(n))
+    }
+
+    fn float(f: f64) -> Expr {
+        e(ExprKind::Float(f))
+    }
+
+    fn string(s: &str) -> Expr {
+        e(ExprKind::Str(s.into()))
+    }
+
+    fn boolean(b: bool) -> Expr {
+        e(ExprKind::Bool(b))
+    }
+
+    fn ident(name: &str) -> Expr {
+        e(ExprKind::Ident(name.into()))
+    }
 
     fn bin(op: BinOp, l: Expr, r: Expr) -> Expr {
-        Expr::Binary(op, Box::new(l), Box::new(r))
+        e(ExprKind::Binary(op, Box::new(l), Box::new(r)))
+    }
+
+    fn unary(op: UnOp, inner: Expr) -> Expr {
+        e(ExprKind::Unary(op, Box::new(inner)))
+    }
+
+    fn expr_stmt(expr: Expr) -> Stmt {
+        st(StmtKind::ExprStmt(expr))
     }
 
     #[test]
     fn test_fold_int_arithmetic() {
-        assert_eq!(
-            fold_expr(bin(BinOp::Add, Expr::Int(1), Expr::Int(2))),
-            Expr::Int(3)
-        );
-        assert_eq!(
-            fold_expr(bin(BinOp::Mul, Expr::Int(6), Expr::Int(7))),
-            Expr::Int(42)
-        );
+        assert_eq!(fold_expr(bin(BinOp::Add, int(1), int(2))), int(3));
+        assert_eq!(fold_expr(bin(BinOp::Mul, int(6), int(7))), int(42));
     }
 
     #[test]
     fn test_fold_nested_arithmetic() {
         let expr = bin(
             BinOp::Mul,
-            bin(BinOp::Add, Expr::Int(1), Expr::Int(2)),
-            bin(BinOp::Add, Expr::Int(3), Expr::Int(4)),
+            bin(BinOp::Add, int(1), int(2)),
+            bin(BinOp::Add, int(3), int(4)),
         );
-        assert_eq!(fold_expr(expr), Expr::Int(21));
+        assert_eq!(fold_expr(expr), int(21));
     }
 
     #[test]
     fn test_fold_mixed_int_float_promotes_to_float() {
-        assert_eq!(
-            fold_expr(bin(BinOp::Add, Expr::Int(1), Expr::Float(2.5))),
-            Expr::Float(3.5)
-        );
+        assert_eq!(fold_expr(bin(BinOp::Add, int(1), float(2.5))), float(3.5));
     }
 
     #[test]
     fn test_fold_string_concat() {
         assert_eq!(
-            fold_expr(bin(
-                BinOp::Add,
-                Expr::Str("a".into()),
-                Expr::Str("b".into())
-            )),
-            Expr::Str("ab".into())
+            fold_expr(bin(BinOp::Add, string("a"), string("b"))),
+            string("ab")
         );
     }
 
     #[test]
     fn test_fold_comparisons() {
+        assert_eq!(fold_expr(bin(BinOp::Lt, int(1), int(2))), boolean(true));
+        assert_eq!(fold_expr(bin(BinOp::Eq, int(1), int(1))), boolean(true));
         assert_eq!(
-            fold_expr(bin(BinOp::Lt, Expr::Int(1), Expr::Int(2))),
-            Expr::Bool(true)
-        );
-        assert_eq!(
-            fold_expr(bin(BinOp::Eq, Expr::Int(1), Expr::Int(1))),
-            Expr::Bool(true)
-        );
-        assert_eq!(
-            fold_expr(bin(
-                BinOp::NotEq,
-                Expr::Str("a".into()),
-                Expr::Str("b".into())
-            )),
-            Expr::Bool(true)
+            fold_expr(bin(BinOp::NotEq, string("a"), string("b"))),
+            boolean(true)
         );
     }
 
     #[test]
     fn test_fold_and_or_no_short_circuit_both_literal() {
         assert_eq!(
-            fold_expr(bin(BinOp::And, Expr::Bool(true), Expr::Bool(false))),
-            Expr::Bool(false)
+            fold_expr(bin(BinOp::And, boolean(true), boolean(false))),
+            boolean(false)
         );
         assert_eq!(
-            fold_expr(bin(BinOp::Or, Expr::Bool(false), Expr::Bool(true))),
-            Expr::Bool(true)
+            fold_expr(bin(BinOp::Or, boolean(false), boolean(true))),
+            boolean(true)
         );
     }
 
     #[test]
     fn test_fold_unary_neg_and_not() {
-        assert_eq!(
-            fold_expr(Expr::Unary(UnOp::Neg, Box::new(Expr::Int(5)))),
-            Expr::Int(-5)
-        );
-        assert_eq!(
-            fold_expr(Expr::Unary(UnOp::Neg, Box::new(Expr::Float(2.5)))),
-            Expr::Float(-2.5)
-        );
-        assert_eq!(
-            fold_expr(Expr::Unary(UnOp::Not, Box::new(Expr::Bool(true)))),
-            Expr::Bool(false)
-        );
+        assert_eq!(fold_expr(unary(UnOp::Neg, int(5))), int(-5));
+        assert_eq!(fold_expr(unary(UnOp::Neg, float(2.5))), float(-2.5));
+        assert_eq!(fold_expr(unary(UnOp::Not, boolean(true))), boolean(false));
     }
 
     #[test]
     fn test_neg_i64_min_does_not_fold() {
-        let e = Expr::Unary(UnOp::Neg, Box::new(Expr::Int(i64::MIN)));
-        let folded = fold_expr(e.clone());
-        assert_eq!(folded, e);
+        let expr = unary(UnOp::Neg, int(i64::MIN));
+        let folded = fold_expr(expr.clone());
+        assert_eq!(folded, expr);
     }
 
     #[test]
     fn test_overflow_does_not_fold() {
-        let e = bin(BinOp::Add, Expr::Int(i64::MAX), Expr::Int(1));
-        assert_eq!(fold_expr(e.clone()), e);
+        let expr = bin(BinOp::Add, int(i64::MAX), int(1));
+        assert_eq!(fold_expr(expr.clone()), expr);
     }
 
     #[test]
     fn test_division_by_zero_does_not_fold() {
-        let e = bin(BinOp::Div, Expr::Int(1), Expr::Int(0));
-        assert_eq!(fold_expr(e.clone()), e);
+        let expr = bin(BinOp::Div, int(1), int(0));
+        assert_eq!(fold_expr(expr.clone()), expr);
     }
 
     #[test]
     fn test_non_literal_does_not_fold() {
-        let e = bin(BinOp::Add, Expr::Ident("x".into()), Expr::Int(1));
-        assert_eq!(fold_expr(e.clone()), e);
+        let expr = bin(BinOp::Add, ident("x"), int(1));
+        assert_eq!(fold_expr(expr.clone()), expr);
     }
 
     #[test]
     fn test_dce_unreachable_after_return() {
-        let stmts = vec![
-            Stmt::Return(Some(Expr::Int(1))),
-            Stmt::ExprStmt(Expr::Int(2)),
-        ];
+        let stmts = vec![st(StmtKind::Return(Some(int(1)))), expr_stmt(int(2))];
         assert_eq!(
             optimize_stmts(stmts),
-            vec![Stmt::Return(Some(Expr::Int(1)))]
+            vec![st(StmtKind::Return(Some(int(1))))]
         );
     }
 
     #[test]
     fn test_dce_if_true_becomes_then_branch() {
-        let stmt = Stmt::If {
-            cond: Expr::Bool(true),
-            then_branch: vec![Stmt::ExprStmt(Expr::Int(1))],
-            else_branch: Some(vec![Stmt::ExprStmt(Expr::Int(2))]),
-        };
+        let stmt = st(StmtKind::If {
+            cond: boolean(true),
+            then_branch: vec![expr_stmt(int(1))],
+            else_branch: Some(vec![expr_stmt(int(2))]),
+        });
         assert_eq!(
             optimize_stmt(stmt),
-            Stmt::Block(vec![Stmt::ExprStmt(Expr::Int(1))])
+            st(StmtKind::Block(vec![expr_stmt(int(1))]))
         );
     }
 
     #[test]
     fn test_dce_if_false_becomes_else_branch() {
-        let stmt = Stmt::If {
-            cond: Expr::Bool(false),
-            then_branch: vec![Stmt::ExprStmt(Expr::Int(1))],
-            else_branch: Some(vec![Stmt::ExprStmt(Expr::Int(2))]),
-        };
+        let stmt = st(StmtKind::If {
+            cond: boolean(false),
+            then_branch: vec![expr_stmt(int(1))],
+            else_branch: Some(vec![expr_stmt(int(2))]),
+        });
         assert_eq!(
             optimize_stmt(stmt),
-            Stmt::Block(vec![Stmt::ExprStmt(Expr::Int(2))])
+            st(StmtKind::Block(vec![expr_stmt(int(2))]))
         );
     }
 
     #[test]
     fn test_dce_if_false_without_else_becomes_empty_block() {
-        let stmt = Stmt::If {
-            cond: Expr::Bool(false),
-            then_branch: vec![Stmt::ExprStmt(Expr::Int(1))],
+        let stmt = st(StmtKind::If {
+            cond: boolean(false),
+            then_branch: vec![expr_stmt(int(1))],
             else_branch: None,
-        };
-        assert_eq!(optimize_stmt(stmt), Stmt::Block(vec![]));
+        });
+        assert_eq!(optimize_stmt(stmt), st(StmtKind::Block(vec![])));
     }
 
     #[test]
     fn test_dce_while_false_becomes_empty_block() {
-        let stmt = Stmt::While {
-            cond: Expr::Bool(false),
-            body: vec![Stmt::ExprStmt(Expr::Int(1))],
-        };
-        assert_eq!(optimize_stmt(stmt), Stmt::Block(vec![]));
+        let stmt = st(StmtKind::While {
+            cond: boolean(false),
+            body: vec![expr_stmt(int(1))],
+        });
+        assert_eq!(optimize_stmt(stmt), st(StmtKind::Block(vec![])));
     }
 
     #[test]
     fn test_while_true_is_not_touched() {
-        let stmt = Stmt::While {
-            cond: Expr::Bool(true),
-            body: vec![Stmt::Break],
-        };
+        let stmt = st(StmtKind::While {
+            cond: boolean(true),
+            body: vec![st(StmtKind::Break)],
+        });
         assert_eq!(
             optimize_stmt(stmt),
-            Stmt::While {
-                cond: Expr::Bool(true),
-                body: vec![Stmt::Break],
-            }
+            st(StmtKind::While {
+                cond: boolean(true),
+                body: vec![st(StmtKind::Break)],
+            })
         );
+    }
+
+    // ── T017: позиции сохраняются ───────────────────────────────────────
+
+    #[test]
+    fn test_folded_constant_keeps_the_span_of_the_whole_expression() {
+        // `Expr` сравнивается без позиций, поэтому смотрим на `span` напрямую
+        let whole = Span::new(4, 8);
+        let folded = fold_expr(Expr::new(
+            ExprKind::Binary(
+                BinOp::Add,
+                Box::new(Expr::new(ExprKind::Int(1), Span::new(4, 4))),
+                Box::new(Expr::new(ExprKind::Int(2), Span::new(8, 8))),
+            ),
+            whole,
+        ));
+        assert_eq!(folded, int(3));
+        assert_eq!(folded.span, whole);
+
+        let unary = fold_expr(Expr::new(
+            ExprKind::Unary(
+                UnOp::Neg,
+                Box::new(Expr::new(ExprKind::Int(5), Span::new(1, 1))),
+            ),
+            Span::new(0, 1),
+        ));
+        assert_eq!(unary, int(-5));
+        assert_eq!(unary.span, Span::new(0, 1));
+    }
+
+    #[test]
+    fn test_unfolded_nodes_keep_their_own_spans() {
+        let tree = Expr::new(
+            ExprKind::Binary(
+                BinOp::Add,
+                Box::new(Expr::new(ExprKind::Ident("x".into()), Span::new(2, 2))),
+                Box::new(Expr::new(ExprKind::Int(1), Span::new(4, 4))),
+            ),
+            Span::new(2, 4),
+        );
+        let optimized = fold_expr(tree);
+        assert_eq!(optimized.span, Span::new(2, 4));
+        let ExprKind::Binary(_, l, r) = &optimized.kind else {
+            panic!("узел не должен сворачиваться")
+        };
+        assert_eq!(l.span, Span::new(2, 2));
+        assert_eq!(r.span, Span::new(4, 4));
+    }
+
+    #[test]
+    fn test_dce_block_and_arms_keep_spans() {
+        let stmt = Stmt::new(
+            StmtKind::If {
+                cond: boolean(true),
+                then_branch: vec![Stmt::new(StmtKind::Break, Span::new(7, 8))],
+                else_branch: None,
+            },
+            Span::new(3, 9),
+        );
+        let optimized = optimize_stmt(stmt);
+        assert_eq!(optimized.span, Span::new(3, 9));
+        let StmtKind::Block(inner) = &optimized.kind else {
+            panic!("IF TRUE должен стать блоком")
+        };
+        assert_eq!(inner[0].span, Span::new(7, 8));
+
+        let arm_span = Span::new(10, 14);
+        let matched = fold_expr(e(ExprKind::Match(
+            Box::new(int(1)),
+            vec![MatchArm {
+                pattern: crate::ast::Pattern::Wildcard,
+                body: bin(BinOp::Add, int(1), int(1)),
+                span: arm_span,
+            }],
+        )));
+        let ExprKind::Match(_, arms) = &matched.kind else {
+            panic!("MATCH остаётся MATCH")
+        };
+        assert_eq!(arms[0].span, arm_span);
+        assert_eq!(arms[0].body, int(2));
     }
 }

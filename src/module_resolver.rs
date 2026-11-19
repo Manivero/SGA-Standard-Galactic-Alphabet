@@ -39,7 +39,7 @@
 //!     добавил ТОЛЬКО path-зависимости: `IMPORT "pkg:имя/файл.sga"`,
 //!     см. `crate::manifest` и docs/LANGUAGE_SPEC.md, §8.1).
 
-use crate::ast::{Program, Stmt};
+use crate::ast::{Program, Stmt, StmtKind};
 use crate::manifest::Manifest;
 use std::collections::HashSet;
 use std::fmt;
@@ -115,7 +115,7 @@ pub fn compute_confinement_root(entry_path: &Path) -> PathBuf {
 }
 
 /// Резолвит все `IMPORT` в `program`, который был распарсен из файла
-/// `entry_path`. Возвращает плоский `Program` без единого `Stmt::Import`
+/// `entry_path`. Возвращает плоский `Program` без единого `StmtKind::Import`
 /// — готовый к передаче в `semantic::Analyzer::analyze` как обычно.
 ///
 /// `parse_fn` — функция полного цикла "текст -> Program" (лексер +
@@ -326,8 +326,9 @@ fn resolve_program<L: ModuleLoader>(
     } = *ctx;
     let mut out = Vec::new();
     for stmt in program {
-        match stmt {
-            Stmt::Import(rel_path) => {
+        let Stmt { kind, span } = stmt;
+        match kind {
+            StmtKind::Import(rel_path) => {
                 // T011 (M005): "pkg:имя/путь" — явный префикс, отличает
                 // package-импорт от обычного файлового IMPORT. Проверяется
                 // ПЕРВЫМ, до проверки абсолютного пути ниже (у pkg:-строк
@@ -496,7 +497,7 @@ fn resolve_program<L: ModuleLoader>(
                 in_progress.pop();
                 out.extend(resolved_imported);
             }
-            other => out.push(other),
+            other => out.push(Stmt::new(other, span)),
         }
     }
     Ok(out)
